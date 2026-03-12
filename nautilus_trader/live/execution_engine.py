@@ -1002,7 +1002,16 @@ class LiveExecutionEngine(ExecutionEngine):
                 LogColor.YELLOW,
             )
 
-            missing_fills = await self._query_and_find_missing_fills(instrument_id, clients)
+            fill_query_result = await self._query_and_find_missing_fills(
+                instrument_id,
+                clients,
+            )
+            if isinstance(fill_query_result, tuple):
+                missing_fills, had_fill_query_errors = fill_query_result
+            else:
+                missing_fills = fill_query_result
+                had_fill_query_errors = False
+
             await self._reconcile_missing_fills(missing_fills, instrument_id)
 
             # Re-read positions from cache (may have changed during reconciliation)
@@ -1018,8 +1027,10 @@ class LiveExecutionEngine(ExecutionEngine):
                     account_id=cached_positions[0].account_id,
                 )
 
-                if self.generate_missing_orders and self._reconcile_position_report(
-                    reconciliation_report,
+                if (
+                    not had_fill_query_errors
+                    and self.generate_missing_orders
+                    and self._reconcile_position_report(reconciliation_report)
                 ):
                     current_positions = self._cache.positions_open(instrument_id=instrument_id)
                     still_discrepant = self._check_position_discrepancy(
@@ -1040,7 +1051,7 @@ class LiveExecutionEngine(ExecutionEngine):
                         f"(cached_qty={cached_qty}, venue_qty={venue_qty}); "
                         f"no further reconciliation attempts will be made",
                     )
-                elif not missing_fills:
+                elif not missing_fills and not had_fill_query_errors:
                     self._log.warning(
                         f"Position discrepancy for {instrument_id} persists but no missing fills found; "
                         f"possible causes: fills outside lookback window ({self.position_check_lookback_mins}min), "
@@ -1169,7 +1180,15 @@ class LiveExecutionEngine(ExecutionEngine):
                 LogColor.YELLOW,
             )
 
-            missing_fills = await self._query_and_find_missing_fills(instrument_id, clients)
+            fill_query_result = await self._query_and_find_missing_fills(
+                instrument_id,
+                clients,
+            )
+            if isinstance(fill_query_result, tuple):
+                missing_fills, had_fill_query_errors = fill_query_result
+            else:
+                missing_fills = fill_query_result
+                had_fill_query_errors = False
             await self._reconcile_missing_fills(missing_fills, instrument_id)
 
             # Re-check using tolerance-aware comparison
@@ -1189,7 +1208,7 @@ class LiveExecutionEngine(ExecutionEngine):
                         f"(cached_qty={cached_qty_now}, venue_qty={venue_qty}); "
                         f"no further reconciliation attempts will be made",
                     )
-                elif not missing_fills:
+                elif not missing_fills and not had_fill_query_errors:
                     self._log.warning(
                         f"Position discrepancy for {instrument_id} persists but no missing fills found; "
                         f"possible causes: fills outside lookback window ({self.position_check_lookback_mins}min), "
@@ -1203,7 +1222,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         instrument_id: InstrumentId,
         clients: Iterable[ExecutionClient],
-    ) -> list[FillReport]:
+    ) -> tuple[list[FillReport], bool]:
         fill_lookback_start = self._clock.utc_now() - pd.Timedelta(
             minutes=self.position_check_lookback_mins,
         )
@@ -1225,8 +1244,10 @@ class LiveExecutionEngine(ExecutionEngine):
         fill_reports_all = await asyncio.gather(*fill_tasks, return_exceptions=True)
 
         venue_fills: list[FillReport] = []
+        had_fill_query_errors = False
         for fills_or_exception in fill_reports_all:
             if isinstance(fills_or_exception, Exception):
+                had_fill_query_errors = True
                 self._log.error(
                     f"Failed to generate fill reports for {instrument_id}: {fills_or_exception}",
                 )
@@ -1249,7 +1270,7 @@ class LiveExecutionEngine(ExecutionEngine):
             and fill.trade_id not in self._recent_fills_cache
         ]
 
-        return missing_fills
+        return missing_fills, had_fill_query_errors
 
     async def _reconcile_missing_fills(
         self,

@@ -3431,7 +3431,7 @@ async def test_query_and_find_missing_fills_finds_missing(
     exec_client.add_fill_reports(VenueOrderId("V-1"), [fill_report1, fill_report2])
 
     # Act
-    missing_fills = await live_exec_engine._query_and_find_missing_fills(
+    missing_fills, had_fill_query_errors = await live_exec_engine._query_and_find_missing_fills(
         AUDUSD_SIM.id,
         live_exec_engine._clients.values(),
     )
@@ -3439,6 +3439,7 @@ async def test_query_and_find_missing_fills_finds_missing(
     # Assert
     assert len(missing_fills) == 1
     assert missing_fills[0].trade_id == TradeId("T-2")
+    assert not had_fill_query_errors
 
 
 @pytest.mark.asyncio
@@ -3456,13 +3457,14 @@ async def test_query_and_find_missing_fills_handles_exceptions(live_exec_engine,
     exec_client.generate_fill_reports = raise_error
 
     # Act
-    missing_fills = await live_exec_engine._query_and_find_missing_fills(
+    missing_fills, had_fill_query_errors = await live_exec_engine._query_and_find_missing_fills(
         AUDUSD_SIM.id,
         live_exec_engine._clients.values(),
     )
 
     # Assert
     assert len(missing_fills) == 0
+    assert had_fill_query_errors
 
 
 @pytest.mark.asyncio
@@ -3526,13 +3528,14 @@ async def test_query_and_find_missing_fills_no_missing(
     exec_client.add_fill_reports(VenueOrderId("V-1"), [fill_report])
 
     # Act
-    missing_fills = await live_exec_engine._query_and_find_missing_fills(
+    missing_fills, had_fill_query_errors = await live_exec_engine._query_and_find_missing_fills(
         AUDUSD_SIM.id,
         live_exec_engine._clients.values(),
     )
 
     # Assert
     assert len(missing_fills) == 0
+    assert not had_fill_query_errors
 
 
 # =============================================================================
@@ -3760,6 +3763,7 @@ async def test_position_check_retries_stops_after_max(live_exec_engine, exec_cli
     # Arrange
     live_exec_engine.register_client(exec_client)
     live_exec_engine.position_check_retries = 2
+    live_exec_engine.generate_missing_orders = False
 
     if AUDUSD_SIM.id not in [i.id for i in cache.instruments()]:
         cache.add_instrument(AUDUSD_SIM)
