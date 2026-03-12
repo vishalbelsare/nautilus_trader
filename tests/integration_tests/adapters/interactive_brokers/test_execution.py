@@ -908,7 +908,7 @@ async def test_handle_position_update_retries_flat_report_after_transient_instru
     )
 
     contract_id = contract_details.contract.conId
-    exec_client._known_positions[contract_id] = Decimal("2")
+    exec_client._known_positions[contract_id] = Decimal(2)
     ib_position = SimpleNamespace(
         contract=contract_details.contract,
         quantity=Decimal(0),
@@ -927,7 +927,7 @@ async def test_handle_position_update_retries_flat_report_after_transient_instru
 
     await exec_client._handle_position_update(ib_position)
 
-    assert exec_client._known_positions[contract_id] == Decimal("2")
+    assert exec_client._known_positions[contract_id] == Decimal(2)
     send_position_status_report.assert_not_called()
 
     await exec_client._handle_position_update(ib_position)
