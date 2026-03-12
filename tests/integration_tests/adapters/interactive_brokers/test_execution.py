@@ -16,6 +16,7 @@
 import asyncio
 from decimal import Decimal
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from ibapi.order_state import OrderState as IBOrderState
@@ -27,6 +28,7 @@ from nautilus_trader.adapters.interactive_brokers.factories import (
 from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price
@@ -888,6 +890,55 @@ async def test_on_exec_details_uses_stored_avg_px(
 async def test_on_account_update(mocker, exec_client):
     # TODO:
     pass
+
+
+@pytest.mark.asyncio
+async def test_handle_position_update_retries_flat_report_after_transient_instrument_lookup_failure(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    contract_id = contract_details.contract.conId
+    exec_client._known_positions[contract_id] = Decimal("2")
+    ib_position = SimpleNamespace(
+        contract=contract_details.contract,
+        quantity=Decimal(0),
+        avg_cost=0.0,
+    )
+
+    get_instrument = mocker.patch.object(
+        exec_client.instrument_provider,
+        "get_instrument",
+        side_effect=[None, instrument],
+    )
+    send_position_status_report = mocker.patch.object(
+        exec_client,
+        "_send_position_status_report",
+    )
+
+    await exec_client._handle_position_update(ib_position)
+
+    assert exec_client._known_positions[contract_id] == Decimal("2")
+    send_position_status_report.assert_not_called()
+
+    await exec_client._handle_position_update(ib_position)
+
+    assert get_instrument.call_count == 2
+    send_position_status_report.assert_called_once()
+    position_report = send_position_status_report.call_args.args[0]
+    assert position_report.instrument_id == instrument.id
+    assert position_report.position_side == PositionSide.FLAT
+    assert position_report.quantity == instrument.make_qty(0)
+    assert contract_id not in exec_client._known_positions
 
 
 @pytest.fixture

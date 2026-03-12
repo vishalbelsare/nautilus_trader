@@ -2023,7 +2023,6 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                         f"Cannot process position closure: "
                         f"instrument not found for contract ID {contract_id}",
                     )
-                    self._known_positions.pop(contract_id, None)
                     return
 
                 if not self._cache.instrument(instrument.id):
@@ -2033,7 +2032,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                     account_id=self.account_id,
                     instrument_id=instrument.id,
                     position_side=PositionSide.FLAT,
-                    quantity=Quantity.zero(),
+                    quantity=instrument.make_qty(0),
                     report_id=UUID4(),
                     ts_last=self._clock.timestamp_ns(),
                     ts_init=self._clock.timestamp_ns(),
