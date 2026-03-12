@@ -1560,7 +1560,14 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             )
             return
 
-        nautilus_order = self._cache.order(ClientOrderId(order_ref))
+        nautilus_order = None
+        if order_ref:
+            nautilus_order = self._cache.order(ClientOrderId(order_ref))
+
+        if nautilus_order is None and venue_order_id is not None:
+            mapped_client_order_id = self._cache.client_order_id(venue_order_id)
+            if mapped_client_order_id is not None:
+                nautilus_order = self._cache.order(mapped_client_order_id)
 
         if nautilus_order:
             # Update order with average fill price if provided and order is filled/partially filled
@@ -1598,7 +1605,13 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             ):
                 self._order_filled_qty.pop(venue_order_id, None)
         else:
-            self._log.warning(f"ClientOrderId {order_ref} not found in Cache")
+            if venue_order_id is not None:
+                self._log.warning(
+                    f"Order callback not found in cache for order_ref={order_ref!r}, "
+                    f"venue_order_id={venue_order_id}",
+                )
+            else:
+                self._log.warning(f"ClientOrderId {order_ref} not found in Cache")
 
     def _on_exec_details(
         self,
@@ -1607,12 +1620,8 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         commission_report: CommissionAndFeesReport,
         contract: IBContract,
     ) -> None:
-        if not execution.orderRef:
-            self._log.warning(f"ClientOrderId not available, execution={execution.__dict__}")
-            return
-
-        client_order_id = ClientOrderId(order_ref)
         venue_order_id = get_venue_order_id(execution.orderId, execution.permId)
+        client_order_id = ClientOrderId(order_ref) if order_ref else None
 
         # Find order by client_order_id or venue_order_id
         nautilus_order = self._find_order_for_execution(client_order_id, venue_order_id)
@@ -1685,13 +1694,14 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
     def _find_order_for_execution(
         self,
-        client_order_id: ClientOrderId,
+        client_order_id: ClientOrderId | None,
         venue_order_id: VenueOrderId | None,
     ) -> Order | None:
         # Try client_order_id first
-        order = self._cache.order(client_order_id)
-        if order:
-            return order
+        if client_order_id is not None:
+            order = self._cache.order(client_order_id)
+            if order:
+                return order
 
         # Fallback to venue_order_id lookup
         if venue_order_id:

@@ -69,6 +69,7 @@ from nautilus_trader.model.book import py_should_handle_own_book_order
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.enums import trailing_offset_type_to_str
@@ -1012,6 +1013,25 @@ class LiveExecutionEngine(ExecutionEngine):
                 instrument_id,
             )
             if still_discrepant:
+                reconciliation_report = venue_report or self._create_flat_position_report(
+                    instrument_id=instrument_id,
+                    account_id=cached_positions[0].account_id,
+                )
+
+                if self.generate_missing_orders and self._reconcile_position_report(
+                    reconciliation_report,
+                ):
+                    current_positions = self._cache.positions_open(instrument_id=instrument_id)
+                    still_discrepant = self._check_position_discrepancy(
+                        current_positions,
+                        venue_report,
+                        instrument_id,
+                    )
+
+                if not still_discrepant:
+                    self._position_recon_retries.pop(instrument_id, None)
+                    continue
+
                 self._position_recon_retries[instrument_id] = retries + 1
                 if retries + 1 >= self.position_check_retries:
                     self._log.error(
@@ -1029,6 +1049,22 @@ class LiveExecutionEngine(ExecutionEngine):
                     )
             else:
                 self._position_recon_retries.pop(instrument_id, None)
+
+    def _create_flat_position_report(
+        self,
+        instrument_id: InstrumentId,
+        account_id: AccountId,
+    ) -> PositionStatusReport:
+        ts_now = self._clock.timestamp_ns()
+        return PositionStatusReport(
+            account_id=account_id,
+            instrument_id=instrument_id,
+            position_side=PositionSide.FLAT,
+            quantity=Quantity.zero(),
+            report_id=UUID4(),
+            ts_last=ts_now,
+            ts_init=ts_now,
+        )
 
     def _check_position_discrepancy(
         self,

@@ -3800,6 +3800,56 @@ async def test_position_check_retries_stops_after_max(live_exec_engine, exec_cli
 
 
 @pytest.mark.asyncio
+async def test_process_cached_position_discrepancies_reconciles_missing_venue_position_as_flat(
+    live_exec_engine,
+    exec_client,
+    cache,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    live_exec_engine.generate_missing_orders = True
+
+    if AUDUSD_SIM.id not in [i.id for i in cache.instruments()]:
+        cache.add_instrument(AUDUSD_SIM)
+
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM, order_side=OrderSide.BUY)
+    fill = TestEventStubs.order_filled(
+        order,
+        instrument=AUDUSD_SIM,
+        last_qty=Quantity.from_int(1000),
+        last_px=Price.from_str("1.00000"),
+        position_id=PositionId("P-FLAT-001"),
+    )
+    position = Position(instrument=AUDUSD_SIM, fill=fill)
+    cache.add_position(position, OmsType.NETTING)
+
+    async def no_missing_fills(instrument_id, clients):
+        return []
+
+    live_exec_engine._query_and_find_missing_fills = no_missing_fills
+
+    reconcile_calls = []
+    original_reconcile = live_exec_engine._reconcile_position_report
+
+    def spy_reconcile(report):
+        reconcile_calls.append(report)
+        return original_reconcile(report)
+
+    live_exec_engine._reconcile_position_report = spy_reconcile
+
+    # Act
+    await live_exec_engine._process_cached_position_discrepancies(
+        {AUDUSD_SIM.id: [position]},
+        {},
+    )
+
+    # Assert
+    assert len(reconcile_calls) == 1
+    assert reconcile_calls[0].instrument_id == AUDUSD_SIM.id
+    assert reconcile_calls[0].position_side == PositionSide.FLAT
+
+
+@pytest.mark.asyncio
 async def test_position_check_retries_clears_on_resolved(live_exec_engine, exec_client, cache):
     # Arrange
     live_exec_engine.register_client(exec_client)

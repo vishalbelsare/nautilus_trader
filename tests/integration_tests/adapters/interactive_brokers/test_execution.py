@@ -714,6 +714,83 @@ async def test_on_order_status_with_avg_px(
 
 
 @pytest.mark.asyncio
+async def test_on_order_status_resolves_cached_external_order_by_venue_order_id(
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    venue_order_id = VenueOrderId("9001")
+    external_order_id = TestIdStubs.client_order_id()
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=external_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+    exec_client._on_order_status(
+        order_ref="",
+        order_status="Cancelled",
+        avg_fill_price=0.0,
+        filled=Decimal(0),
+        remaining=Decimal(100),
+        venue_order_id=venue_order_id,
+    )
+
+    assert cache.order(external_order_id).status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_on_exec_details_resolves_cached_external_order_by_venue_order_id(
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    venue_order_id = VenueOrderId("9002")
+    external_order_id = TestIdStubs.client_order_id()
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=external_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = ""
+    commission_report = IBTestExecStubs.commission()
+
+    exec_client._on_exec_details(
+        order_ref="",
+        execution=execution,
+        commission_report=commission_report,
+        contract=contract_details.contract,
+    )
+
+    assert cache.order(external_order_id).filled_qty == Quantity(100, 0)
+    assert cache.order(external_order_id).status == OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
 async def test_on_exec_details_uses_stored_avg_px(
     mocker,
     exec_client,
