@@ -43,7 +43,7 @@ pub type Statistic = Arc<dyn PortfolioStatistic<Item = f64> + Send + Sync>;
 /// Analyzes portfolio performance and calculates various statistics.
 ///
 /// The `PortfolioAnalyzer` tracks account balances, positions, and realized PnLs
-/// to provide comprehensive portfolio analysis including returns, PnL calculations,
+/// to provide portfolio analysis including returns, PnL calculations,
 /// and customizable statistics.
 #[repr(C)]
 #[derive(Debug)]
@@ -107,7 +107,7 @@ impl PortfolioAnalyzer {
     }
 
     /// Removes a specific statistic from calculation.
-    pub fn deregister_statistic(&mut self, statistic: Statistic) {
+    pub fn deregister_statistic(&mut self, statistic: &Statistic) {
         self.statistics.remove(&statistic.name());
     }
 
@@ -208,17 +208,13 @@ impl PortfolioAnalyzer {
 
     /// Calculates total PnL including unrealized PnL if provided.
     ///
-    /// # Panics
-    ///
-    /// This function does not panic. The internal `expect` is guarded by a length
-    /// check ensuring at least one currency exists.
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No currency is specified in a multi-currency portfolio.
     /// - The specified currency is not found in account balances.
     /// - The unrealized PnL currency does not match the specified currency.
+    #[allow(clippy::missing_panics_doc)] // Guarded by length check
     pub fn total_pnl(
         &self,
         currency: Option<&Currency>,
@@ -232,7 +228,6 @@ impl PortfolioAnalyzer {
         let currency = match currency {
             Some(c) => c,
             None if self.account_balances.len() == 1 => {
-                // SAFETY: Length is 1, so next() always returns Some
                 self.account_balances.keys().next().expect("len is 1")
             }
             None => return Err("Currency must be specified for multi-currency portfolio"),
@@ -261,17 +256,13 @@ impl PortfolioAnalyzer {
 
     /// Calculates total PnL as a percentage of starting balance.
     ///
-    /// # Panics
-    ///
-    /// This function does not panic. The internal `expect` is guarded by a length
-    /// check ensuring at least one currency exists.
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No currency is specified in a multi-currency portfolio.
     /// - The specified currency is not found in account balances.
     /// - The unrealized PnL currency does not match the specified currency.
+    #[allow(clippy::missing_panics_doc)] // Guarded by length check
     pub fn total_pnl_percentage(
         &self,
         currency: Option<&Currency>,
@@ -285,7 +276,6 @@ impl PortfolioAnalyzer {
         let currency = match currency {
             Some(c) => c,
             None if self.account_balances.len() == 1 => {
-                // SAFETY: Length is 1, so next() always returns Some
                 self.account_balances.keys().next().expect("len is 1")
             }
             None => return Err("Currency must be specified for multi-currency portfolio"),
@@ -516,7 +506,7 @@ mod tests {
     }
 
     fn create_mock_position(
-        id: String,
+        id: &str,
         realized_pnl: f64,
         realized_return: f64,
         currency: Currency,
@@ -527,7 +517,7 @@ mod tests {
             trader_id: trader_id(),
             strategy_id: strategy_id_ema_cross(),
             instrument_id: instrument_id_aud_usd_sim(),
-            id: PositionId::new(&id),
+            id: PositionId::new(id),
             account_id: AccountId::new("test-account"),
             opening_order_id: ClientOrderId::test_default(),
             closing_order_id: None,
@@ -626,7 +616,7 @@ mod tests {
         }
         fn calculate_balance_locked(
             &mut self,
-            _: InstrumentAny,
+            _: &InstrumentAny,
             _: OrderSide,
             _: Quantity,
             _: Price,
@@ -636,15 +626,15 @@ mod tests {
         }
         fn calculate_pnls(
             &self,
-            _: InstrumentAny,
-            _: OrderFilled,
+            _: &InstrumentAny,
+            _: &OrderFilled,
             _: Option<Position>,
         ) -> Result<Vec<Money>, anyhow::Error> {
             todo!()
         }
         fn calculate_commission(
             &self,
-            _: InstrumentAny,
+            _: &InstrumentAny,
             _: Quantity,
             _: Price,
             _: LiquiditySide,
@@ -673,7 +663,7 @@ mod tests {
         assert!(analyzer.statistic("test_stat").is_some());
 
         // Test deregistration
-        analyzer.deregister_statistic(Arc::clone(&stat));
+        analyzer.deregister_statistic(&stat);
         assert!(analyzer.statistic("test_stat").is_none());
 
         // Test deregister all
@@ -757,8 +747,8 @@ mod tests {
         let currency = Currency::USD();
 
         let positions = vec![
-            create_mock_position("AUD/USD".to_owned(), 100.0, 0.1, currency),
-            create_mock_position("AUD/USD".to_owned(), 200.0, 0.2, currency),
+            create_mock_position("AUD/USD", 100.0, 0.1, currency),
+            create_mock_position("AUD/USD", 200.0, 0.2, currency),
         ];
 
         analyzer.add_positions(&positions);
@@ -790,8 +780,8 @@ mod tests {
 
         // Add some positions
         let positions = vec![
-            create_mock_position("AUD/USD".to_owned(), 100.0, 0.1, currency),
-            create_mock_position("AUD/USD".to_owned(), 200.0, 0.2, currency),
+            create_mock_position("AUD/USD", 100.0, 0.1, currency),
+            create_mock_position("AUD/USD", 200.0, 0.2, currency),
         ];
 
         let mut starting_balances = AHashMap::new();
@@ -833,8 +823,8 @@ mod tests {
         analyzer.register_statistic(Arc::clone(&stat));
 
         let positions = vec![
-            create_mock_position("AUD/USD".to_owned(), 100.0, 0.1, currency),
-            create_mock_position("AUD/USD".to_owned(), 200.0, 0.2, currency),
+            create_mock_position("AUD/USD", 100.0, 0.1, currency),
+            create_mock_position("AUD/USD", 200.0, 0.2, currency),
         ];
 
         let mut starting_balances = AHashMap::new();
@@ -871,12 +861,7 @@ mod tests {
         let mut analyzer = PortfolioAnalyzer::new();
         let currency = Currency::USD();
 
-        let positions = vec![create_mock_position(
-            "AUD/USD".to_owned(),
-            100.0,
-            0.1,
-            currency,
-        )];
+        let positions = vec![create_mock_position("AUD/USD", 100.0, 0.1, currency)];
         let mut starting_balances = AHashMap::new();
         starting_balances.insert(currency, Money::new(1000.0, currency));
         let mut current_balances = AHashMap::new();
@@ -903,18 +888,8 @@ mod tests {
         let mut analyzer = PortfolioAnalyzer::new();
         let currency = Currency::USD();
 
-        let positions1 = vec![create_mock_position(
-            "pos1".to_owned(),
-            100.0,
-            0.1,
-            currency,
-        )];
-        let positions2 = vec![create_mock_position(
-            "pos2".to_owned(),
-            200.0,
-            0.2,
-            currency,
-        )];
+        let positions1 = vec![create_mock_position("pos1", 100.0, 0.1, currency)];
+        let positions2 = vec![create_mock_position("pos2", 200.0, 0.2, currency)];
 
         let mut starting_balances = AHashMap::new();
         starting_balances.insert(currency, Money::new(1000.0, currency));

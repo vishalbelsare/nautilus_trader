@@ -30,6 +30,7 @@ use crate::{
 /// # Panics
 ///
 /// Panics if event conversion (`py_from_dict`) unwrap fails.
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyfunction]
 #[pyo3(signature = (events, calculate_account_state, allow_borrowing = false))]
 pub fn cash_account_from_account_events(
@@ -42,6 +43,7 @@ pub fn cash_account_from_account_events(
         .map(|obj| AccountState::py_from_dict(&obj))
         .collect::<PyResult<Vec<AccountState>>>()
         .unwrap();
+
     if account_events.is_empty() {
         return Err(to_pyvalue_err("No account events"));
     }
@@ -64,6 +66,7 @@ pub fn cash_account_from_account_events(
 /// # Panics
 ///
 /// Panics if event conversion (`py_from_dict`) unwrap fails.
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyfunction]
 pub fn margin_account_from_account_events(
     events: Vec<Bound<'_, PyDict>>,
@@ -74,6 +77,7 @@ pub fn margin_account_from_account_events(
         .map(|obj| AccountState::py_from_dict(&obj))
         .collect::<PyResult<Vec<AccountState>>>()
         .unwrap();
+
     if account_events.is_empty() {
         return Err(to_pyvalue_err("No account events"));
     }

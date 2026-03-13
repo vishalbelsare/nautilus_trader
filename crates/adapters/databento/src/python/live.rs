@@ -197,6 +197,7 @@ impl DatabentoLiveClient {
 
     #[pyo3(name = "subscribe")]
     #[pyo3(signature = (schema, instrument_ids, start=None, snapshot=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_subscribe(
         &mut self,
         schema: String,
@@ -246,6 +247,7 @@ impl DatabentoLiveClient {
         if self.is_closed {
             return Err(to_pyruntime_err("Client already closed"));
         }
+
         if self.is_running {
             return Err(to_pyruntime_err("Client already running"));
         }
@@ -257,7 +259,7 @@ impl DatabentoLiveClient {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<LiveMessage>(self.buffer_size);
 
         // Consume the receiver
-        // SAFETY: We guard the client from being started more than once with the
+        // We guard the client from being started more than once with the
         // `is_running` flag, so here it is safe to unwrap the command receiver.
         let cmd_rx = self
             .cmd_rx
@@ -303,6 +305,7 @@ impl DatabentoLiveClient {
         if !self.is_running {
             return Err(to_pyruntime_err("Client never started"));
         }
+
         if self.is_closed {
             return Err(to_pyruntime_err("Client already closed"));
         }

@@ -37,6 +37,7 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderInitialized {
     #[allow(clippy::too_many_arguments)]
     #[new]
@@ -159,6 +160,7 @@ impl OrderInitialized {
         dict.set_item("reconciliation", self.reconciliation)?;
         // TODO remove options as in legacy cython only
         let options = PyDict::new(py);
+
         if self.order_type == OrderType::StopMarket {
             options.set_item("trigger_type", self.trigger_type.map(|x| x.to_string()))?;
             options.set_item("trigger_price", self.trigger_price.map(|x| x.to_string()))?;

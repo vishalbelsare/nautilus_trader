@@ -45,18 +45,18 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide, PositionSideSpecified},
+    enums::{
+        LiquiditySide, OmsType, OrderSide, PositionSideSpecified, TrailingOffsetType, TriggerType,
+    },
     events::{
-        AccountState, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderModifyRejected,
-        OrderRejected, OrderUpdated,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
+        OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
     },
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, Venue, VenueOrderId},
     instruments::Instrument,
-    orders::{Order, OrderAny},
+    orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     http::{
         BinanceFuturesHttpError,
-        client::{BinanceFuturesHttpClient, BinanceFuturesInstrument, is_algo_order_type},
+        client::{BinanceFuturesHttpClient, is_algo_order_type},
         models::{BatchOrderResult, BinancePositionRisk},
         query::{
             BatchCancelItem, BinanceAllOrdersParamsBuilder, BinanceOpenOrdersParamsBuilder,
@@ -75,15 +75,21 @@ use super::{
     },
     websocket::{
         client::BinanceFuturesWebSocketClient,
-        handler_exec::BinanceFuturesExecWsFeedHandler,
-        messages::{ExecHandlerCommand, NautilusExecWsMessage},
+        messages::{BinanceExecutionType, BinanceFuturesExecWsMessage, NautilusWsMessage},
+        parse_exec::{
+            decode_algo_client_id, parse_futures_account_update,
+            parse_futures_algo_update_to_order_status, parse_futures_order_update_to_fill,
+            parse_futures_order_update_to_order_status,
+        },
     },
 };
 use crate::{
     common::{
-        consts::BINANCE_VENUE,
+        consts::{BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_VENUE},
         credential::resolve_credentials,
-        enums::{BinancePositionSide, BinanceProductType},
+        dispatch::{OrderIdentity, WsDispatchState, ensure_accepted_emitted},
+        encoder::{decode_broker_id, encode_broker_id},
+        enums::{BinancePositionSide, BinanceProductType, BinanceWorkingType},
     },
     config::BinanceExecClientConfig,
     futures::http::models::BinanceFuturesAccountInfo,
@@ -106,14 +112,14 @@ pub struct BinanceFuturesExecutionClient {
     clock: &'static AtomicTime,
     config: BinanceExecClientConfig,
     emitter: ExecutionEventEmitter,
+    dispatch_state: Arc<WsDispatchState>,
     product_type: BinanceProductType,
     http_client: BinanceFuturesHttpClient,
     ws_client: Option<BinanceFuturesWebSocketClient>,
-    exec_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<ExecHandlerCommand>>,
     listen_key: Arc<RwLock<Option<String>>>,
     cancellation_token: CancellationToken,
-    handler_signal: Arc<AtomicBool>,
     triggered_algo_order_ids: Arc<RwLock<AHashSet<ClientOrderId>>>,
+    algo_client_order_ids: Arc<RwLock<AHashSet<ClientOrderId>>>,
     ws_task: Mutex<Option<JoinHandle<()>>>,
     keepalive_task: Mutex<Option<JoinHandle<()>>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -141,9 +147,12 @@ impl BinanceFuturesExecutionClient {
             product_type,
         )?;
 
+        let clock = get_atomic_clock_realtime();
+
         let http_client = BinanceFuturesHttpClient::new(
             product_type,
             config.environment,
+            clock,
             Some(api_key.clone()),
             Some(api_secret.clone()),
             config.base_url_http.clone(),
@@ -162,8 +171,6 @@ impl BinanceFuturesExecutionClient {
             Some(20), // Heartbeat interval
         )
         .context("failed to construct Binance Futures WebSocket client")?;
-
-        let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
@@ -177,14 +184,14 @@ impl BinanceFuturesExecutionClient {
             clock,
             config,
             emitter,
+            dispatch_state: Arc::new(WsDispatchState::default()),
             product_type,
             http_client,
             ws_client: Some(ws_client),
-            exec_cmd_tx: None,
             listen_key: Arc::new(RwLock::new(None)),
             cancellation_token: CancellationToken::new(),
-            handler_signal: Arc::new(AtomicBool::new(false)),
             triggered_algo_order_ids: Arc::new(RwLock::new(AHashSet::new())),
+            algo_client_order_ids: Arc::new(RwLock::new(AHashSet::new())),
             ws_task: Mutex::new(None),
             keepalive_task: Mutex::new(None),
             pending_tasks: Mutex::new(Vec::new()),
@@ -299,77 +306,6 @@ impl BinanceFuturesExecutionClient {
         Ok(response.dual_side_position)
     }
 
-    /// Handles execution events from the handler.
-    ///
-    /// The handler has already correlated WebSocket updates with order context
-    /// (strategy_id, etc.) and emits normalized Nautilus events.
-    fn handle_exec_event(message: NautilusExecWsMessage, emitter: &ExecutionEventEmitter) {
-        match message {
-            NautilusExecWsMessage::OrderAccepted(event) => {
-                emitter.send_order_event(OrderEventAny::Accepted(event));
-            }
-            NautilusExecWsMessage::OrderCanceled(event) => {
-                emitter.send_order_event(OrderEventAny::Canceled(event));
-            }
-            NautilusExecWsMessage::OrderRejected(event) => {
-                emitter.send_order_event(OrderEventAny::Rejected(event));
-            }
-            NautilusExecWsMessage::OrderFilled(event) => {
-                emitter.send_order_event(OrderEventAny::Filled(event));
-            }
-            NautilusExecWsMessage::OrderUpdated(event) => {
-                emitter.send_order_event(OrderEventAny::Updated(event));
-            }
-            NautilusExecWsMessage::AccountUpdate(event) => {
-                emitter.send_account_state(event);
-            }
-            NautilusExecWsMessage::ListenKeyExpired => {
-                log::warn!("Listen key expired - reconnection required");
-            }
-            NautilusExecWsMessage::Reconnected => {
-                log::info!("User data stream WebSocket reconnected");
-            }
-        }
-    }
-
-    /// Registers an order with the execution handler for context tracking.
-    fn register_order(&self, order: &OrderAny) {
-        if let Some(ref cmd_tx) = self.exec_cmd_tx {
-            let cmd = ExecHandlerCommand::RegisterOrder {
-                client_order_id: order.client_order_id(),
-                trader_id: order.trader_id(),
-                strategy_id: order.strategy_id(),
-                instrument_id: order.instrument_id(),
-            };
-            if let Err(e) = cmd_tx.send(cmd) {
-                log::error!("Failed to register order with handler: {e}");
-            }
-        }
-    }
-
-    /// Registers a cancel request with the execution handler for context tracking.
-    fn register_cancel(
-        &self,
-        client_order_id: ClientOrderId,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        venue_order_id: Option<VenueOrderId>,
-    ) {
-        if let Some(ref cmd_tx) = self.exec_cmd_tx {
-            let cmd = ExecHandlerCommand::RegisterCancel {
-                client_order_id,
-                trader_id,
-                strategy_id,
-                instrument_id,
-                venue_order_id,
-            };
-            if let Err(e) = cmd_tx.send(cmd) {
-                log::error!("Failed to register cancel with handler: {e}");
-            }
-        }
-    }
-
     fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         let http_client = self.http_client.clone();
 
@@ -379,9 +315,6 @@ impl BinanceFuturesExecutionClient {
             .order(&cmd.client_order_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-
-        // Register order with handler for context tracking before HTTP request
-        self.register_order(&order);
 
         let emitter = self.emitter.clone();
         let trader_id = self.core.trader_id;
@@ -397,11 +330,50 @@ impl BinanceFuturesExecutionClient {
         let price = order.price();
         let trigger_price = order.trigger_price();
         let reduce_only = order.is_reduce_only();
+        let post_only = order.is_post_only();
+        let activation_price = order.activation_price();
+        let trailing_offset = order.trailing_offset();
+        let trigger_type = order.trigger_type();
         let position_side = self.determine_position_side(order_side, reduce_only);
+
+        // Register identity for tracked/external dispatch routing
+        self.dispatch_state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                instrument_id,
+                strategy_id,
+                order_side,
+                order_type,
+            },
+        );
 
         // HTTP only generates OrderRejected on failure.
         // OrderAccepted comes from WebSocket (ORDER_TRADE_UPDATE or ALGO_UPDATE).
         let use_algo_api = is_algo_order_type(order_type);
+
+        // Convert trailing offset (basis points) to Binance callback rate (percentage).
+        // Binance accepts 1 decimal place (0.1% granularity = 10 bp increments).
+        let callback_rate = trailing_offset
+            .map(|offset| {
+                let rate = offset / rust_decimal::Decimal::ONE_HUNDRED;
+                let rounded = rate.round_dp(1);
+                if rounded != rate {
+                    anyhow::bail!(
+                        "Trailing offset {offset} bp is not a multiple of 10 bp \
+                         (Binance requires 0.1% granularity)"
+                    );
+                }
+                Ok(rounded.to_string())
+            })
+            .transpose()?;
+
+        let working_type = match trigger_type {
+            Some(TriggerType::MarkPrice) => Some(BinanceWorkingType::MarkPrice),
+            Some(TriggerType::LastPrice | TriggerType::Default) => {
+                Some(BinanceWorkingType::ContractPrice)
+            }
+            _ => None,
+        };
 
         self.spawn_task("submit_order", async move {
             let result = if use_algo_api {
@@ -418,6 +390,9 @@ impl BinanceFuturesExecutionClient {
                         trigger_price,
                         reduce_only,
                         position_side,
+                        activation_price,
+                        callback_rate,
+                        working_type,
                     )
                     .await
             } else {
@@ -433,6 +408,7 @@ impl BinanceFuturesExecutionClient {
                         price,
                         trigger_price,
                         reduce_only,
+                        post_only,
                         position_side,
                     )
                     .await
@@ -477,18 +453,9 @@ impl BinanceFuturesExecutionClient {
         Ok(())
     }
 
-    fn cancel_order_internal(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order_internal(&self, cmd: &CancelOrder) {
         let http_client = self.http_client.clone();
         let command = cmd.clone();
-
-        // Register cancel with handler for context tracking before HTTP request
-        self.register_cancel(
-            command.client_order_id,
-            self.core.trader_id,
-            command.strategy_id,
-            command.instrument_id,
-            command.venue_order_id,
-        );
 
         // Non-triggered algo orders use algo cancel endpoint, triggered use regular
         let is_algo = self
@@ -562,8 +529,6 @@ impl BinanceFuturesExecutionClient {
 
             Ok(())
         });
-
-        Ok(())
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -762,82 +727,40 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 .map_err(|e| anyhow::anyhow!("failed to subscribe to user data stream: {e}"))?;
             log::info!("Subscribed to user data stream");
 
-            // Create channels for the execution handler
-            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Store command channel for order registration
-            self.exec_cmd_tx = Some(cmd_tx.clone());
-
-            // Create and initialize the execution handler
-            let mut handler = BinanceFuturesExecWsFeedHandler::new(
-                self.clock,
-                self.core.trader_id,
-                self.core.account_id,
-                self.core.account_type,
-                self.product_type,
-                self.handler_signal.clone(),
-                self.triggered_algo_order_ids.clone(),
-                cmd_rx,
-                raw_rx,
-            );
-
-            // Initialize handler with instruments
-            let instruments_for_handler: Vec<BinanceFuturesInstrument> = self
-                .http_client
-                .instruments_cache()
-                .iter()
-                .map(|r| r.value().clone())
-                .collect();
-            if let Err(e) = cmd_tx.send(ExecHandlerCommand::InitializeInstruments(
-                instruments_for_handler,
-            )) {
-                log::error!("Failed to send instruments to handler: {e}");
-            }
-
-            // Set up raw message forwarding from WebSocket to handler
             let stream = ws_client.stream();
+            let emitter = self.emitter.clone();
+            let http_client = self.http_client.clone();
+            let account_id = self.core.account_id;
+            let clock = self.clock;
+            let product_type = self.product_type;
+            let dispatch_state = self.dispatch_state.clone();
+            let triggered_algo_ids = self.triggered_algo_order_ids.clone();
+            let algo_client_ids = self.algo_client_order_ids.clone();
             let cancel = self.cancellation_token.clone();
-            let raw_forward_task = get_runtime().spawn(async move {
+
+            let ws_task = get_runtime().spawn(async move {
                 pin_mut!(stream);
                 loop {
                     tokio::select! {
                         Some(message) = stream.next() => {
-                            if let Err(e) = raw_tx.send(message) {
-                                log::error!("Failed to forward raw message to handler: {e}");
-                                break;
-                            }
+                            dispatch_ws_message(
+                                message,
+                                &emitter,
+                                &http_client,
+                                account_id,
+                                product_type,
+                                clock,
+                                &dispatch_state,
+                                &triggered_algo_ids,
+                                &algo_client_ids,
+                            );
                         }
                         () = cancel.cancelled() => {
-                            log::debug!("Raw message forwarding task cancelled");
+                            log::debug!("WS dispatch task cancelled");
                             break;
                         }
                     }
                 }
-            });
-
-            let emitter = self.emitter.clone();
-            let handler_cancel = self.cancellation_token.clone();
-
-            let ws_task = get_runtime().spawn(async move {
-                loop {
-                    tokio::select! {
-                        msg = handler.next() => {
-                            match msg {
-                                Some(event) => {
-                                    Self::handle_exec_event(event, &emitter);
-                                }
-                                None => break,
-                            }
-                        }
-                        () = handler_cancel.cancelled() => {
-                            log::debug!("Handler task cancelled");
-                            break;
-                        }
-                    }
-                }
-
-                raw_forward_task.abort();
             });
             *self.ws_task.lock().expect(MUTEX_POISONED) = Some(ws_task);
 
@@ -856,6 +779,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                 let guard = listen_key_ref.read().expect(MUTEX_POISONED);
                                 guard.clone()
                             };
+
                             if let Some(ref key) = key {
                                 match http_client.keepalive_listen_key(key).await {
                                     Ok(()) => {
@@ -941,6 +865,324 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         Ok(())
     }
 
+    async fn generate_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_order_status_report requires instrument_id: {cmd:?}");
+            return Ok(None);
+        };
+
+        let symbol = instrument_id.symbol.to_string();
+        let order_id = cmd.venue_order_id.as_ref().map(|id| {
+            id.inner()
+                .parse::<i64>()
+                .expect("venue_order_id should be numeric")
+        });
+        let orig_client_order_id = cmd
+            .client_order_id
+            .map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_FUTURES_BROKER_ID));
+
+        let mut builder = BinanceOrderQueryParamsBuilder::default();
+        builder.symbol(symbol);
+
+        if let Some(oid) = order_id {
+            builder.order_id(oid);
+        }
+
+        if let Some(ref coid) = orig_client_order_id {
+            builder.orig_client_order_id(coid.clone());
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (_, size_precision) = self.get_instrument_precision(instrument_id);
+        let ts_init = self.clock.get_time_ns();
+
+        match self.http_client.query_order(&params).await {
+            Ok(order) => {
+                let report = order.to_order_status_report(
+                    self.core.account_id,
+                    instrument_id,
+                    size_precision,
+                    ts_init,
+                )?;
+                Ok(Some(report))
+            }
+            Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => {
+                // Order not found in regular API, try algo order API
+                let Some(client_order_id) = cmd.client_order_id else {
+                    return Ok(None);
+                };
+
+                match self.http_client.query_algo_order(client_order_id).await {
+                    Ok(algo_order) => {
+                        let report = algo_order.to_order_status_report(
+                            self.core.account_id,
+                            instrument_id,
+                            size_precision,
+                            ts_init,
+                        )?;
+                        Ok(Some(report))
+                    }
+                    Err(e) => {
+                        log::debug!("Algo order query also failed: {e}");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let ts_init = self.clock.get_time_ns();
+        let mut reports = Vec::new();
+
+        if cmd.open_only {
+            let symbol = cmd.instrument_id.map(|id| id.symbol.to_string());
+            let mut builder = BinanceOpenOrdersParamsBuilder::default();
+
+            if let Some(s) = symbol {
+                builder.symbol(s);
+            }
+            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let (orders, algo_orders) = tokio::try_join!(
+                self.http_client.query_open_orders(&params),
+                self.http_client.query_open_algo_orders(cmd.instrument_id),
+            )?;
+
+            for order in orders {
+                if let Some(instrument_id) = cmd.instrument_id {
+                    let (_, size_precision) = self.get_instrument_precision(instrument_id);
+
+                    if let Ok(report) = order.to_order_status_report(
+                        self.core.account_id,
+                        instrument_id,
+                        size_precision,
+                        ts_init,
+                    ) {
+                        reports.push(report);
+                    }
+                } else {
+                    let cache = self.core.cache();
+                    if let Some(instrument) = cache
+                        .instruments(&BINANCE_VENUE, None)
+                        .into_iter()
+                        .find(|i| i.symbol().as_str() == order.symbol.as_str())
+                        && let Ok(report) = order.to_order_status_report(
+                            self.core.account_id,
+                            instrument.id(),
+                            instrument.size_precision(),
+                            ts_init,
+                        )
+                    {
+                        reports.push(report);
+                    }
+                }
+            }
+
+            for algo_order in algo_orders {
+                if let Some(instrument_id) = cmd.instrument_id {
+                    let (_, size_precision) = self.get_instrument_precision(instrument_id);
+
+                    if let Ok(report) = algo_order.to_order_status_report(
+                        self.core.account_id,
+                        instrument_id,
+                        size_precision,
+                        ts_init,
+                    ) {
+                        reports.push(report);
+                    }
+                } else {
+                    let cache = self.core.cache();
+                    if let Some(instrument) = cache
+                        .instruments(&BINANCE_VENUE, None)
+                        .into_iter()
+                        .find(|i| i.symbol().as_str() == algo_order.symbol.as_str())
+                        && let Ok(report) = algo_order.to_order_status_report(
+                            self.core.account_id,
+                            instrument.id(),
+                            instrument.size_precision(),
+                            ts_init,
+                        )
+                    {
+                        reports.push(report);
+                    }
+                }
+            }
+        } else if let Some(instrument_id) = cmd.instrument_id {
+            let symbol = instrument_id.symbol.to_string();
+            let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000); // ns to ms
+            let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
+
+            let mut builder = BinanceAllOrdersParamsBuilder::default();
+            builder.symbol(symbol);
+
+            if let Some(st) = start_time {
+                builder.start_time(st);
+            }
+
+            if let Some(et) = end_time {
+                builder.end_time(et);
+            }
+            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let orders = self.http_client.query_all_orders(&params).await?;
+            let (_, size_precision) = self.get_instrument_precision(instrument_id);
+
+            for order in orders {
+                if let Ok(report) = order.to_order_status_report(
+                    self.core.account_id,
+                    instrument_id,
+                    size_precision,
+                    ts_init,
+                ) {
+                    reports.push(report);
+                }
+            }
+        }
+
+        Ok(reports)
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_fill_reports requires instrument_id for Binance Futures");
+            return Ok(Vec::new());
+        };
+
+        let symbol = instrument_id.symbol.to_string();
+        let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000);
+        let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
+
+        let mut builder = BinanceUserTradesParamsBuilder::default();
+        builder.symbol(symbol);
+
+        if let Some(st) = start_time {
+            builder.start_time(st);
+        }
+
+        if let Some(et) = end_time {
+            builder.end_time(et);
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let trades = self.http_client.query_user_trades(&params).await?;
+        let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
+        let ts_init = self.clock.get_time_ns();
+
+        let mut reports = Vec::new();
+        for trade in trades {
+            if let Ok(report) = trade.to_fill_report(
+                self.core.account_id,
+                instrument_id,
+                price_precision,
+                size_precision,
+                ts_init,
+            ) {
+                reports.push(report);
+            }
+        }
+
+        Ok(reports)
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let symbol = cmd.instrument_id.map(|id| id.symbol.to_string());
+
+        let mut builder = BinancePositionRiskParamsBuilder::default();
+
+        if let Some(s) = symbol {
+            builder.symbol(s);
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let positions = self.http_client.query_positions(&params).await?;
+
+        let mut reports = Vec::new();
+        for position in positions {
+            let position_amt: f64 = position.position_amt.parse().unwrap_or(0.0);
+            if position_amt == 0.0 {
+                continue;
+            }
+
+            let cache = self.core.cache();
+            if let Some(instrument) = cache
+                .instruments(&BINANCE_VENUE, None)
+                .into_iter()
+                .find(|i| i.symbol().as_str() == position.symbol.as_str())
+                && let Ok(report) = self.create_position_report(
+                    &position,
+                    instrument.id(),
+                    instrument.size_precision(),
+                )
+            {
+                reports.push(report);
+            }
+        }
+
+        Ok(reports)
+    }
+
+    async fn generate_mass_status(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
+
+        let ts_now = self.clock.get_time_ns();
+
+        let start = lookback_mins.map(|mins| {
+            let lookback_ns = mins * 60 * 1_000_000_000;
+            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
+        });
+
+        let order_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .open_only(true)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let position_cmd = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (order_reports, position_reports) = tokio::try_join!(
+            self.generate_order_status_reports(&order_cmd),
+            self.generate_position_status_reports(&position_cmd),
+        )?;
+
+        log::info!("Received {} OrderStatusReports", order_reports.len());
+        log::info!("Received {} PositionReports", position_reports.len());
+
+        let mut mass_status = ExecutionMassStatus::new(
+            self.core.client_id,
+            self.core.account_id,
+            *BINANCE_VENUE,
+            ts_now,
+            None,
+        );
+
+        mass_status.add_order_reports(order_reports);
+        mass_status.add_position_reports(position_reports);
+
+        Ok(Some(mass_status))
+    }
+
     fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
         self.update_account_state()
     }
@@ -952,6 +1194,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let command = cmd.clone();
         let emitter = self.emitter.clone();
         let account_id = self.core.account_id;
+        let clock = self.clock;
 
         let symbol = command.instrument_id.symbol.to_string();
         let order_id = command.venue_order_id.map(|id| {
@@ -959,15 +1202,20 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 .parse::<i64>()
                 .expect("venue_order_id should be numeric")
         });
-        let orig_client_order_id = Some(command.client_order_id.to_string());
+        let orig_client_order_id = Some(encode_broker_id(
+            &command.client_order_id,
+            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+        ));
         let (_, size_precision) = self.get_instrument_precision(command.instrument_id);
 
         self.spawn_task("query_order", async move {
             let mut builder = BinanceOrderQueryParamsBuilder::default();
             builder.symbol(symbol.clone());
+
             if let Some(oid) = order_id {
                 builder.order_id(oid);
             }
+
             if let Some(coid) = orig_client_order_id {
                 builder.orig_client_order_id(coid);
             }
@@ -977,10 +1225,12 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
             match result {
                 Ok(order) => {
+                    let ts_init = clock.get_time_ns();
                     let report = order.to_order_status_report(
                         account_id,
                         command.instrument_id,
                         size_precision,
+                        ts_init,
                     )?;
 
                     emitter.send_order_status_report(report);
@@ -1065,6 +1315,25 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             let client_order_id = order.client_order_id();
             log::warn!("Cannot submit closed order {client_order_id}");
             return Ok(());
+        }
+
+        // Validate trailing offset before submission (Initialized -> Denied is valid,
+        // but Submitted -> Denied is not, so validate before emitting OrderSubmitted)
+        if let Some(offset_type) = order.trailing_offset_type() {
+            if offset_type != TrailingOffsetType::BasisPoints {
+                anyhow::bail!(
+                    "Binance only supports TrailingOffsetType::BasisPoints, received {offset_type:?}"
+                );
+            }
+
+            if let Some(offset) = order.trailing_offset() {
+                let rate = (offset / rust_decimal::Decimal::ONE_HUNDRED).round_dp(1);
+                if rate < rust_decimal::Decimal::new(1, 1)
+                    || rate > rust_decimal::Decimal::new(10, 0)
+                {
+                    anyhow::bail!("callbackRate {rate}% out of Binance range [0.1, 10.0]");
+                }
+            }
         }
 
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
@@ -1214,7 +1483,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 
     fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
-        self.cancel_order_internal(cmd)
+        self.cancel_order_internal(cmd);
+        Ok(())
     }
 
     fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
@@ -1277,13 +1547,19 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                             } else {
                                 BatchCancelItem::by_client_order_id(
                                     command.instrument_id.symbol.to_string(),
-                                    cancel.client_order_id.to_string(),
+                                    encode_broker_id(
+                                        &cancel.client_order_id,
+                                        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+                                    ),
                                 )
                             }
                         } else {
                             BatchCancelItem::by_client_order_id(
                                 command.instrument_id.symbol.to_string(),
-                                cancel.client_order_id.to_string(),
+                                encode_broker_id(
+                                    &cancel.client_order_id,
+                                    BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+                                ),
                             )
                         }
                     })
@@ -1366,299 +1642,543 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         Ok(())
     }
+}
 
-    async fn generate_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let Some(instrument_id) = cmd.instrument_id else {
-            log::warn!("generate_order_status_report requires instrument_id: {cmd:?}");
-            return Ok(None);
-        };
-
-        let symbol = instrument_id.symbol.to_string();
-        let order_id = cmd.venue_order_id.as_ref().map(|id| {
-            id.inner()
-                .parse::<i64>()
-                .expect("venue_order_id should be numeric")
-        });
-        let orig_client_order_id = cmd.client_order_id.map(|id| id.to_string());
-
-        let mut builder = BinanceOrderQueryParamsBuilder::default();
-        builder.symbol(symbol);
-        if let Some(oid) = order_id {
-            builder.order_id(oid);
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ws_message(
+    msg: NautilusWsMessage,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    triggered_algo_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+    algo_client_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+) {
+    match msg {
+        NautilusWsMessage::ExecRaw(exec_msg) => {
+            dispatch_exec_message(
+                exec_msg,
+                emitter,
+                http_client,
+                account_id,
+                product_type,
+                clock,
+                dispatch_state,
+                triggered_algo_ids,
+                algo_client_ids,
+            );
         }
-        if let Some(ref coid) = orig_client_order_id {
-            builder.orig_client_order_id(coid.clone());
+        NautilusWsMessage::Reconnected => {
+            log::info!("User data stream WebSocket reconnected");
         }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+        NautilusWsMessage::Error(err) => {
+            log::error!(
+                "User data stream WebSocket error: code={}, msg={}",
+                err.code,
+                err.msg
+            );
+        }
+        NautilusWsMessage::Data(_) | NautilusWsMessage::Exec(_) => {}
+    }
+}
 
-        let (_, size_precision) = self.get_instrument_precision(instrument_id);
-
-        match self.http_client.query_order(&params).await {
-            Ok(order) => {
-                let report = order.to_order_status_report(
-                    self.core.account_id,
-                    instrument_id,
-                    size_precision,
-                )?;
-                Ok(Some(report))
+#[allow(clippy::too_many_arguments)]
+fn dispatch_exec_message(
+    msg: BinanceFuturesExecWsMessage,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    triggered_algo_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+    algo_client_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+) {
+    match msg {
+        BinanceFuturesExecWsMessage::OrderUpdate(update) => {
+            dispatch_order_update(
+                &update,
+                emitter,
+                http_client,
+                account_id,
+                product_type,
+                clock,
+                dispatch_state,
+            );
+        }
+        BinanceFuturesExecWsMessage::AlgoUpdate(update) => {
+            dispatch_algo_update(
+                &update,
+                emitter,
+                http_client,
+                account_id,
+                product_type,
+                clock,
+                dispatch_state,
+                triggered_algo_ids,
+                algo_client_ids,
+            );
+        }
+        BinanceFuturesExecWsMessage::AccountUpdate(update) => {
+            let ts_init = clock.get_time_ns();
+            if let Some(state) = parse_futures_account_update(&update, account_id, ts_init) {
+                emitter.send_account_state(state);
             }
-            Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => {
-                // Order not found in regular API, try algo order API
-                let Some(client_order_id) = cmd.client_order_id else {
-                    return Ok(None);
+        }
+        BinanceFuturesExecWsMessage::MarginCall(mc) => {
+            log::warn!(
+                "Margin call: cross_wallet_balance={}, positions_at_risk={}",
+                mc.cross_wallet_balance,
+                mc.positions.len()
+            );
+        }
+        BinanceFuturesExecWsMessage::AccountConfigUpdate(cfg) => {
+            if let Some(ref lc) = cfg.leverage_config {
+                log::info!(
+                    "Account config update: symbol={}, leverage={}",
+                    lc.symbol,
+                    lc.leverage
+                );
+            }
+        }
+        BinanceFuturesExecWsMessage::ListenKeyExpired => {
+            log::warn!("Listen key expired, awaiting reconnection");
+        }
+    }
+}
+
+/// Dispatches a Futures order update with tracked/untracked routing.
+///
+/// Tracked orders produce proper order events. Untracked orders fall back
+/// to execution reports for reconciliation.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_order_update(
+    msg: &super::websocket::messages::BinanceFuturesOrderUpdateMsg,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+) {
+    let order = &msg.order;
+    let symbol_ustr = ustr::Ustr::from(order.symbol.as_str());
+    let ts_init = clock.get_time_ns();
+    let ts_event = UnixNanos::from((msg.event_time * 1_000_000) as u64);
+
+    let cache = http_client.instruments_cache();
+    let cached_instrument = cache.get(&symbol_ustr);
+
+    if cached_instrument.is_none() && order.execution_type == BinanceExecutionType::Trade {
+        log::error!(
+            "Instrument not in cache for fill: {}, skipping to avoid precision mismatch",
+            order.symbol
+        );
+        return;
+    }
+
+    let (instrument_id, price_precision, size_precision) = if let Some(inst) = cached_instrument {
+        (
+            inst.id(),
+            inst.price_precision() as u8,
+            inst.quantity_precision() as u8,
+        )
+    } else {
+        let id = crate::common::symbol::format_instrument_id(&symbol_ustr, product_type);
+        log::warn!(
+            "Instrument not in cache for {}, using default precision",
+            order.symbol
+        );
+        (id, 8, 8)
+    };
+
+    let client_order_id = ClientOrderId::new(decode_broker_id(
+        &order.client_order_id,
+        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+    ));
+
+    let identity = dispatch_state
+        .order_identities
+        .get(&client_order_id)
+        .map(|r| r.clone());
+
+    if let Some(identity) = identity {
+        let venue_order_id = VenueOrderId::new(order.order_id.to_string());
+
+        match order.execution_type {
+            BinanceExecutionType::New => {
+                if dispatch_state.emitted_accepted.contains(&client_order_id)
+                    || dispatch_state.filled_orders.contains(&client_order_id)
+                {
+                    log::debug!("Skipping duplicate Accepted for {client_order_id}");
+                    return;
+                }
+                dispatch_state.insert_accepted(client_order_id);
+                let accepted = OrderAccepted::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    account_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                );
+                emitter.send_order_event(OrderEventAny::Accepted(accepted));
+            }
+            BinanceExecutionType::Trade => {
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    dispatch_state,
+                    ts_init,
+                );
+
+                let last_qty: f64 = order.last_filled_qty.parse().unwrap_or(0.0);
+                let last_px: f64 = order.last_filled_price.parse().unwrap_or(0.0);
+                let commission: f64 = order
+                    .commission
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0.0);
+                let commission_currency = order
+                    .commission_asset
+                    .as_ref()
+                    .map_or_else(Currency::USDT, |a| Currency::from(a.as_str()));
+
+                let liquidity_side = if order.is_maker {
+                    LiquiditySide::Maker
+                } else {
+                    LiquiditySide::Taker
                 };
 
-                match self.http_client.query_algo_order(client_order_id).await {
-                    Ok(algo_order) => {
-                        let report = algo_order.to_order_status_report(
-                            self.core.account_id,
-                            instrument_id,
-                            size_precision,
-                        )?;
-                        Ok(Some(report))
-                    }
-                    Err(e) => {
-                        log::debug!("Algo order query also failed: {e}");
-                        Ok(None)
-                    }
-                }
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn generate_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let mut reports = Vec::new();
-
-        if cmd.open_only {
-            let symbol = cmd.instrument_id.map(|id| id.symbol.to_string());
-            let mut builder = BinanceOpenOrdersParamsBuilder::default();
-            if let Some(s) = symbol {
-                builder.symbol(s);
-            }
-            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let (orders, algo_orders) = tokio::try_join!(
-                self.http_client.query_open_orders(&params),
-                self.http_client.query_open_algo_orders(cmd.instrument_id),
-            )?;
-
-            for order in orders {
-                if let Some(instrument_id) = cmd.instrument_id {
-                    let (_, size_precision) = self.get_instrument_precision(instrument_id);
-                    if let Ok(report) = order.to_order_status_report(
-                        self.core.account_id,
-                        instrument_id,
-                        size_precision,
-                    ) {
-                        reports.push(report);
-                    }
-                } else {
-                    let cache = self.core.cache();
-                    if let Some(instrument) = cache
-                        .instruments(&BINANCE_VENUE, None)
-                        .into_iter()
-                        .find(|i| i.symbol().as_str() == order.symbol.as_str())
-                        && let Ok(report) = order.to_order_status_report(
-                            self.core.account_id,
-                            instrument.id(),
-                            instrument.size_precision(),
-                        )
-                    {
-                        reports.push(report);
-                    }
-                }
-            }
-
-            for algo_order in algo_orders {
-                if let Some(instrument_id) = cmd.instrument_id {
-                    let (_, size_precision) = self.get_instrument_precision(instrument_id);
-                    if let Ok(report) = algo_order.to_order_status_report(
-                        self.core.account_id,
-                        instrument_id,
-                        size_precision,
-                    ) {
-                        reports.push(report);
-                    }
-                } else {
-                    let cache = self.core.cache();
-                    if let Some(instrument) = cache
-                        .instruments(&BINANCE_VENUE, None)
-                        .into_iter()
-                        .find(|i| i.symbol().as_str() == algo_order.symbol.as_str())
-                        && let Ok(report) = algo_order.to_order_status_report(
-                            self.core.account_id,
-                            instrument.id(),
-                            instrument.size_precision(),
-                        )
-                    {
-                        reports.push(report);
-                    }
-                }
-            }
-        } else if let Some(instrument_id) = cmd.instrument_id {
-            let symbol = instrument_id.symbol.to_string();
-            let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000); // ns to ms
-            let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
-
-            let mut builder = BinanceAllOrdersParamsBuilder::default();
-            builder.symbol(symbol);
-            if let Some(st) = start_time {
-                builder.start_time(st);
-            }
-            if let Some(et) = end_time {
-                builder.end_time(et);
-            }
-            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let orders = self.http_client.query_all_orders(&params).await?;
-            let (_, size_precision) = self.get_instrument_precision(instrument_id);
-
-            for order in orders {
-                if let Ok(report) = order.to_order_status_report(
-                    self.core.account_id,
+                let filled = OrderFilled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
                     instrument_id,
-                    size_precision,
-                ) {
-                    reports.push(report);
+                    client_order_id,
+                    venue_order_id,
+                    account_id,
+                    TradeId::new(order.trade_id.to_string()),
+                    identity.order_side,
+                    identity.order_type,
+                    Quantity::new(last_qty, size_precision),
+                    Price::new(last_px, price_precision),
+                    commission_currency,
+                    liquidity_side,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    None,
+                    Some(Money::new(commission, commission_currency)),
+                );
+
+                dispatch_state.insert_filled(client_order_id);
+                emitter.send_order_event(OrderEventAny::Filled(filled));
+
+                let cum_qty: f64 = order.cumulative_filled_qty.parse().unwrap_or(0.0);
+                let orig_qty: f64 = order.original_qty.parse().unwrap_or(0.0);
+                if (orig_qty - cum_qty) <= 0.0 {
+                    dispatch_state.cleanup_terminal(client_order_id);
                 }
             }
+            BinanceExecutionType::Canceled | BinanceExecutionType::Expired => {
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    dispatch_state,
+                    ts_init,
+                );
+                let canceled = OrderCanceled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            }
+            BinanceExecutionType::Amendment => {
+                let quantity: f64 = order.original_qty.parse().unwrap_or(0.0);
+                let price: f64 = order.original_price.parse().unwrap_or(0.0);
+
+                let updated = OrderUpdated::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    Quantity::new(quantity, size_precision),
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                    Some(Price::new(price, price_precision)),
+                    None,
+                    None,
+                );
+                emitter.send_order_event(OrderEventAny::Updated(updated));
+            }
+            BinanceExecutionType::Calculated => {
+                log::warn!(
+                    "Calculated execution (liquidation/ADL): symbol={}, client_order_id={}",
+                    order.symbol,
+                    order.client_order_id
+                );
+            }
         }
-
-        Ok(reports)
+    } else {
+        // Untracked: fall back to reports for reconciliation
+        match order.execution_type {
+            BinanceExecutionType::Trade => {
+                match parse_futures_order_update_to_fill(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(fill) => emitter.send_fill_report(fill),
+                    Err(e) => log::error!("Failed to parse fill report: {e}"),
+                }
+                match parse_futures_order_update_to_order_status(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(status) => emitter.send_order_status_report(status),
+                    Err(e) => log::error!("Failed to parse order status report: {e}"),
+                }
+            }
+            BinanceExecutionType::New
+            | BinanceExecutionType::Canceled
+            | BinanceExecutionType::Expired
+            | BinanceExecutionType::Amendment => {
+                match parse_futures_order_update_to_order_status(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(status) => emitter.send_order_status_report(status),
+                    Err(e) => log::error!("Failed to parse order status report: {e}"),
+                }
+            }
+            BinanceExecutionType::Calculated => {
+                log::warn!(
+                    "Calculated execution (liquidation/ADL): symbol={}, client_order_id={}",
+                    order.symbol,
+                    order.client_order_id
+                );
+            }
+        }
     }
+}
 
-    async fn generate_fill_reports(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let Some(instrument_id) = cmd.instrument_id else {
-            log::warn!("generate_fill_reports requires instrument_id for Binance Futures");
-            return Ok(Vec::new());
+#[allow(clippy::too_many_arguments)]
+fn dispatch_algo_update(
+    msg: &super::websocket::messages::BinanceFuturesAlgoUpdateMsg,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    triggered_algo_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+    algo_client_ids: &Arc<RwLock<AHashSet<ClientOrderId>>>,
+) {
+    use crate::common::enums::BinanceAlgoStatus;
+
+    let algo_data = &msg.algo_order;
+    let ts_init = clock.get_time_ns();
+    let ts_event = UnixNanos::from((msg.event_time * 1_000_000) as u64);
+    let client_order_id = decode_algo_client_id(algo_data);
+
+    let symbol_ustr = ustr::Ustr::from(algo_data.symbol.as_str());
+    let (instrument_id, _price_precision, _size_precision) =
+        if let Some(inst) = http_client.instruments_cache().get(&symbol_ustr) {
+            (
+                inst.id(),
+                inst.price_precision() as u8,
+                inst.quantity_precision() as u8,
+            )
+        } else {
+            let id = crate::common::symbol::format_instrument_id(&symbol_ustr, product_type);
+            log::warn!(
+                "Instrument not in cache for {}, using default precision",
+                algo_data.symbol
+            );
+            (id, 8, 8)
         };
 
-        let symbol = instrument_id.symbol.to_string();
-        let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000);
-        let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
+    let identity = dispatch_state
+        .order_identities
+        .get(&client_order_id)
+        .map(|r| r.clone());
 
-        let mut builder = BinanceUserTradesParamsBuilder::default();
-        builder.symbol(symbol);
-        if let Some(st) = start_time {
-            builder.start_time(st);
+    match algo_data.algo_status {
+        BinanceAlgoStatus::New => {
+            algo_client_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .insert(client_order_id);
         }
-        if let Some(et) = end_time {
-            builder.end_time(et);
+        BinanceAlgoStatus::Triggering => {
+            log::info!(
+                "Algo order triggering: client_order_id={}, algo_id={}, symbol={}",
+                algo_data.client_algo_id,
+                algo_data.algo_id,
+                algo_data.symbol
+            );
         }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+        BinanceAlgoStatus::Triggered => {
+            triggered_algo_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .insert(client_order_id);
+            log::info!(
+                "Algo order triggered: client_order_id={}, algo_id={}, actual_order_id={:?}",
+                algo_data.client_algo_id,
+                algo_data.algo_id,
+                algo_data.actual_order_id
+            );
+        }
+        BinanceAlgoStatus::Canceled | BinanceAlgoStatus::Expired => {
+            algo_client_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
+            triggered_algo_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
 
-        let trades = self.http_client.query_user_trades(&params).await?;
-        let (price_precision, size_precision) = self.get_instrument_precision(instrument_id);
+            if let Some(identity) = identity {
+                let venue_order_id = algo_data
+                    .actual_order_id
+                    .as_ref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| VenueOrderId::new(id.clone()));
 
-        let mut reports = Vec::new();
-        for trade in trades {
-            if let Ok(report) = trade.to_fill_report(
-                self.core.account_id,
+                let canceled = OrderCanceled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    venue_order_id,
+                    Some(account_id),
+                );
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            } else if let Some(report) = parse_futures_algo_update_to_order_status(
+                algo_data,
+                msg.event_time,
                 instrument_id,
-                price_precision,
-                size_precision,
+                _price_precision,
+                _size_precision,
+                account_id,
+                ts_init,
             ) {
-                reports.push(report);
+                emitter.send_order_status_report(report);
             }
         }
+        BinanceAlgoStatus::Rejected => {
+            algo_client_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
+            triggered_algo_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
 
-        Ok(reports)
-    }
-
-    async fn generate_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let symbol = cmd.instrument_id.map(|id| id.symbol.to_string());
-
-        let mut builder = BinancePositionRiskParamsBuilder::default();
-        if let Some(s) = symbol {
-            builder.symbol(s);
-        }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let positions = self.http_client.query_positions(&params).await?;
-
-        let mut reports = Vec::new();
-        for position in positions {
-            let position_amt: f64 = position.position_amt.parse().unwrap_or(0.0);
-            if position_amt == 0.0 {
-                continue;
-            }
-
-            let cache = self.core.cache();
-            if let Some(instrument) = cache
-                .instruments(&BINANCE_VENUE, None)
-                .into_iter()
-                .find(|i| i.symbol().as_str() == position.symbol.as_str())
-                && let Ok(report) = self.create_position_report(
-                    &position,
-                    instrument.id(),
-                    instrument.size_precision(),
-                )
-            {
-                reports.push(report);
+            if let Some(identity) = identity {
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.emit_order_rejected_event(
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    "REJECTED",
+                    ts_init,
+                    false,
+                );
+            } else if let Some(report) = parse_futures_algo_update_to_order_status(
+                algo_data,
+                msg.event_time,
+                instrument_id,
+                _price_precision,
+                _size_precision,
+                account_id,
+                ts_init,
+            ) {
+                emitter.send_order_status_report(report);
             }
         }
+        BinanceAlgoStatus::Finished => {
+            algo_client_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
+            triggered_algo_ids
+                .write()
+                .expect(MUTEX_POISONED)
+                .remove(&client_order_id);
+            dispatch_state.cleanup_terminal(client_order_id);
 
-        Ok(reports)
-    }
+            let executed_qty: f64 = algo_data
+                .executed_qty
+                .as_ref()
+                .and_then(|q| q.parse().ok())
+                .unwrap_or(0.0);
 
-    async fn generate_mass_status(
-        &self,
-        lookback_mins: Option<u64>,
-    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
-
-        let ts_now = self.clock.get_time_ns();
-
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
-
-        let order_cmd = GenerateOrderStatusReportsBuilder::default()
-            .ts_init(ts_now)
-            .open_only(true)
-            .start(start)
-            .build()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let position_cmd = GeneratePositionStatusReportsBuilder::default()
-            .ts_init(ts_now)
-            .start(start)
-            .build()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let (order_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
-            self.generate_position_status_reports(&position_cmd),
-        )?;
-
-        log::info!("Received {} OrderStatusReports", order_reports.len());
-        log::info!("Received {} PositionReports", position_reports.len());
-
-        let mut mass_status = ExecutionMassStatus::new(
-            self.core.client_id,
-            self.core.account_id,
-            *BINANCE_VENUE,
-            ts_now,
-            None,
-        );
-
-        mass_status.add_order_reports(order_reports);
-        mass_status.add_position_reports(position_reports);
-
-        Ok(Some(mass_status))
+            if executed_qty > 0.0 {
+                log::debug!(
+                    "Algo order finished with fills: client_order_id={}, executed_qty={}",
+                    algo_data.client_algo_id,
+                    executed_qty
+                );
+            } else {
+                log::debug!(
+                    "Algo order finished without fills: client_order_id={}",
+                    algo_data.client_algo_id
+                );
+            }
+        }
+        BinanceAlgoStatus::Unknown => {
+            log::warn!(
+                "Unknown algo status: client_order_id={}, algo_id={}",
+                algo_data.client_algo_id,
+                algo_data.algo_id
+            );
+        }
     }
 }

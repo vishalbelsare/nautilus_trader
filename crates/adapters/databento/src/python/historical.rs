@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use nautilus_core::{
-    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyexception, to_pyvalue_err},
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
@@ -27,7 +27,6 @@ use nautilus_model::{
 };
 use pyo3::{
     IntoPyObjectExt,
-    exceptions::PyException,
     prelude::*,
     types::{PyDict, PyList},
 };
@@ -85,16 +84,14 @@ impl DatabentoHistoricalClient {
                     dict.set_item("end", res.end)?;
                     dict.into_py_any(py)
                 }),
-                Err(e) => Err(PyErr::new::<PyException, _>(format!(
-                    "Error handling response: {e}"
-                ))),
+                Err(e) => Err(to_pyexception(format!("Error handling response: {e}"))),
             }
         })
     }
 
     #[pyo3(name = "get_range_instruments")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_instruments<'py>(
         &self,
         py: Python<'py>,
@@ -138,7 +135,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_quotes")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None, schema=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_quotes<'py>(
         &self,
         py: Python<'py>,
@@ -175,7 +172,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_trades")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_trades<'py>(
         &self,
         py: Python<'py>,
@@ -211,7 +208,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_bars")]
     #[pyo3(signature = (dataset, instrument_ids, aggregation, start, end=None, limit=None, price_precision=None, timestamp_on_close=true))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_bars<'py>(
         &self,
         py: Python<'py>,
@@ -249,7 +246,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_order_book_depth10")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, depth=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_order_book_depth10<'py>(
         &self,
         py: Python<'py>,
@@ -284,7 +281,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_order_book_deltas")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_order_book_deltas<'py>(
         &self,
         py: Python<'py>,
@@ -320,7 +317,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_imbalance")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_imbalance<'py>(
         &self,
         py: Python<'py>,
@@ -356,7 +353,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_statistics")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_statistics<'py>(
         &self,
         py: Python<'py>,
@@ -392,7 +389,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_range_status")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_status<'py>(
         &self,
         py: Python<'py>,

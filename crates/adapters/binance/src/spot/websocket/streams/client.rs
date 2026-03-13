@@ -35,6 +35,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures_util::Stream;
 use nautilus_common::live::get_runtime;
+use nautilus_core::string::REDACTED;
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
     mode::ConnectionMode,
@@ -61,10 +62,6 @@ use crate::common::{
 
 /// Binance Spot WebSocket client for SBE market data streams.
 #[derive(Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance")
-)]
 pub struct BinanceSpotWebSocketClient {
     url: String,
     credential: Option<Arc<Ed25519Credential>>,
@@ -85,10 +82,7 @@ impl Debug for BinanceSpotWebSocketClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(BinanceSpotWebSocketClient))
             .field("url", &self.url)
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "<redacted>"),
-            )
+            .field("credential", &self.credential.as_ref().map(|_| REDACTED))
             .field("heartbeat", &self.heartbeat)
             .finish_non_exhaustive()
     }
@@ -164,10 +158,8 @@ impl BinanceSpotWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if connection fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal output receiver mutex is poisoned.
+    // Mutex poisoning is not documented individually
+    #[allow(clippy::missing_panics_doc)]
     pub async fn connect(&mut self) -> BinanceWsResult<()> {
         self.signal.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
@@ -199,6 +191,7 @@ impl BinanceSpotWebSocketClient {
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            idle_timeout_ms: None,
         };
 
         // Configure rate limits for subscription operations

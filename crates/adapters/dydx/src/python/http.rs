@@ -63,18 +63,16 @@ impl DydxHttpClient {
     fn py_request_instruments<'py>(
         &self,
         py: Python<'py>,
-        maker_fee: Option<String>,
-        taker_fee: Option<String>,
+        maker_fee: Option<&str>,
+        taker_fee: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let maker = maker_fee
-            .as_ref()
-            .map(|s| Decimal::from_str(s))
+            .map(Decimal::from_str)
             .transpose()
             .map_err(to_pyvalue_err)?;
 
         let taker = taker_fee
-            .as_ref()
-            .map(|s| Decimal::from_str(s))
+            .map(Decimal::from_str)
             .transpose()
             .map_err(to_pyvalue_err)?;
 
@@ -86,8 +84,7 @@ impl DydxHttpClient {
                 .await
                 .map_err(to_pyvalue_err)?;
 
-            #[allow(deprecated)]
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let py_instruments: PyResult<Vec<Py<PyAny>>> = instruments
                     .into_iter()
                     .map(|inst| instrument_any_to_pyobject(py, inst))
@@ -318,6 +315,25 @@ impl DydxHttpClient {
                     PyList::new(py, reports.into_iter().map(|r| r.into_py_any_unwrap(py)))?;
                 Ok(pylist.into_py_any_unwrap(py))
             })
+        })
+    }
+
+    #[pyo3(name = "request_account_state")]
+    fn py_request_account_state<'py>(
+        &self,
+        py: Python<'py>,
+        address: String,
+        subaccount_number: u32,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_state = client
+                .request_account_state(&address, subaccount_number, account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| Ok(account_state.into_py_any_unwrap(py)))
         })
     }
 

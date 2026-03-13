@@ -40,7 +40,11 @@ use crate::{
 #[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderUpdated {
     /// The trader ID associated with the event.
@@ -178,7 +182,7 @@ impl OrderEvent for OrderUpdated {
         self.event_id
     }
 
-    fn kind(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         stringify!(OrderUpdated)
     }
 
@@ -243,7 +247,7 @@ impl OrderEvent for OrderUpdated {
     }
 
     fn reconciliation(&self) -> bool {
-        false
+        self.reconciliation != 0
     }
 
     fn price(&self) -> Option<Price> {

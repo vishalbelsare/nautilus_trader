@@ -48,6 +48,7 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BarSpecification {
     #[new]
     fn py_new(step: usize, aggregation: BarAggregation, price_type: PriceType) -> PyResult<Self> {
@@ -76,6 +77,24 @@ impl BarSpecification {
         self.to_string()
     }
 
+    #[getter]
+    #[pyo3(name = "step")]
+    fn py_step(&self) -> usize {
+        self.step.get()
+    }
+
+    #[getter]
+    #[pyo3(name = "aggregation")]
+    fn py_aggregation(&self) -> BarAggregation {
+        self.aggregation
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    fn py_price_type(&self) -> PriceType {
+        self.price_type
+    }
+
     #[staticmethod]
     #[pyo3(name = "fully_qualified_name")]
     fn py_fully_qualified_name() -> String {
@@ -100,6 +119,7 @@ impl BarSpecification {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BarType {
     #[new]
     #[pyo3(signature = (instrument_id, spec, aggregation_source = AggregationSource::External)
@@ -242,6 +262,7 @@ impl Bar {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[allow(clippy::too_many_arguments)]
 impl Bar {
     #[new]
@@ -350,12 +371,8 @@ impl Bar {
         bar_type: &BarType,
         price_precision: u8,
         size_precision: u8,
-    ) -> PyResult<HashMap<String, String>> {
-        Ok(Self::get_metadata(
-            bar_type,
-            price_precision,
-            size_precision,
-        ))
+    ) -> HashMap<String, String> {
+        Self::get_metadata(bar_type, price_precision, size_precision)
     }
 
     #[staticmethod]
@@ -374,18 +391,6 @@ impl Bar {
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
         from_dict_pyo3(py, values)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
     }
 
     /// Creates a `PyCapsule` containing a raw pointer to a `Data::Bar` object.
@@ -417,15 +422,28 @@ impl Bar {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+}
+
+#[pymethods]
+impl Bar {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
     }
 }
 
@@ -487,7 +505,7 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let dict_string = bar.py_to_dict(py).unwrap().to_string();
-            let expected_string = r"{'type': 'Bar', 'bar_type': 'AUDUSD.SIM-1-MINUTE-LAST-INTERNAL', 'open': '1.00010', 'high': '1.00020', 'low': '1.00000', 'close': '1.00010', 'volume': '100000', 'ts_event': 0, 'ts_init': 0}";
+            let expected_string = "{'type': 'Bar', 'bar_type': 'AUDUSD.SIM-1-MINUTE-LAST-INTERNAL', 'open': '1.00010', 'high': '1.00020', 'low': '1.00000', 'close': '1.00010', 'volume': '100000', 'ts_event': 0, 'ts_init': 0}";
             assert_eq!(dict_string, expected_string);
         });
     }

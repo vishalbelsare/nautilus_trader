@@ -50,7 +50,13 @@ use crate::{
 /// This wrapper holds an `Rc<RefCell<Cache>>` allowing actors to share
 /// the same cache instance. All methods delegate to the underlying cache.
 #[allow(non_camel_case_types)]
-#[pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", unsendable)]
+#[pyo3::pyclass(
+    module = "nautilus_trader.core.nautilus_pyo3.common",
+    name = "Cache",
+    unsendable,
+    from_py_object
+)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 #[derive(Debug, Clone)]
 pub struct PyCache(Rc<RefCell<Cache>>);
 
@@ -63,7 +69,14 @@ impl PyCache {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyCache {
+    #[new]
+    #[pyo3(signature = (config=None))]
+    fn py_new(config: Option<CacheConfig>) -> Self {
+        Self(Rc::new(RefCell::new(Cache::new(config, None))))
+    }
+
     #[pyo3(name = "instrument")]
     fn py_instrument(
         &self,
@@ -96,8 +109,12 @@ impl PyCache {
     fn py_order_book(&self, instrument_id: InstrumentId) -> Option<OrderBook> {
         self.0.borrow().order_book(&instrument_id).cloned()
     }
+}
 
-    #[cfg(feature = "defi")]
+#[cfg(feature = "defi")]
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PyCache {
     #[pyo3(name = "pool")]
     fn py_pool(&self, instrument_id: InstrumentId) -> Option<Pool> {
         self.0
@@ -106,7 +123,6 @@ impl PyCache {
             .and_then(|cache| cache.pool(&instrument_id).cloned())
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool_profiler")]
     fn py_pool_profiler(&self, instrument_id: InstrumentId) -> Option<PoolProfiler> {
         self.0
@@ -117,6 +133,7 @@ impl PyCache {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl CacheConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
@@ -387,6 +404,7 @@ impl Cache {
     }
 
     #[pyo3(name = "add_position")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_add_position(
         &mut self,
         py: Python,
@@ -394,7 +412,7 @@ impl Cache {
         oms_type: OmsType,
     ) -> PyResult<()> {
         let position_obj = position.extract::<Position>(py)?;
-        self.add_position(position_obj, oms_type)
+        self.add_position(&position_obj, oms_type)
             .map_err(to_pyvalue_err)
     }
 
@@ -599,51 +617,47 @@ impl Cache {
     fn py_synthetic_ids(&self) -> Vec<InstrumentId> {
         self.synthetic_ids().into_iter().copied().collect()
     }
+}
 
-    #[cfg(feature = "defi")]
+#[cfg(feature = "defi")]
+#[pymethods]
+impl Cache {
     #[pyo3(name = "add_pool")]
     fn py_add_pool(&mut self, pool: Pool) -> PyResult<()> {
         self.add_pool(pool).map_err(to_pyvalue_err)
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool")]
     fn py_pool(&self, instrument_id: InstrumentId) -> Option<Pool> {
         self.pool(&instrument_id).cloned()
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool_ids")]
     fn py_pool_ids(&self, venue: Option<Venue>) -> Vec<InstrumentId> {
         self.pool_ids(venue.as_ref())
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pools")]
     fn py_pools(&self, venue: Option<Venue>) -> Vec<Pool> {
         self.pools(venue.as_ref()).into_iter().cloned().collect()
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "add_pool_profiler")]
     fn py_add_pool_profiler(&mut self, pool_profiler: PoolProfiler) -> PyResult<()> {
         self.add_pool_profiler(pool_profiler)
             .map_err(to_pyvalue_err)
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool_profiler")]
     fn py_pool_profiler(&self, instrument_id: InstrumentId) -> Option<PoolProfiler> {
         self.pool_profiler(&instrument_id).cloned()
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool_profiler_ids")]
     fn py_pool_profiler_ids(&self, venue: Option<Venue>) -> Vec<InstrumentId> {
         self.pool_profiler_ids(venue.as_ref())
     }
 
-    #[cfg(feature = "defi")]
     #[pyo3(name = "pool_profilers")]
     fn py_pool_profilers(&self, venue: Option<Venue>) -> Vec<PoolProfiler> {
         self.pool_profilers(venue.as_ref())

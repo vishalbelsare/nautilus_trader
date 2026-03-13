@@ -84,6 +84,7 @@ impl DeribitExecutionClient {
             DeribitHttpClient::new_with_env(
                 config.api_key.clone(),
                 config.api_secret.clone(),
+                config.base_url_http.clone(),
                 config.use_testnet,
                 config.http_timeout_secs,
                 config.max_retries,
@@ -247,10 +248,10 @@ impl DeribitExecutionClient {
     /// Submits a single order to Deribit.
     ///
     /// This is the core submission logic shared by `submit_order` and `submit_order_list`.
-    fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) -> anyhow::Result<()> {
+    fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) {
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
-            return Ok(());
+            return;
         }
 
         let params = Self::build_order_params(order);
@@ -294,8 +295,6 @@ impl DeribitExecutionClient {
 
             Ok(())
         });
-
-        Ok(())
     }
 
     /// Spawns a stream handler to dispatch WebSocket messages to the execution engine.
@@ -462,10 +461,18 @@ impl ExecutionClient for DeribitExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("failed to subscribe to user portfolio: {e}"))?;
 
+        if let Err(e) = self.ws_client.wait_for_subscriptions_confirmed(30.0).await {
+            // Roll back subscription state so a retry re-sends subscribe requests
+            let _ = self.ws_client.unsubscribe_user_orders().await;
+            let _ = self.ws_client.unsubscribe_user_trades().await;
+            let _ = self.ws_client.unsubscribe_user_portfolio().await;
+            anyhow::bail!("subscription confirmation failed: {e}");
+        }
+
         log::info!("Subscribed to user order, trade, and portfolio updates");
 
         // Spawn stream handler to dispatch WebSocket messages to the execution engine
-        let stream = self.ws_client.stream();
+        let stream = self.ws_client.stream()?;
         self.spawn_stream_handler(stream);
 
         self.core.set_connected();
@@ -717,7 +724,8 @@ impl ExecutionClient for DeribitExecutionClient {
             .order(&cmd.client_order_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-        self.submit_single_order(&order, "submit_order")
+        self.submit_single_order(&order, "submit_order");
+        Ok(())
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
@@ -738,7 +746,7 @@ impl ExecutionClient for DeribitExecutionClient {
         // Deribit doesn't have native batch order submission
         // Loop through and submit each order individually using shared helper
         for order in &orders {
-            self.submit_single_order(order, "submit_order_list_item")?;
+            self.submit_single_order(order, "submit_order_list_item");
         }
 
         Ok(())
@@ -1106,10 +1114,15 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         NautilusWsMessage::Authenticated(auth) => {
             log::debug!("WebSocket authenticated: scope={}", auth.scope);
         }
+        NautilusWsMessage::AuthenticationFailed(reason) => {
+            log::error!("Authentication failed in execution client: {reason}");
+        }
         NautilusWsMessage::Data(_)
         | NautilusWsMessage::Deltas(_)
         | NautilusWsMessage::Instrument(_)
+        | NautilusWsMessage::InstrumentStatus(_)
         | NautilusWsMessage::FundingRates(_)
+        | NautilusWsMessage::OptionGreeks(_)
         | NautilusWsMessage::Raw(_) => {
             // Data messages are handled by the data client, not execution
             log::trace!("Ignoring data message in execution client");

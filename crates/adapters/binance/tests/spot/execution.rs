@@ -26,12 +26,11 @@ use axum::{
     routing::{get, post},
 };
 use nautilus_binance::{
-    common::{
-        enums::{BinanceEnvironment, BinanceProductType},
+    config::BinanceExecClientConfig,
+    spot::{
+        execution::BinanceSpotExecutionClient,
         sbe::spot::{SBE_SCHEMA_ID, SBE_SCHEMA_VERSION},
     },
-    config::BinanceExecClientConfig,
-    spot::execution::BinanceSpotExecutionClient,
 };
 use nautilus_common::{
     cache::Cache,
@@ -566,12 +565,11 @@ fn create_test_execution_client(
     let config = BinanceExecClientConfig {
         trader_id,
         account_id,
-        product_types: vec![BinanceProductType::Spot],
-        environment: BinanceEnvironment::Mainnet,
         base_url_http: Some(base_url),
-        base_url_ws: None,
+        use_ws_trading: false,
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
+        ..Default::default()
     };
 
     // Set up event channel (must be set before creating client)

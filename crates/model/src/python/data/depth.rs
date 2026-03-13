@@ -45,6 +45,7 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderBookDepth10 {
     #[allow(clippy::too_many_arguments)]
     #[new]
@@ -160,12 +161,8 @@ impl OrderBookDepth10 {
         instrument_id: &InstrumentId,
         price_precision: u8,
         size_precision: u8,
-    ) -> PyResult<HashMap<String, String>> {
-        Ok(Self::get_metadata(
-            instrument_id,
-            price_precision,
-            size_precision,
-        ))
+    ) -> HashMap<String, String> {
+        Self::get_metadata(instrument_id, price_precision, size_precision)
     }
 
     #[staticmethod]
@@ -251,18 +248,6 @@ impl OrderBookDepth10 {
         from_dict_pyo3(py, values)
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
-    }
-
     /// Creates a `PyCapsule` containing a raw pointer to a `Data::Depth10` object.
     ///
     /// This function takes the current object (assumed to be of a type that can be represented as
@@ -292,14 +277,27 @@ impl OrderBookDepth10 {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+}
+
+#[pymethods]
+impl OrderBookDepth10 {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
     }
 }

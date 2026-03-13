@@ -264,7 +264,7 @@ fn test_set_position_id_counts_updates_correctly(mut execution_engine: Execution
     execution_engine
         .cache()
         .borrow_mut()
-        .add_position(position, OmsType::Netting)
+        .add_position(&position, OmsType::Netting)
         .unwrap();
 
     execution_engine.set_position_id_counts();
@@ -304,7 +304,7 @@ fn test_submit_order_with_duplicate_client_order_id_handles_gracefully(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -334,11 +334,11 @@ fn test_submit_order_with_duplicate_client_order_id_handles_gracefully(
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order.clone()));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order.clone()));
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.process(&order_submitted_event);
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     assert!(
         execution_engine
@@ -385,7 +385,7 @@ fn test_submit_order_for_random_venue_logs(mut execution_engine: ExecutionEngine
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
     let order = OrderTestBuilder::new(OrderType::Market)
         .trader_id(trader_id)
@@ -422,7 +422,7 @@ fn test_submit_order_for_random_venue_logs(mut execution_engine: ExecutionEngine
         ts_init: UnixNanos::default(),
     };
     // This should find the client by venue routing since instrument is AUD/USD.SIM
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
     let cache = execution_engine.cache().borrow();
     assert!(
         cache.order_exists(&order.client_order_id()),
@@ -457,7 +457,7 @@ fn test_order_filled_with_unrecognized_strategy_id(mut execution_engine: Executi
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -481,7 +481,7 @@ fn test_order_filled_with_unrecognized_strategy_id(mut execution_engine: Executi
         .unwrap();
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let different_strategy_id = StrategyId::from("RANDOM-001");
     let order_filled_event = OrderFilled::new(
@@ -506,7 +506,7 @@ fn test_order_filled_with_unrecognized_strategy_id(mut execution_engine: Executi
         Some(Money::from("2 USD")),
     );
     // This should now log an error instead of panicking
-    execution_engine.process(OrderEventAny::Filled(order_filled_event));
+    execution_engine.process(&OrderEventAny::Filled(order_filled_event));
     let cache = execution_engine.cache().borrow();
     let updated_order = cache.order(&order.client_order_id()).unwrap();
     assert_eq!(
@@ -538,7 +538,7 @@ fn test_submit_bracket_order_list_with_all_duplicate_client_order_id_logs_does_n
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let entry = OrderTestBuilder::new(OrderType::Market)
@@ -606,16 +606,16 @@ fn test_submit_bracket_order_list_with_all_duplicate_client_order_id_logs_does_n
             .unwrap();
     }
 
-    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list.clone()));
+    execution_engine.execute(&TradingCommand::SubmitOrderList(submit_order_list.clone()));
     let entry_submitted = TestOrderEventStubs::submitted(&entry, AccountId::test_default());
-    execution_engine.process(entry_submitted);
+    execution_engine.process(&entry_submitted);
 
     let stop_loss_submitted = TestOrderEventStubs::submitted(&stop_loss, AccountId::test_default());
-    execution_engine.process(stop_loss_submitted);
+    execution_engine.process(&stop_loss_submitted);
 
     let take_profit_submitted =
         TestOrderEventStubs::submitted(&take_profit, AccountId::test_default());
-    execution_engine.process(take_profit_submitted);
+    execution_engine.process(&take_profit_submitted);
 
     // Get updated orders from cache after submitted events
     let cache = execution_engine.cache().borrow();
@@ -632,7 +632,7 @@ fn test_submit_bracket_order_list_with_all_duplicate_client_order_id_logs_does_n
         .expect("Take profit order should exist")
         .clone();
     drop(cache);
-    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list));
+    execution_engine.execute(&TradingCommand::SubmitOrderList(submit_order_list));
     assert_eq!(
         entry_updated.status(),
         OrderStatus::Submitted,
@@ -690,7 +690,7 @@ fn test_submit_order_successfully_processes_and_caches_order(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -719,7 +719,7 @@ fn test_submit_order_successfully_processes_and_caches_order(
         instrument_id: instrument.id,
         exec_algorithm_id: None,
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
     let cache = execution_engine.cache().borrow();
     assert!(
         cache.order_exists(&order.client_order_id()),
@@ -781,7 +781,7 @@ fn test_submit_order_with_cleared_cache_logs_error(mut execution_engine: Executi
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
     let order = OrderTestBuilder::new(OrderType::Market)
         .trader_id(trader_id)
@@ -811,7 +811,7 @@ fn test_submit_order_with_cleared_cache_logs_error(mut execution_engine: Executi
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
     assert!(
         execution_engine
             .cache()
@@ -835,7 +835,7 @@ fn test_submit_order_with_cleared_cache_logs_error(mut execution_engine: Executi
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
     assert_eq!(
         order.status(),
         OrderStatus::Initialized,
@@ -872,7 +872,7 @@ fn test_when_applying_event_to_order_with_invalid_state_trigger_logs(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
     let order = OrderTestBuilder::new(OrderType::Market)
         .trader_id(trader_id)
@@ -902,7 +902,7 @@ fn test_when_applying_event_to_order_with_invalid_state_trigger_logs(
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
     assert!(
         execution_engine
             .cache()
@@ -926,7 +926,7 @@ fn test_when_applying_event_to_order_with_invalid_state_trigger_logs(
     );
 
     // This should log an error and not change the order status
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     assert_eq!(
         order.status(),
         OrderStatus::Initialized,
@@ -945,7 +945,7 @@ fn test_order_filled_event_when_order_not_found_in_cache_logs(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -976,7 +976,7 @@ fn test_order_filled_event_when_order_not_found_in_cache_logs(
         Some(AccountId::test_default()),
     );
 
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     assert_eq!(
         order.status(),
         OrderStatus::Initialized,
@@ -1013,7 +1013,7 @@ fn test_cancel_order_for_already_closed_order_logs_and_does_nothing(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -1052,17 +1052,17 @@ fn test_cancel_order_for_already_closed_order_logs_and_does_nothing(
     };
 
     // Submit and process order through full lifecycle to FILLED status
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_filled_event = OrderEventAny::Filled(OrderFilled::new(
         order.trader_id(),
@@ -1085,7 +1085,7 @@ fn test_cancel_order_for_already_closed_order_logs_and_does_nothing(
         None,                       // position_id
         Some(Money::from("2 USD")), // commission
     ));
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let order_status = {
         let cache = execution_engine.cache().borrow();
         let cached_order = cache
@@ -1110,7 +1110,7 @@ fn test_cancel_order_for_already_closed_order_logs_and_does_nothing(
         params: None,
     };
 
-    execution_engine.execute(TradingCommand::CancelOrder(cancel_order));
+    execution_engine.execute(&TradingCommand::CancelOrder(cancel_order));
     let order_status_after_cancel = {
         let cache = execution_engine.cache().borrow();
         let cached_order_after_cancel = cache
@@ -1147,7 +1147,7 @@ fn test_canceled_order_receiving_fill_event_reopens_and_completes_order(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1165,14 +1165,14 @@ fn test_canceled_order_receiving_fill_event_reopens_and_completes_order(
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
     let cache = execution_engine.cache().borrow();
     let accepted_order = cache
         .order(&order.client_order_id())
@@ -1188,7 +1188,7 @@ fn test_canceled_order_receiving_fill_event_reopens_and_completes_order(
         AccountId::from("TEST-ACCOUNT"),
         Some(VenueOrderId::from("V-001")), // Must match the accepted event
     );
-    execution_engine.process(order_canceled_event);
+    execution_engine.process(&order_canceled_event);
     let cache = execution_engine.cache().borrow();
     let canceled_order = cache
         .order(&order.client_order_id())
@@ -1229,7 +1229,7 @@ fn test_canceled_order_receiving_fill_event_reopens_and_completes_order(
         Some(Money::from("2 USD")),
     ));
 
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let cache = execution_engine.cache().borrow();
     let filled_order = cache
         .order(&order.client_order_id())
@@ -1280,7 +1280,7 @@ fn test_canceled_order_receiving_partial_fill_event_reopens_and_becomes_partiall
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1298,21 +1298,21 @@ fn test_canceled_order_receiving_partial_fill_event_reopens_and_becomes_partiall
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_canceled_event = TestOrderEventStubs::canceled(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         Some(VenueOrderId::from("V-001")), // Must match the accepted event
     );
-    execution_engine.process(order_canceled_event);
+    execution_engine.process(&order_canceled_event);
     let cache = execution_engine.cache().borrow();
     let canceled_order = cache
         .order(&order.client_order_id())
@@ -1354,7 +1354,7 @@ fn test_canceled_order_receiving_partial_fill_event_reopens_and_becomes_partiall
         Some(Money::from("2 USD")),
     ));
 
-    execution_engine.process(order_partially_filled_event);
+    execution_engine.process(&order_partially_filled_event);
     let cache = execution_engine.cache().borrow();
     let partially_filled_order = cache
         .order(&order.client_order_id())
@@ -1422,7 +1422,7 @@ fn test_process_event_with_no_venue_order_id_logs_and_does_nothing(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Limit)
@@ -1442,7 +1442,7 @@ fn test_process_event_with_no_venue_order_id_logs_and_does_nothing(
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let different_client_order_id = ClientOrderId::from("DIFFERENT-ORDER-ID");
     let order_canceled_event = OrderEventAny::Canceled(OrderCanceled::new(
@@ -1457,7 +1457,7 @@ fn test_process_event_with_no_venue_order_id_logs_and_does_nothing(
         None,  // venue_order_id - this is the key: no venue_order_id
         None,  // account_id
     ));
-    execution_engine.process(order_canceled_event);
+    execution_engine.process(&order_canceled_event);
     let cache = execution_engine.cache().borrow();
     let order_after = cache
         .order(&order.client_order_id())
@@ -1492,7 +1492,7 @@ fn test_modify_order_for_already_closed_order_logs_and_does_nothing(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::StopMarket)
@@ -1511,14 +1511,14 @@ fn test_modify_order_for_already_closed_order_logs_and_does_nothing(
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_filled_event = OrderEventAny::Filled(OrderFilled::new(
         order.trader_id(),
@@ -1541,7 +1541,7 @@ fn test_modify_order_for_already_closed_order_logs_and_does_nothing(
         Some(PositionId::new("1")),
         Some(Money::from("2 USD")),
     ));
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let cache = execution_engine.cache().borrow();
     let filled_order = cache
         .order(&order.client_order_id())
@@ -1574,7 +1574,7 @@ fn test_modify_order_for_already_closed_order_logs_and_does_nothing(
         ts_init: UnixNanos::default(),
         params: None,
     };
-    execution_engine.execute(TradingCommand::ModifyOrder(modify_order));
+    execution_engine.execute(&TradingCommand::ModifyOrder(modify_order));
     let cache = execution_engine.cache().borrow();
     let order_after = cache
         .order(&order.client_order_id())
@@ -1615,7 +1615,7 @@ fn test_handle_order_event_with_different_client_order_id_but_matching_venue_ord
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1633,14 +1633,14 @@ fn test_handle_order_event_with_different_client_order_id_but_matching_venue_ord
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let different_venue_order_id = VenueOrderId::from("DIFFERENT-V-001"); // Different venue order ID
     let order_canceled_event = OrderEventAny::Canceled(OrderCanceled::new(
@@ -1655,7 +1655,7 @@ fn test_handle_order_event_with_different_client_order_id_but_matching_venue_ord
         Some(different_venue_order_id), // Different venue_order_id
         Some(AccountId::from("TEST-ACCOUNT")),
     ));
-    execution_engine.process(order_canceled_event);
+    execution_engine.process(&order_canceled_event);
     let cache = execution_engine.cache().borrow();
     let order_after = cache
         .order(&order.client_order_id())
@@ -1690,7 +1690,7 @@ fn test_handle_order_event_with_random_client_order_id_and_order_id_not_cached(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1708,14 +1708,14 @@ fn test_handle_order_event_with_random_client_order_id_and_order_id_not_cached(
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let random_client_order_id = ClientOrderId::from("web_001"); // Random ID from web UI
     let random_venue_order_id = VenueOrderId::from("RANDOM_001"); // Random venue order ID
@@ -1731,7 +1731,7 @@ fn test_handle_order_event_with_random_client_order_id_and_order_id_not_cached(
         Some(random_venue_order_id), // Random venue order ID
         Some(AccountId::from("TEST-ACCOUNT")),
     ));
-    execution_engine.process(order_canceled_event);
+    execution_engine.process(&order_canceled_event);
     let cache = execution_engine.cache().borrow();
     let order_after = cache
         .order(&order.client_order_id())
@@ -1766,7 +1766,7 @@ fn test_handle_duplicate_order_events_logs_error_and_does_not_apply(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -1784,14 +1784,14 @@ fn test_handle_duplicate_order_events_logs_error_and_does_not_apply(
 
     let order_submitted_event =
         TestOrderEventStubs::submitted(&order, AccountId::from("TEST-ACCOUNT"));
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::from("TEST-ACCOUNT"),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let venue_order_id = VenueOrderId::from("V-001"); // Use the same venue_order_id as the accepted event
     let order_canceled_event = OrderEventAny::Canceled(OrderCanceled::new(
@@ -1807,8 +1807,8 @@ fn test_handle_duplicate_order_events_logs_error_and_does_not_apply(
         Some(AccountId::from("TEST-ACCOUNT")),
     ));
 
-    execution_engine.process(order_canceled_event.clone());
-    execution_engine.process(order_canceled_event); // Duplicate event
+    execution_engine.process(&order_canceled_event);
+    execution_engine.process(&order_canceled_event); // Duplicate event
     let cache = execution_engine.cache().borrow();
     let order_after = cache
         .order(&order.client_order_id())
@@ -1857,7 +1857,7 @@ fn test_handle_order_fill_event_with_no_position_id_correctly_handles_fill(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -1874,11 +1874,11 @@ fn test_handle_order_fill_event_with_no_position_id_correctly_handles_fill(
         .unwrap();
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_filled_event = TestOrderEventStubs::filled(
         &order,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001")), // Provide unique trade_id
         None,                                            // position_id
         None,                                            // last_px
@@ -1889,7 +1889,7 @@ fn test_handle_order_fill_event_with_no_position_id_correctly_handles_fill(
         Some(AccountId::test_default()),                 // account_id
     );
 
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let cache = execution_engine.cache().borrow();
     let position_ids = cache.position_ids(None, None, None, None);
     assert_eq!(position_ids.len(), 1, "Should have exactly one position");
@@ -1959,7 +1959,7 @@ fn test_handle_order_fill_event(mut execution_engine: ExecutionEngine) {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     {
@@ -1987,7 +1987,7 @@ fn test_handle_order_fill_event(mut execution_engine: ExecutionEngine) {
     let expected_position_id = PositionId::from(format!("{}-{}", instrument.id, strategy_id));
 
     let position = Position::new(
-        &instrument.into(),
+        &instrument.clone().into(),
         OrderFilled::new(
             order.trader_id(),
             order.strategy_id(),
@@ -2014,7 +2014,7 @@ fn test_handle_order_fill_event(mut execution_engine: ExecutionEngine) {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_position(position, OmsType::Netting)
+        .add_position(&position, OmsType::Netting)
         .unwrap();
 
     let order_filled_event = OrderEventAny::Filled(OrderFilled::new(
@@ -2039,7 +2039,7 @@ fn test_handle_order_fill_event(mut execution_engine: ExecutionEngine) {
         Some(Money::from("2 USD")),
     ));
 
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let cache = execution_engine.cache().borrow();
 
     println!("Filtering parameters:");
@@ -2165,7 +2165,7 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -2189,19 +2189,19 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
         .unwrap();
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let expected_position_id = PositionId::from(format!("{}-{}", instrument.id, strategy_id));
 
     let position = Position::new(
-        &instrument.into(),
+        &instrument.clone().into(),
         OrderFilled::new(
             order.trader_id(),
             order.strategy_id(),
@@ -2228,7 +2228,7 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
     execution_engine
         .cache()
         .borrow_mut()
-        .add_position(position, OmsType::Netting)
+        .add_position(&position, OmsType::Netting)
         .unwrap();
     // First partial fill: 20,100
     let fill_event_1 = OrderEventAny::Filled(OrderFilled::new(
@@ -2252,7 +2252,7 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
         None,  // No position_id
         Some(Money::from("2 USD")),
     ));
-    execution_engine.process(fill_event_1);
+    execution_engine.process(&fill_event_1);
 
     // Second partial fill: 19,900
     let fill_event_2 = OrderEventAny::Filled(OrderFilled::new(
@@ -2276,7 +2276,7 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
         None,  // No position_id
         Some(Money::from("2 USD")),
     ));
-    execution_engine.process(fill_event_2);
+    execution_engine.process(&fill_event_2);
 
     // Third partial fill: 60,000 (completes the order)
     let fill_event_3 = OrderEventAny::Filled(OrderFilled::new(
@@ -2300,7 +2300,7 @@ fn test_handle_multiple_partial_fill_events(mut execution_engine: ExecutionEngin
         None,  // No position_id
         Some(Money::from("2 USD")),
     ));
-    execution_engine.process(fill_event_3);
+    execution_engine.process(&fill_event_3);
     let cache = execution_engine.cache().borrow();
 
     assert!(
@@ -2411,7 +2411,7 @@ fn test_handle_position_opening_with_position_id_none(mut execution_engine: Exec
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -2435,18 +2435,18 @@ fn test_handle_position_opening_with_position_id_none(mut execution_engine: Exec
         .unwrap();
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event = TestOrderEventStubs::accepted(
         &order,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_filled_event = TestOrderEventStubs::filled(
         &order,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001")),
         None,                            // position_id = None (let engine generate it)
         None,                            // last_px
@@ -2457,7 +2457,7 @@ fn test_handle_position_opening_with_position_id_none(mut execution_engine: Exec
         Some(AccountId::test_default()), // account_id
     );
 
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
     let cache = execution_engine.cache().borrow();
     let position_ids = cache.position_ids(None, None, None, None);
     assert_eq!(position_ids.len(), 1, "Should have exactly one position");
@@ -2561,7 +2561,7 @@ fn test_add_to_existing_position_on_order_fill(mut execution_engine: ExecutionEn
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -2585,19 +2585,19 @@ fn test_add_to_existing_position_on_order_fill(mut execution_engine: ExecutionEn
         .unwrap();
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     // Fill first order to create a position
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         None,                            // Let system generate position ID
         None,                            // last_px
@@ -2607,7 +2607,7 @@ fn test_add_to_existing_position_on_order_fill(mut execution_engine: ExecutionEn
         None,                            // ts_filled_ns
         Some(AccountId::test_default()), // account_id
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     // Get the created position ID
     let cache = execution_engine.cache().borrow();
@@ -2636,18 +2636,18 @@ fn test_add_to_existing_position_on_order_fill(mut execution_engine: ExecutionEn
         .unwrap();
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-2")),
         Some(expected_position_id),      // Specify existing position ID
         None,                            // last_px
@@ -2657,7 +2657,7 @@ fn test_add_to_existing_position_on_order_fill(mut execution_engine: ExecutionEn
         None,                            // ts_filled_ns
         Some(AccountId::test_default()), // account_id
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
     let cache = execution_engine.cache().borrow();
 
     assert!(
@@ -2779,7 +2779,7 @@ fn test_close_position_on_order_fill(mut execution_engine: ExecutionEngine) {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -2805,21 +2805,21 @@ fn test_close_position_on_order_fill(mut execution_engine: ExecutionEngine) {
         .unwrap();
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let position_id = PositionId::from("P-1");
 
     // Fill first order to open position
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position_id),
         None,
@@ -2829,7 +2829,7 @@ fn test_close_position_on_order_fill(mut execution_engine: ExecutionEngine) {
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -2868,14 +2868,14 @@ fn test_close_position_on_order_fill(mut execution_engine: ExecutionEngine) {
         .unwrap();
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
@@ -2889,7 +2889,7 @@ fn test_close_position_on_order_fill(mut execution_engine: ExecutionEngine) {
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     // Wait for any async operations to complete (if any)
     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2982,7 +2982,7 @@ fn test_multiple_strategy_positions_opened(mut execution_engine: ExecutionEngine
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -3028,18 +3028,18 @@ fn test_multiple_strategy_positions_opened(mut execution_engine: ExecutionEngine
     let position2_id = PositionId::from("P-2");
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position1_id),
         None,
@@ -3049,21 +3049,21 @@ fn test_multiple_strategy_positions_opened(mut execution_engine: ExecutionEngine
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-2")),
         Some(position2_id),
         None,
@@ -3073,7 +3073,7 @@ fn test_multiple_strategy_positions_opened(mut execution_engine: ExecutionEngine
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     let cache = execution_engine.cache().borrow();
 
@@ -3293,7 +3293,7 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -3336,18 +3336,18 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
     let position_id = PositionId::from("P-19700101-000000-000-000-1");
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position_id),
         None,
@@ -3357,7 +3357,7 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -3380,18 +3380,18 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
     }
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-2")),
         Some(position_id), // Fill against the same position
         None,
@@ -3401,7 +3401,7 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     let cache = execution_engine.cache().borrow();
 
@@ -3521,7 +3521,7 @@ fn test_flip_position_on_opposite_filled_same_position_buy(mut execution_engine:
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -3564,18 +3564,18 @@ fn test_flip_position_on_opposite_filled_same_position_buy(mut execution_engine:
     let position_id = PositionId::from("P-19700101-000000-000-None-1");
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position_id),
         None,
@@ -3585,7 +3585,7 @@ fn test_flip_position_on_opposite_filled_same_position_buy(mut execution_engine:
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -3612,18 +3612,18 @@ fn test_flip_position_on_opposite_filled_same_position_buy(mut execution_engine:
     }
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-2")),
         Some(position_id), // Fill against the same position
         None,
@@ -3633,7 +3633,7 @@ fn test_flip_position_on_opposite_filled_same_position_buy(mut execution_engine:
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     let cache = execution_engine.cache().borrow();
 
@@ -3754,7 +3754,7 @@ fn test_flip_position_on_flat_position_then_filled_reusing_position_id(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -3812,18 +3812,18 @@ fn test_flip_position_on_flat_position_then_filled_reusing_position_id(
     let position_id = PositionId::from("P-19700101-000000-000-001-1");
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position_id),
         None,
@@ -3833,7 +3833,7 @@ fn test_flip_position_on_flat_position_then_filled_reusing_position_id(
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -3860,14 +3860,14 @@ fn test_flip_position_on_flat_position_then_filled_reusing_position_id(
     }
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
@@ -3881,7 +3881,7 @@ fn test_flip_position_on_flat_position_then_filled_reusing_position_id(
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -3939,7 +3939,7 @@ fn test_flip_position_when_netting_oms(mut execution_engine: ExecutionEngine) {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -3982,18 +3982,18 @@ fn test_flip_position_when_netting_oms(mut execution_engine: ExecutionEngine) {
     let position_id = PositionId::from("P-19700101-000000-000-None-1");
 
     let order1_submitted_event = TestOrderEventStubs::submitted(&order1, AccountId::test_default());
-    execution_engine.process(order1_submitted_event);
+    execution_engine.process(&order1_submitted_event);
 
     let order1_accepted_event = TestOrderEventStubs::accepted(
         &order1,
         AccountId::test_default(),
         VenueOrderId::from("V-001"),
     );
-    execution_engine.process(order1_accepted_event);
+    execution_engine.process(&order1_accepted_event);
 
     let order1_filled_event = TestOrderEventStubs::filled(
         &order1,
-        &instrument.into(),
+        &instrument.clone().into(),
         Some(TradeId::new("E-19700101-000000-001-001-1")),
         Some(position_id),
         None,
@@ -4003,7 +4003,7 @@ fn test_flip_position_when_netting_oms(mut execution_engine: ExecutionEngine) {
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order1_filled_event);
+    execution_engine.process(&order1_filled_event);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -4030,14 +4030,14 @@ fn test_flip_position_when_netting_oms(mut execution_engine: ExecutionEngine) {
     }
 
     let order2_submitted_event = TestOrderEventStubs::submitted(&order2, AccountId::test_default());
-    execution_engine.process(order2_submitted_event);
+    execution_engine.process(&order2_submitted_event);
 
     let order2_accepted_event = TestOrderEventStubs::accepted(
         &order2,
         AccountId::test_default(),
         VenueOrderId::from("V-002"),
     );
-    execution_engine.process(order2_accepted_event);
+    execution_engine.process(&order2_accepted_event);
 
     let order2_filled_event = TestOrderEventStubs::filled(
         &order2,
@@ -4051,7 +4051,7 @@ fn test_flip_position_when_netting_oms(mut execution_engine: ExecutionEngine) {
         None,
         Some(AccountId::test_default()),
     );
-    execution_engine.process(order2_filled_event);
+    execution_engine.process(&order2_filled_event);
 
     let cache = execution_engine.cache().borrow();
 
@@ -4099,11 +4099,11 @@ fn test_handle_updated_order_event(mut execution_engine: ExecutionEngine) {
         .unwrap();
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, account_id);
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event =
         TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("V-001"));
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_pending_update_event = OrderEventAny::PendingUpdate(OrderPendingUpdate::new(
         trader_id,
@@ -4117,7 +4117,7 @@ fn test_handle_updated_order_event(mut execution_engine: ExecutionEngine) {
         false,
         Some(VenueOrderId::from("V-001")),
     ));
-    execution_engine.process(order_pending_update_event);
+    execution_engine.process(&order_pending_update_event);
 
     // Get order from cache and check venue_order_id
     {
@@ -4149,7 +4149,7 @@ fn test_handle_updated_order_event(mut execution_engine: ExecutionEngine) {
         None, // trigger_price
         None, // protection_price
     ));
-    execution_engine.process(order_updated_event);
+    execution_engine.process(&order_updated_event);
 
     // Note: This test was updated as the venue order ID currently does not change once assigned
     let cache = execution_engine.cache().borrow();
@@ -4186,7 +4186,7 @@ fn test_submit_order_with_quote_quantity_and_no_prices_denies(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -4220,7 +4220,7 @@ fn test_submit_order_with_quote_quantity_and_no_prices_denies(
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let cached_order = cache
@@ -4267,7 +4267,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_no_prices_denies(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -4353,7 +4353,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_no_prices_denies(
             .unwrap();
     }
 
-    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list));
+    execution_engine.execute(&TradingCommand::SubmitOrderList(submit_order_list));
 
     let cache = execution_engine.cache().borrow();
 
@@ -4472,7 +4472,7 @@ fn test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantit
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     // Set up market with quote tick
@@ -4532,7 +4532,7 @@ fn test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantit
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let cached_order = cache
@@ -4556,11 +4556,11 @@ fn test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantit
     drop(cache); // Release the borrow before processing events
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, account_id);
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event =
         TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("V-001"));
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_filled_event = TestOrderEventStubs::filled(
         &order,
@@ -4574,7 +4574,7 @@ fn test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantit
         None,
         Some(account_id),
     );
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
 
     let cache = execution_engine.cache().borrow();
     let final_cached_order = cache
@@ -4609,7 +4609,7 @@ fn test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quanti
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     // Set up market with trade tick
@@ -4669,7 +4669,7 @@ fn test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quanti
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let cached_order = cache
@@ -4693,11 +4693,11 @@ fn test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quanti
     drop(cache); // Release the borrow before processing events
 
     let order_submitted_event = TestOrderEventStubs::submitted(&order, account_id);
-    execution_engine.process(order_submitted_event);
+    execution_engine.process(&order_submitted_event);
 
     let order_accepted_event =
         TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("V-001"));
-    execution_engine.process(order_accepted_event);
+    execution_engine.process(&order_accepted_event);
 
     let order_filled_event = TestOrderEventStubs::filled(
         &order,
@@ -4711,7 +4711,7 @@ fn test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quanti
         None,
         Some(account_id),
     );
-    execution_engine.process(order_filled_event);
+    execution_engine.process(&order_filled_event);
 
     let cache = execution_engine.cache().borrow();
     let final_cached_order = cache
@@ -4746,7 +4746,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     // Set up market with trade tick
@@ -4886,7 +4886,7 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list));
+    execution_engine.execute(&TradingCommand::SubmitOrderList(submit_order_list));
 
     let cache = execution_engine.cache().borrow();
 
@@ -4928,26 +4928,26 @@ fn test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
     drop(cache); // Release the borrow before processing events
 
     let entry_submitted_event = TestOrderEventStubs::submitted(&entry_order, account_id);
-    execution_engine.process(entry_submitted_event);
+    execution_engine.process(&entry_submitted_event);
 
     let entry_accepted_event =
         TestOrderEventStubs::accepted(&entry_order, account_id, VenueOrderId::from("V-001"));
-    execution_engine.process(entry_accepted_event);
+    execution_engine.process(&entry_accepted_event);
 
     let stop_loss_submitted_event = TestOrderEventStubs::submitted(&stop_loss_order, account_id);
-    execution_engine.process(stop_loss_submitted_event);
+    execution_engine.process(&stop_loss_submitted_event);
 
     let stop_loss_accepted_event =
         TestOrderEventStubs::accepted(&stop_loss_order, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(stop_loss_accepted_event);
+    execution_engine.process(&stop_loss_accepted_event);
 
     let take_profit_submitted_event =
         TestOrderEventStubs::submitted(&take_profit_order, account_id);
-    execution_engine.process(take_profit_submitted_event);
+    execution_engine.process(&take_profit_submitted_event);
 
     let take_profit_accepted_event =
         TestOrderEventStubs::accepted(&take_profit_order, account_id, VenueOrderId::from("V-003"));
-    execution_engine.process(take_profit_accepted_event);
+    execution_engine.process(&take_profit_accepted_event);
 
     let cache = execution_engine.cache().borrow();
     let final_entry_order = cache
@@ -4991,7 +4991,7 @@ fn test_submit_market_should_not_add_to_own_book() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5033,7 +5033,7 @@ fn test_submit_market_should_not_add_to_own_book() {
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let own_order_book = cache.own_order_book(&order.instrument_id());
@@ -5068,7 +5068,7 @@ fn test_submit_ioc_fok_should_not_add_to_own_book(#[case] time_in_force: TimeInF
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5112,7 +5112,7 @@ fn test_submit_ioc_fok_should_not_add_to_own_book(#[case] time_in_force: TimeInF
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let own_order_book = cache.own_order_book(&order.instrument_id());
@@ -5145,7 +5145,7 @@ fn test_submit_order_adds_to_own_book_bid() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5188,7 +5188,7 @@ fn test_submit_order_adds_to_own_book_bid() {
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -5292,7 +5292,7 @@ fn test_submit_order_adds_to_own_book_ask() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5335,7 +5335,7 @@ fn test_submit_order_adds_to_own_book_ask() {
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -5439,7 +5439,7 @@ fn test_cancel_order_removes_from_own_book() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5513,19 +5513,19 @@ fn test_cancel_order_removes_from_own_book() {
     };
 
     // Submit orders to create own order books
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_bid));
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_ask));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_bid));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_ask));
     let order_submitted_bid = TestOrderEventStubs::submitted(&order_bid, account_id);
     let order_submitted_ask = TestOrderEventStubs::submitted(&order_ask, account_id);
-    execution_engine.process(order_submitted_bid);
-    execution_engine.process(order_submitted_ask);
+    execution_engine.process(&order_submitted_bid);
+    execution_engine.process(&order_submitted_ask);
 
     let order_accepted_bid =
         TestOrderEventStubs::accepted(&order_bid, account_id, VenueOrderId::from("V-001"));
     let order_accepted_ask =
         TestOrderEventStubs::accepted(&order_ask, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_accepted_bid);
-    execution_engine.process(order_accepted_ask);
+    execution_engine.process(&order_accepted_bid);
+    execution_engine.process(&order_accepted_ask);
 
     let cancel_order_bid = CancelOrder {
         trader_id,
@@ -5551,15 +5551,15 @@ fn test_cancel_order_removes_from_own_book() {
         params: None,
     };
 
-    execution_engine.execute(TradingCommand::CancelOrder(cancel_order_bid));
-    execution_engine.execute(TradingCommand::CancelOrder(cancel_order_ask));
+    execution_engine.execute(&TradingCommand::CancelOrder(cancel_order_bid));
+    execution_engine.execute(&TradingCommand::CancelOrder(cancel_order_ask));
 
     let order_canceled_bid =
         TestOrderEventStubs::canceled(&order_bid, account_id, Some(VenueOrderId::from("V-001")));
     let order_canceled_ask =
         TestOrderEventStubs::canceled(&order_ask, account_id, Some(VenueOrderId::from("V-002")));
-    execution_engine.process(order_canceled_bid);
-    execution_engine.process(order_canceled_ask);
+    execution_engine.process(&order_canceled_bid);
+    execution_engine.process(&order_canceled_ask);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -5603,7 +5603,7 @@ fn test_own_book_status_filtering() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5677,19 +5677,19 @@ fn test_own_book_status_filtering() {
     };
 
     // Submit orders to create own order books
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_bid));
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_ask));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_bid));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_ask));
     let order_submitted_bid = TestOrderEventStubs::submitted(&order_bid, account_id);
     let order_submitted_ask = TestOrderEventStubs::submitted(&order_ask, account_id);
-    execution_engine.process(order_submitted_bid);
-    execution_engine.process(order_submitted_ask);
+    execution_engine.process(&order_submitted_bid);
+    execution_engine.process(&order_submitted_ask);
 
     let order_accepted_bid =
         TestOrderEventStubs::accepted(&order_bid, account_id, VenueOrderId::from("V-001"));
     let order_accepted_ask =
         TestOrderEventStubs::accepted(&order_ask, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_accepted_bid);
-    execution_engine.process(order_accepted_ask);
+    execution_engine.process(&order_accepted_bid);
+    execution_engine.process(&order_accepted_ask);
 
     let cancel_order_bid = CancelOrder {
         trader_id,
@@ -5715,15 +5715,15 @@ fn test_own_book_status_filtering() {
         params: None,
     };
 
-    execution_engine.execute(TradingCommand::CancelOrder(cancel_order_bid));
-    execution_engine.execute(TradingCommand::CancelOrder(cancel_order_ask));
+    execution_engine.execute(&TradingCommand::CancelOrder(cancel_order_bid));
+    execution_engine.execute(&TradingCommand::CancelOrder(cancel_order_ask));
 
     let order_canceled_bid =
         TestOrderEventStubs::canceled(&order_bid, account_id, Some(VenueOrderId::from("V-001")));
     let order_canceled_ask =
         TestOrderEventStubs::canceled(&order_ask, account_id, Some(VenueOrderId::from("V-002")));
-    execution_engine.process(order_canceled_bid);
-    execution_engine.process(order_canceled_ask);
+    execution_engine.process(&order_canceled_bid);
+    execution_engine.process(&order_canceled_ask);
 
     let cache = execution_engine.cache().borrow();
 
@@ -5770,8 +5770,8 @@ fn test_own_book_status_filtering() {
     let accepted_statuses: AHashSet<OrderStatus> =
         AHashSet::from_iter([OrderStatus::Accepted, OrderStatus::PartiallyFilled]);
 
-    let filtered_bids = own_book.bids_as_map(Some(accepted_statuses.clone()), None, None);
-    let filtered_asks = own_book.asks_as_map(Some(accepted_statuses), None, None);
+    let filtered_bids = own_book.bids_as_map(Some(&accepted_statuses), None, None);
+    let filtered_asks = own_book.asks_as_map(Some(&accepted_statuses), None, None);
 
     assert!(
         filtered_bids.is_empty(),
@@ -5805,7 +5805,7 @@ fn test_filled_order_removes_from_own_book() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -5879,19 +5879,19 @@ fn test_filled_order_removes_from_own_book() {
     };
 
     // Submit orders to create own order books
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_bid));
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_ask));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_bid));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_ask));
     let order_submitted_bid = TestOrderEventStubs::submitted(&order_bid, account_id);
     let order_submitted_ask = TestOrderEventStubs::submitted(&order_ask, account_id);
-    execution_engine.process(order_submitted_bid);
-    execution_engine.process(order_submitted_ask);
+    execution_engine.process(&order_submitted_bid);
+    execution_engine.process(&order_submitted_ask);
 
     let order_accepted_bid =
         TestOrderEventStubs::accepted(&order_bid, account_id, VenueOrderId::from("V-001"));
     let order_accepted_ask =
         TestOrderEventStubs::accepted(&order_ask, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_accepted_bid);
-    execution_engine.process(order_accepted_ask);
+    execution_engine.process(&order_accepted_bid);
+    execution_engine.process(&order_accepted_ask);
     let order_filled_bid = OrderEventAny::Filled(OrderFilled::new(
         order_bid.trader_id(),
         order_bid.strategy_id(),
@@ -5934,8 +5934,8 @@ fn test_filled_order_removes_from_own_book() {
         None,  // position_id
         None,  // commission
     ));
-    execution_engine.process(order_filled_bid);
-    execution_engine.process(order_filled_ask);
+    execution_engine.process(&order_filled_bid);
+    execution_engine.process(&order_filled_ask);
 
     let cache = execution_engine.cache().borrow();
 
@@ -6005,7 +6005,7 @@ fn test_order_updates_in_own_book() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -6079,19 +6079,19 @@ fn test_order_updates_in_own_book() {
     };
 
     // Submit orders to create own order books
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_bid));
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_ask));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_bid));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order_ask));
     let order_submitted_bid = TestOrderEventStubs::submitted(&order_bid, account_id);
     let order_submitted_ask = TestOrderEventStubs::submitted(&order_ask, account_id);
-    execution_engine.process(order_submitted_bid);
-    execution_engine.process(order_submitted_ask);
+    execution_engine.process(&order_submitted_bid);
+    execution_engine.process(&order_submitted_ask);
 
     let order_accepted_bid =
         TestOrderEventStubs::accepted(&order_bid, account_id, VenueOrderId::from("V-001"));
     let order_accepted_ask =
         TestOrderEventStubs::accepted(&order_ask, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_accepted_bid);
-    execution_engine.process(order_accepted_ask);
+    execution_engine.process(&order_accepted_bid);
+    execution_engine.process(&order_accepted_ask);
 
     let new_bid_price = Price::from_str("9.0").unwrap();
     let new_ask_price = Price::from_str("12.0").unwrap();
@@ -6130,8 +6130,8 @@ fn test_order_updates_in_own_book() {
         None,                              // protection_price
     ));
 
-    execution_engine.process(order_updated_bid);
-    execution_engine.process(order_updated_ask);
+    execution_engine.process(&order_updated_bid);
+    execution_engine.process(&order_updated_ask);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -6172,8 +6172,8 @@ fn test_order_updates_in_own_book() {
     assert_eq!(own_order_ask.status, OrderStatus::Accepted);
     let accepted_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Accepted]);
 
-    let filtered_bids = own_book.bids_as_map(Some(accepted_statuses.clone()), None, None);
-    let filtered_asks = own_book.asks_as_map(Some(accepted_statuses), None, None);
+    let filtered_bids = own_book.bids_as_map(Some(&accepted_statuses), None, None);
+    let filtered_asks = own_book.asks_as_map(Some(&accepted_statuses), None, None);
 
     assert_eq!(
         filtered_bids.len(),
@@ -6236,7 +6236,7 @@ fn test_position_flip_with_own_order_book() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let account = CashAccount::default();
@@ -6287,13 +6287,13 @@ fn test_position_flip_with_own_order_book() {
     };
 
     // Submit buy order to create own order book
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_buy_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_buy_order));
 
     let order_submitted_buy = TestOrderEventStubs::submitted(&buy_order, account_id);
     let order_accepted_buy =
         TestOrderEventStubs::accepted(&buy_order, account_id, VenueOrderId::from("V-001"));
-    execution_engine.process(order_submitted_buy);
-    execution_engine.process(order_accepted_buy);
+    execution_engine.process(&order_submitted_buy);
+    execution_engine.process(&order_accepted_buy);
 
     let order_filled_buy = OrderEventAny::Filled(OrderFilled::new(
         buy_order.trader_id(),
@@ -6316,7 +6316,7 @@ fn test_position_flip_with_own_order_book() {
         None,  // position_id
         None,  // commission
     ));
-    execution_engine.process(order_filled_buy);
+    execution_engine.process(&order_filled_buy);
 
     // The position ID should be generated by the execution engine
     // Let's find the position that was created
@@ -6377,13 +6377,13 @@ fn test_position_flip_with_own_order_book() {
         ts_init: UnixNanos::default(),
     };
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_sell_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_sell_order));
 
     let order_submitted_sell = TestOrderEventStubs::submitted(&sell_order, account_id);
     let order_accepted_sell =
         TestOrderEventStubs::accepted(&sell_order, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_submitted_sell);
-    execution_engine.process(order_accepted_sell);
+    execution_engine.process(&order_submitted_sell);
+    execution_engine.process(&order_accepted_sell);
 
     let order_filled_sell = OrderEventAny::Filled(OrderFilled::new(
         sell_order.trader_id(),
@@ -6406,7 +6406,7 @@ fn test_position_flip_with_own_order_book() {
         Some(position_id), // position_id
         None,              // commission
     ));
-    execution_engine.process(order_filled_sell);
+    execution_engine.process(&order_filled_sell);
 
     let cache = execution_engine.cache().borrow();
 
@@ -6483,7 +6483,7 @@ fn test_own_book_with_crossed_orders() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -6557,19 +6557,19 @@ fn test_own_book_with_crossed_orders() {
     };
 
     // Submit orders to create own order books
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_buy_order));
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_sell_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_buy_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_sell_order));
     let order_submitted_buy = TestOrderEventStubs::submitted(&buy_order, account_id);
     let order_submitted_sell = TestOrderEventStubs::submitted(&sell_order, account_id);
-    execution_engine.process(order_submitted_buy);
-    execution_engine.process(order_submitted_sell);
+    execution_engine.process(&order_submitted_buy);
+    execution_engine.process(&order_submitted_sell);
 
     let order_accepted_buy =
         TestOrderEventStubs::accepted(&buy_order, account_id, VenueOrderId::from("V-001"));
     let order_accepted_sell =
         TestOrderEventStubs::accepted(&sell_order, account_id, VenueOrderId::from("V-002"));
-    execution_engine.process(order_accepted_buy);
-    execution_engine.process(order_accepted_sell);
+    execution_engine.process(&order_accepted_buy);
+    execution_engine.process(&order_accepted_sell);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -6603,8 +6603,8 @@ fn test_own_book_with_crossed_orders() {
     // because it's just tracking the orders, not matching them
     let accepted_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Accepted]);
 
-    let active_bid_orders = own_book.bids_as_map(Some(accepted_statuses.clone()), None, None);
-    let active_ask_orders = own_book.asks_as_map(Some(accepted_statuses), None, None);
+    let active_bid_orders = own_book.bids_as_map(Some(&accepted_statuses), None, None);
+    let active_ask_orders = own_book.asks_as_map(Some(&accepted_statuses), None, None);
 
     assert_eq!(active_bid_orders.len(), 1, "Expected 1 active bid order");
     assert!(
@@ -6641,7 +6641,7 @@ fn test_own_book_with_contingent_orders() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -6747,24 +6747,24 @@ fn test_own_book_with_contingent_orders() {
         .add_order(sl_order.clone(), None, Some(ClientId::from("STUB")), true)
         .unwrap();
 
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_entry_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_entry_order));
 
     // Submit TP order (in a real bracket, this would be contingent but for testing we submit it)
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_tp_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_tp_order));
 
     let entry_submitted_event = TestOrderEventStubs::submitted(&entry_order, account_id);
-    execution_engine.process(entry_submitted_event);
+    execution_engine.process(&entry_submitted_event);
 
     let entry_accepted_event =
         TestOrderEventStubs::accepted(&entry_order, account_id, VenueOrderId::from("1"));
-    execution_engine.process(entry_accepted_event);
+    execution_engine.process(&entry_accepted_event);
 
     let tp_submitted_event = TestOrderEventStubs::submitted(&tp_order, account_id);
-    execution_engine.process(tp_submitted_event);
+    execution_engine.process(&tp_submitted_event);
 
     let tp_accepted_event =
         TestOrderEventStubs::accepted(&tp_order, account_id, VenueOrderId::from("2"));
-    execution_engine.process(tp_accepted_event);
+    execution_engine.process(&tp_accepted_event);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -6810,7 +6810,7 @@ fn test_own_book_with_contingent_orders() {
 
     let entry_filled_event = TestOrderEventStubs::filled(
         &cached_entry_order,
-        &InstrumentAny::CurrencyPair(instrument),
+        &InstrumentAny::CurrencyPair(instrument.clone()),
         None, // trade_id
         None, // position_id
         None, // last_px
@@ -6820,17 +6820,17 @@ fn test_own_book_with_contingent_orders() {
         None, // ts_filled_ns
         None, // account_id
     );
-    execution_engine.process(entry_filled_event);
+    execution_engine.process(&entry_filled_event);
 
     // Submit and process SL order after entry is filled
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_sl_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_sl_order));
 
     let sl_submitted_event = TestOrderEventStubs::submitted(&sl_order, account_id);
-    execution_engine.process(sl_submitted_event);
+    execution_engine.process(&sl_submitted_event);
 
     let sl_accepted_event =
         TestOrderEventStubs::accepted(&sl_order, account_id, VenueOrderId::from("3"));
-    execution_engine.process(sl_accepted_event);
+    execution_engine.process(&sl_accepted_event);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -6911,7 +6911,7 @@ fn test_own_book_order_status_filtering_parameterized(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -6955,18 +6955,18 @@ fn test_own_book_order_status_filtering_parameterized(
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
     for step in process_steps {
         match step {
             OrderStatus::Submitted => {
                 let event = TestOrderEventStubs::submitted(&order, account_id);
-                execution_engine.process(event);
+                execution_engine.process(&event);
             }
             OrderStatus::Accepted => {
                 let event =
                     TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::from("1"));
-                execution_engine.process(event);
+                execution_engine.process(&event);
             }
             OrderStatus::PartiallyFilled => {
                 // Get the updated order from cache to ensure venue_order_id is set
@@ -6980,7 +6980,7 @@ fn test_own_book_order_status_filtering_parameterized(
 
                 let event = TestOrderEventStubs::filled(
                     &cached_order,
-                    &InstrumentAny::CurrencyPair(instrument),
+                    &InstrumentAny::CurrencyPair(instrument.clone()),
                     None,                         // trade_id
                     None,                         // position_id
                     None,                         // last_px
@@ -6990,7 +6990,7 @@ fn test_own_book_order_status_filtering_parameterized(
                     None,                         // ts_filled_ns
                     None,                         // account_id
                 );
-                execution_engine.process(event);
+                execution_engine.process(&event);
             }
             OrderStatus::Filled => {
                 // Get the updated order from cache to ensure venue_order_id is set
@@ -7004,7 +7004,7 @@ fn test_own_book_order_status_filtering_parameterized(
 
                 let event = TestOrderEventStubs::filled(
                     &cached_order,
-                    &InstrumentAny::CurrencyPair(instrument),
+                    &InstrumentAny::CurrencyPair(instrument.clone()),
                     None, // trade_id
                     None, // position_id
                     None, // last_px
@@ -7014,7 +7014,7 @@ fn test_own_book_order_status_filtering_parameterized(
                     None, // ts_filled_ns
                     None, // account_id
                 );
-                execution_engine.process(event);
+                execution_engine.process(&event);
             }
             OrderStatus::Canceled => {
                 let event = TestOrderEventStubs::canceled(
@@ -7022,7 +7022,7 @@ fn test_own_book_order_status_filtering_parameterized(
                     account_id,
                     Some(VenueOrderId::from("1")),
                 );
-                execution_engine.process(event);
+                execution_engine.process(&event);
             }
             _ => {} // Handle other statuses if needed
         }
@@ -7044,7 +7044,7 @@ fn test_own_book_order_status_filtering_parameterized(
 
         // Test status filtering
         let status_filter: AHashSet<OrderStatus> = AHashSet::from_iter([final_status]);
-        let filtered_bids = own_book.bids_as_map(Some(status_filter), None, None);
+        let filtered_bids = own_book.bids_as_map(Some(&status_filter), None, None);
         assert!(
             filtered_bids.contains_key(&price_decimal),
             "Expected order at price {price_str} with status {final_status:?}"
@@ -7087,7 +7087,7 @@ fn test_own_book_combined_status_filtering() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -7196,7 +7196,7 @@ fn test_own_book_combined_status_filtering() {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_initialized));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_initialized));
 
     // 2. Submit and process submitted_order (becomes SUBMITTED)
     let submit_submitted = SubmitOrder {
@@ -7212,9 +7212,9 @@ fn test_own_book_combined_status_filtering() {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_submitted));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_submitted));
     let submitted_event = TestOrderEventStubs::submitted(&submitted_order, account_id);
-    execution_engine.process(submitted_event);
+    execution_engine.process(&submitted_event);
 
     // 3. Submit, submit, and accept accepted_order (becomes ACCEPTED)
     let submit_accepted = SubmitOrder {
@@ -7230,12 +7230,12 @@ fn test_own_book_combined_status_filtering() {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_accepted));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_accepted));
     let accepted_submitted_event = TestOrderEventStubs::submitted(&accepted_order, account_id);
-    execution_engine.process(accepted_submitted_event);
+    execution_engine.process(&accepted_submitted_event);
     let accepted_accepted_event =
         TestOrderEventStubs::accepted(&accepted_order, account_id, VenueOrderId::from("V-003"));
-    execution_engine.process(accepted_accepted_event);
+    execution_engine.process(&accepted_accepted_event);
 
     // 4. Submit, submit, accept, and partially fill partially_filled_order (becomes PARTIALLY_FILLED)
     let submit_partial = SubmitOrder {
@@ -7251,16 +7251,16 @@ fn test_own_book_combined_status_filtering() {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
     };
-    execution_engine.execute(TradingCommand::SubmitOrder(submit_partial));
+    execution_engine.execute(&TradingCommand::SubmitOrder(submit_partial));
     let partial_submitted_event =
         TestOrderEventStubs::submitted(&partially_filled_order, account_id);
-    execution_engine.process(partial_submitted_event);
+    execution_engine.process(&partial_submitted_event);
     let partial_accepted_event = TestOrderEventStubs::accepted(
         &partially_filled_order,
         account_id,
         VenueOrderId::from("V-004"),
     );
-    execution_engine.process(partial_accepted_event);
+    execution_engine.process(&partial_accepted_event);
 
     // Get updated order from cache for partial fill
     let cached_partial_order = {
@@ -7273,7 +7273,7 @@ fn test_own_book_combined_status_filtering() {
 
     let partial_filled_event = TestOrderEventStubs::filled(
         &cached_partial_order,
-        &InstrumentAny::CurrencyPair(instrument),
+        &InstrumentAny::CurrencyPair(instrument.clone()),
         None,                         // trade_id
         None,                         // position_id
         None,                         // last_px
@@ -7283,7 +7283,7 @@ fn test_own_book_combined_status_filtering() {
         None,                         // ts_filled_ns
         None,                         // account_id
     );
-    execution_engine.process(partial_filled_event);
+    execution_engine.process(&partial_filled_event);
 
     let cache = execution_engine.cache().borrow();
     let own_book = cache
@@ -7293,7 +7293,7 @@ fn test_own_book_combined_status_filtering() {
     // INITIALIZED + SUBMITTED
     let early_statuses: AHashSet<OrderStatus> =
         AHashSet::from_iter([OrderStatus::Initialized, OrderStatus::Submitted]);
-    let early_orders = own_book.bids_as_map(Some(early_statuses), None, None);
+    let early_orders = own_book.bids_as_map(Some(&early_statuses), None, None);
     let early_order_count: usize = early_orders.values().map(std::vec::Vec::len).sum();
     assert_eq!(
         early_order_count, 2,
@@ -7314,7 +7314,7 @@ fn test_own_book_combined_status_filtering() {
     // ACCEPTED + PARTIALLY_FILLED
     let active_statuses: AHashSet<OrderStatus> =
         AHashSet::from_iter([OrderStatus::Accepted, OrderStatus::PartiallyFilled]);
-    let active_orders = own_book.bids_as_map(Some(active_statuses), None, None);
+    let active_orders = own_book.bids_as_map(Some(&active_statuses), None, None);
     let active_order_count: usize = active_orders.values().map(std::vec::Vec::len).sum();
     assert_eq!(
         active_order_count, 2,
@@ -7377,7 +7377,7 @@ fn test_own_book_status_integrity_during_transitions() {
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(instrument.into())
+        .add_instrument(instrument.clone().into())
         .unwrap();
 
     let stub_client = StubExecutionClient::new(
@@ -7428,17 +7428,17 @@ fn test_own_book_status_integrity_during_transitions() {
             command_id: UUID4::new(),
             ts_init: UnixNanos::default(),
         };
-        execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+        execution_engine.execute(&TradingCommand::SubmitOrder(submit_order));
 
         let submitted_event = TestOrderEventStubs::submitted(&order, account_id);
-        execution_engine.process(submitted_event);
+        execution_engine.process(&submitted_event);
 
         let accepted_event = TestOrderEventStubs::accepted(
             &order,
             account_id,
             VenueOrderId::from(format!("V-00{}", i + 1)),
         );
-        execution_engine.process(accepted_event);
+        execution_engine.process(&accepted_event);
 
         orders.push(order);
     }
@@ -7450,7 +7450,7 @@ fn test_own_book_status_integrity_during_transitions() {
             .expect("Own order book should exist");
 
         let accepted_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Accepted]);
-        let accepted_orders = own_book.bids_as_map(Some(accepted_statuses), None, None);
+        let accepted_orders = own_book.bids_as_map(Some(&accepted_statuses), None, None);
         assert_eq!(accepted_orders.len(), 3, "Expected 3 accepted orders");
 
         for (price, order) in prices.iter().zip(&orders) {
@@ -7484,7 +7484,7 @@ fn test_own_book_status_integrity_during_transitions() {
 
     let partial_fill_event = TestOrderEventStubs::filled(
         &cached_order_1,
-        &InstrumentAny::CurrencyPair(instrument),
+        &InstrumentAny::CurrencyPair(instrument.clone()),
         None,                         // trade_id
         Some(PositionId::new("1")),   // position_id
         None,                         // last_px
@@ -7494,7 +7494,7 @@ fn test_own_book_status_integrity_during_transitions() {
         None,                         // ts_filled_ns
         None,                         // account_id
     );
-    execution_engine.process(partial_fill_event);
+    execution_engine.process(&partial_fill_event);
     {
         let cache = execution_engine.cache().borrow();
         let own_book = cache
@@ -7504,7 +7504,7 @@ fn test_own_book_status_integrity_during_transitions() {
         let partially_filled_statuses: AHashSet<OrderStatus> =
             AHashSet::from_iter([OrderStatus::PartiallyFilled]);
         let partially_filled_orders =
-            own_book.bids_as_map(Some(partially_filled_statuses), None, None);
+            own_book.bids_as_map(Some(&partially_filled_statuses), None, None);
         assert_eq!(
             partially_filled_orders.len(),
             1,
@@ -7518,7 +7518,7 @@ fn test_own_book_status_integrity_during_transitions() {
         );
 
         let accepted_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Accepted]);
-        let accepted_after_partial = own_book.bids_as_map(Some(accepted_statuses), None, None);
+        let accepted_after_partial = own_book.bids_as_map(Some(&accepted_statuses), None, None);
         assert_eq!(
             accepted_after_partial.len(),
             2,
@@ -7534,7 +7534,7 @@ fn test_own_book_status_integrity_during_transitions() {
     // Cancel order 2 (index 2, price 1.02)
     let cancel_event =
         TestOrderEventStubs::canceled(&orders[2], account_id, Some(VenueOrderId::from("V-003")));
-    execution_engine.process(cancel_event);
+    execution_engine.process(&cancel_event);
     {
         let cache = execution_engine.cache().borrow();
         let own_book = cache
@@ -7542,7 +7542,7 @@ fn test_own_book_status_integrity_during_transitions() {
             .expect("Own order book should exist");
 
         let canceled_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Canceled]);
-        let canceled_orders = own_book.bids_as_map(Some(canceled_statuses), None, None);
+        let canceled_orders = own_book.bids_as_map(Some(&canceled_statuses), None, None);
         assert_eq!(
             canceled_orders.len(),
             0,
@@ -7550,7 +7550,7 @@ fn test_own_book_status_integrity_during_transitions() {
         );
 
         let accepted_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Accepted]);
-        let accepted_after_cancel = own_book.bids_as_map(Some(accepted_statuses), None, None);
+        let accepted_after_cancel = own_book.bids_as_map(Some(&accepted_statuses), None, None);
         assert_eq!(
             accepted_after_cancel.len(),
             1,
@@ -7576,7 +7576,7 @@ fn test_own_book_status_integrity_during_transitions() {
 
     let first_partial_fill = TestOrderEventStubs::filled(
         &cached_order_0,
-        &InstrumentAny::CurrencyPair(instrument),
+        &InstrumentAny::CurrencyPair(instrument.clone()),
         Some(TradeId::new("001")),    // trade_id
         None,                         // position_id
         None,                         // last_px
@@ -7586,7 +7586,7 @@ fn test_own_book_status_integrity_during_transitions() {
         None,                         // ts_filled_ns
         None,                         // account_id
     );
-    execution_engine.process(first_partial_fill);
+    execution_engine.process(&first_partial_fill);
 
     {
         let cache = execution_engine.cache().borrow();
@@ -7597,7 +7597,7 @@ fn test_own_book_status_integrity_during_transitions() {
         let partially_filled_statuses: AHashSet<OrderStatus> =
             AHashSet::from_iter([OrderStatus::PartiallyFilled]);
         let partially_after_first =
-            own_book.bids_as_map(Some(partially_filled_statuses), None, None);
+            own_book.bids_as_map(Some(&partially_filled_statuses), None, None);
         assert_eq!(
             partially_after_first.len(),
             2,
@@ -7622,7 +7622,7 @@ fn test_own_book_status_integrity_during_transitions() {
 
     let complete_fill = TestOrderEventStubs::filled(
         &cached_order_0_updated,
-        &InstrumentAny::CurrencyPair(instrument),
+        &InstrumentAny::CurrencyPair(instrument.clone()),
         Some(TradeId::new("002")),    // trade_id
         None,                         // position_id
         None,                         // last_px
@@ -7632,7 +7632,7 @@ fn test_own_book_status_integrity_during_transitions() {
         None,                         // ts_filled_ns
         None,                         // account_id
     );
-    execution_engine.process(complete_fill);
+    execution_engine.process(&complete_fill);
 
     // Final verification
     {
@@ -7644,7 +7644,7 @@ fn test_own_book_status_integrity_during_transitions() {
         let partially_filled_statuses: AHashSet<OrderStatus> =
             AHashSet::from_iter([OrderStatus::PartiallyFilled]);
         let partially_after_complete =
-            own_book.bids_as_map(Some(partially_filled_statuses), None, None);
+            own_book.bids_as_map(Some(&partially_filled_statuses), None, None);
         assert_eq!(
             partially_after_complete.len(),
             1,
@@ -7686,7 +7686,7 @@ fn test_own_book_status_integrity_during_transitions() {
 
         // FILLED orders should not appear in the own book
         let filled_statuses: AHashSet<OrderStatus> = AHashSet::from_iter([OrderStatus::Filled]);
-        let filled_orders = own_book.bids_as_map(Some(filled_statuses), None, None);
+        let filled_orders = own_book.bids_as_map(Some(&filled_statuses), None, None);
         assert_eq!(
             filled_orders.len(),
             0,
@@ -7734,7 +7734,7 @@ fn test_own_book_status_integrity_during_transitions() {
         claims.insert(instrument_id);
 
         execution_engine
-            .register_external_order_claims(strategy_id, claims)
+            .register_external_order_claims(strategy_id, &claims)
             .unwrap();
 
         let claim = execution_engine.get_external_order_claim(&instrument_id);
@@ -7751,10 +7751,10 @@ fn test_own_book_status_integrity_during_transitions() {
         claims.insert(instrument_id);
 
         execution_engine
-            .register_external_order_claims(strategy_id_1, claims.clone())
+            .register_external_order_claims(strategy_id_1, &claims)
             .unwrap();
 
-        let result = execution_engine.register_external_order_claims(strategy_id_2, claims);
+        let result = execution_engine.register_external_order_claims(strategy_id_2, &claims);
         assert!(result.is_err());
         assert!(
             result
@@ -7775,7 +7775,7 @@ fn test_own_book_status_integrity_during_transitions() {
         let mut initial_claims = HashSet::new();
         initial_claims.insert(instrument_id_2);
         execution_engine
-            .register_external_order_claims(strategy_id_1, initial_claims)
+            .register_external_order_claims(strategy_id_1, &initial_claims)
             .unwrap();
 
         // Try to register multiple claims where one conflicts
@@ -7785,7 +7785,7 @@ fn test_own_book_status_integrity_during_transitions() {
         conflicting_claims.insert(instrument_id_3);
 
         let result =
-            execution_engine.register_external_order_claims(strategy_id_2, conflicting_claims);
+            execution_engine.register_external_order_claims(strategy_id_2, &conflicting_claims);
         assert!(result.is_err());
 
         assert_eq!(
@@ -7813,7 +7813,7 @@ fn test_own_book_status_integrity_during_transitions() {
         claims.insert(instrument_id_2);
 
         execution_engine
-            .register_external_order_claims(strategy_id, claims)
+            .register_external_order_claims(strategy_id, &claims)
             .unwrap();
 
         let instruments = execution_engine.get_external_order_claims_instruments();
@@ -7907,7 +7907,7 @@ fn test_own_book_status_integrity_during_transitions() {
         execution_engine
             .cache()
             .borrow_mut()
-            .add_instrument(instrument.into())
+            .add_instrument(instrument.clone().into())
             .unwrap();
 
         let account = CashAccount::default();
@@ -7934,18 +7934,18 @@ fn test_own_book_status_integrity_during_transitions() {
 
         let position_id = PositionId::from("P-1");
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order1,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order1,
             AccountId::test_default(),
             VenueOrderId::from("V-1"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order1,
-            &instrument.into(),
+            &instrument.clone().into(),
             Some(TradeId::new("T-1")),
             Some(position_id),
             None,
@@ -7979,16 +7979,16 @@ fn test_own_book_status_integrity_during_transitions() {
             .add_order(order2.clone(), None, Some(ClientId::from("STUB")), true)
             .unwrap();
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order2,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order2,
             AccountId::test_default(),
             VenueOrderId::from("V-2"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order2,
             &instrument.into(),
             Some(TradeId::new("T-2")),
@@ -8036,7 +8036,7 @@ fn test_own_book_status_integrity_during_transitions() {
         execution_engine
             .cache()
             .borrow_mut()
-            .add_instrument(instrument.into())
+            .add_instrument(instrument.clone().into())
             .unwrap();
 
         let account = CashAccount::default();
@@ -8063,18 +8063,18 @@ fn test_own_book_status_integrity_during_transitions() {
 
         let position_id1 = PositionId::from("P-19700101-000000-000-001-1");
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order1,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order1,
             AccountId::test_default(),
             VenueOrderId::from("V-1"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order1,
-            &instrument.into(),
+            &instrument.clone().into(),
             Some(TradeId::new("T-1")),
             Some(position_id1),
             None,
@@ -8100,16 +8100,16 @@ fn test_own_book_status_integrity_during_transitions() {
             .add_order(order2.clone(), None, Some(ClientId::from("STUB")), true)
             .unwrap();
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order2,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order2,
             AccountId::test_default(),
             VenueOrderId::from("V-2"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order2,
             &instrument.into(),
             Some(TradeId::new("T-2")),
@@ -8163,7 +8163,7 @@ fn test_own_book_status_integrity_during_transitions() {
         execution_engine
             .cache()
             .borrow_mut()
-            .add_instrument(instrument.into())
+            .add_instrument(instrument.clone().into())
             .unwrap();
 
         let account = CashAccount::default();
@@ -8191,18 +8191,18 @@ fn test_own_book_status_integrity_during_transitions() {
             .add_order(order1.clone(), None, Some(ClientId::from("STUB")), true)
             .unwrap();
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order1,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order1,
             AccountId::test_default(),
             VenueOrderId::from("V-1"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order1,
-            &instrument.into(),
+            &instrument.clone().into(),
             Some(TradeId::new("T-1")),
             Some(position_id),
             None,
@@ -8229,18 +8229,18 @@ fn test_own_book_status_integrity_during_transitions() {
             .add_order(order2.clone(), None, Some(ClientId::from("STUB")), true)
             .unwrap();
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order2,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order2,
             AccountId::test_default(),
             VenueOrderId::from("V-2"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order2,
-            &instrument.into(),
+            &instrument.clone().into(),
             Some(TradeId::new("T-2")),
             Some(position_id),
             None,
@@ -8273,16 +8273,16 @@ fn test_own_book_status_integrity_during_transitions() {
             .add_order(order3.clone(), None, Some(ClientId::from("STUB")), true)
             .unwrap();
 
-        execution_engine.process(TestOrderEventStubs::submitted(
+        execution_engine.process(&TestOrderEventStubs::submitted(
             &order3,
             AccountId::test_default(),
         ));
-        execution_engine.process(TestOrderEventStubs::accepted(
+        execution_engine.process(&TestOrderEventStubs::accepted(
             &order3,
             AccountId::test_default(),
             VenueOrderId::from("V-3"),
         ));
-        execution_engine.process(TestOrderEventStubs::filled(
+        execution_engine.process(&TestOrderEventStubs::filled(
             &order3,
             &instrument.into(),
             Some(TradeId::new("T-3")),
@@ -8374,9 +8374,9 @@ fn test_reconcile_order_status_report_generates_canceled_event(
         .add_order(order.clone(), None, None, true)
         .unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     let report = create_order_status_report(
         Some(client_order_id),
@@ -8410,9 +8410,9 @@ fn test_reconcile_order_status_report_no_event_when_in_sync(mut execution_engine
         .add_order(order.clone(), None, None, true)
         .unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     let report = create_order_status_report(
         Some(client_order_id),
@@ -8448,9 +8448,9 @@ fn test_reconcile_order_status_report_finds_order_by_venue_order_id(
         .add_order(order.clone(), None, None, true)
         .unwrap();
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     let report = create_order_status_report(
         None,
@@ -8500,7 +8500,7 @@ fn test_reconcile_fill_report_order_not_found(mut execution_engine: ExecutionEng
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     let report = create_fill_report(
@@ -8527,7 +8527,7 @@ fn test_reconcile_fill_report_applies_fill_event(mut execution_engine: Execution
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -8544,10 +8544,10 @@ fn test_reconcile_fill_report_applies_fill_event(mut execution_engine: Execution
         .unwrap();
 
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
 
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     let report = create_fill_report(
         instrument.id(),
@@ -8575,7 +8575,7 @@ fn test_reconcile_fill_report_finds_order_by_venue_order_id(mut execution_engine
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Market)
@@ -8592,10 +8592,10 @@ fn test_reconcile_fill_report_finds_order_by_venue_order_id(mut execution_engine
         .unwrap();
 
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
 
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     // Report without client_order_id - should find by venue_order_id
     let report = create_fill_report(
@@ -8641,7 +8641,7 @@ fn test_reconcile_position_report_netting_mode(mut execution_engine: ExecutionEn
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     // No venue_position_id = netting mode
@@ -8665,7 +8665,7 @@ fn test_reconcile_position_report_hedging_mode_position_not_found(
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     // With venue_position_id = hedging mode
@@ -8701,7 +8701,7 @@ fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine:
     execution_engine
         .cache()
         .borrow_mut()
-        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
         .unwrap();
 
     let order = OrderTestBuilder::new(OrderType::Limit)
@@ -8719,10 +8719,10 @@ fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine:
         .unwrap();
 
     let submitted = TestOrderEventStubs::submitted(&order, AccountId::test_default());
-    execution_engine.process(submitted);
+    execution_engine.process(&submitted);
 
     let accepted = TestOrderEventStubs::accepted(&order, AccountId::test_default(), venue_order_id);
-    execution_engine.process(accepted);
+    execution_engine.process(&accepted);
 
     let order_report = create_order_status_report(
         Some(client_order_id),
@@ -8747,4 +8747,73 @@ fn test_reconcile_execution_mass_status_with_order_reports(mut execution_engine:
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
     assert_eq!(order.status(), OrderStatus::Canceled);
+}
+
+#[rstest]
+fn test_get_all_clients_empty(execution_engine: ExecutionEngine) {
+    let clients = execution_engine.get_all_clients();
+
+    assert!(clients.is_empty());
+}
+
+#[rstest]
+fn test_get_all_clients_with_registered_client(
+    mut execution_engine: ExecutionEngine,
+    stub_client: StubExecutionClient,
+) {
+    let client_id = stub_client.client_id();
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+
+    let clients = execution_engine.get_all_clients();
+
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].client_id(), client_id);
+}
+
+#[rstest]
+fn test_get_all_clients_includes_default_client(mut execution_engine: ExecutionEngine) {
+    let default_client = StubExecutionClient::new(
+        ClientId::from("DEFAULT"),
+        AccountId::from("DEFAULT-ACCOUNT"),
+        Venue::from("DEFAULT"),
+        OmsType::Netting,
+        None,
+    );
+    let default_id = default_client.client_id();
+    execution_engine.register_default_client(Box::new(default_client));
+
+    let clients = execution_engine.get_all_clients();
+
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].client_id(), default_id);
+}
+
+#[rstest]
+fn test_get_all_clients_with_registered_and_default(
+    mut execution_engine: ExecutionEngine,
+    stub_client: StubExecutionClient,
+) {
+    let registered_id = stub_client.client_id();
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+
+    let default_client = StubExecutionClient::new(
+        ClientId::from("DEFAULT"),
+        AccountId::from("DEFAULT-ACCOUNT"),
+        Venue::from("DEFAULT"),
+        OmsType::Netting,
+        None,
+    );
+    let default_id = default_client.client_id();
+    execution_engine.register_default_client(Box::new(default_client));
+
+    let clients = execution_engine.get_all_clients();
+    let client_ids: HashSet<ClientId> = clients.iter().map(|c| c.client_id()).collect();
+
+    assert_eq!(clients.len(), 2);
+    assert!(client_ids.contains(&registered_id));
+    assert!(client_ids.contains(&default_id));
 }

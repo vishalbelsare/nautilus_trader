@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use ahash::AHashSet;
 use indexmap::IndexMap;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use pyo3::prelude::*;
@@ -27,6 +28,7 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderBook {
     #[new]
     fn py_new(instrument_id: InstrumentId, book_type: BookType) -> Self {
@@ -209,10 +211,11 @@ impl OrderBook {
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Decimal> {
+        let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
         self.bids_filtered_as_map(
             depth,
             own_book,
-            status.map(|s| s.into_iter().collect()),
+            status_set.as_ref(),
             accepted_buffer_ns,
             ts_now,
         )
@@ -228,10 +231,11 @@ impl OrderBook {
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Decimal> {
+        let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
         self.asks_filtered_as_map(
             depth,
             own_book,
-            status.map(|s| s.into_iter().collect()),
+            status_set.as_ref(),
             accepted_buffer_ns,
             ts_now,
         )
@@ -248,11 +252,12 @@ impl OrderBook {
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Decimal> {
+        let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
         self.group_bids_filtered(
             group_size,
             depth,
             own_book,
-            status.map(|s| s.into_iter().collect()),
+            status_set.as_ref(),
             accepted_buffer_ns,
             ts_now,
         )
@@ -269,14 +274,36 @@ impl OrderBook {
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Decimal> {
+        let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
         self.group_asks_filtered(
             group_size,
             depth,
             own_book,
-            status.map(|s| s.into_iter().collect()),
+            status_set.as_ref(),
             accepted_buffer_ns,
             ts_now,
         )
+    }
+
+    #[pyo3(name = "filtered_view")]
+    #[pyo3(signature = (own_book=None, depth=None, status=None, accepted_buffer_ns=None, ts_now=None))]
+    fn py_filtered_view(
+        &self,
+        own_book: Option<&OwnOrderBook>,
+        depth: Option<usize>,
+        status: Option<std::collections::HashSet<OrderStatus>>,
+        accepted_buffer_ns: Option<u64>,
+        ts_now: Option<u64>,
+    ) -> PyResult<Self> {
+        let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
+        self.filtered_view_checked(
+            own_book,
+            depth,
+            status_set.as_ref(),
+            accepted_buffer_ns,
+            ts_now,
+        )
+        .map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "best_bid_price")]
@@ -312,6 +339,11 @@ impl OrderBook {
     #[pyo3(name = "get_avg_px_for_quantity")]
     fn py_get_avg_px_for_quantity(&self, qty: Quantity, order_side: OrderSide) -> f64 {
         self.get_avg_px_for_quantity(qty, order_side)
+    }
+
+    #[pyo3(name = "get_worst_px_for_quantity")]
+    fn py_get_worst_px_for_quantity(&self, qty: Quantity, order_side: OrderSide) -> Option<Price> {
+        self.get_worst_px_for_quantity(qty, order_side)
     }
 
     #[pyo3(name = "get_avg_px_qty_for_exposure")]
