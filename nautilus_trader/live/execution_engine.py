@@ -84,6 +84,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.instruments import Instrument
@@ -903,11 +904,12 @@ class LiveExecutionEngine(ExecutionEngine):
             self._log.debug("No execution clients to check position consistency, early return")
             return
 
-        venue_positions = await self._query_position_status_reports()
+        venue_positions, failed_position_report_venues = await self._query_position_status_reports()
 
         await self._process_cached_position_discrepancies(
             positions_by_instrument,
             venue_positions,
+            failed_position_report_venues,
         )
 
         await self._process_venue_reported_positions(
@@ -921,8 +923,10 @@ class LiveExecutionEngine(ExecutionEngine):
         for iid in stale:
             self._position_recon_retries.pop(iid, None)
 
-    async def _query_position_status_reports(self) -> dict[InstrumentId, PositionStatusReport]:
-        clients = self._clients.values()
+    async def _query_position_status_reports(
+        self,
+    ) -> tuple[dict[InstrumentId, PositionStatusReport], set[Venue | None]]:
+        clients = list(self._clients.values())
 
         tasks = [
             c.generate_position_status_reports(
@@ -942,14 +946,17 @@ class LiveExecutionEngine(ExecutionEngine):
             position_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             self._log.error(f"Failed to gather position status reports: {e}")
-            return {}
+            return {}, {client.venue for client in clients}
 
         # Build mapping: instrument_id -> venue report
         venue_positions: dict[InstrumentId, PositionStatusReport] = {}
-        for reports_or_exception in position_reports_all:
+        failed_venues: set[Venue | None] = set()
+        for client, reports_or_exception in zip(clients, position_reports_all, strict=True):
             if isinstance(reports_or_exception, Exception):
+                failed_venues.add(client.venue)
                 self._log.error(
-                    f"Failed to generate position status reports: {reports_or_exception}",
+                    f"Failed to generate position status reports for venue {client.venue}: "
+                    f"{reports_or_exception}",
                 )
                 continue
 
@@ -957,17 +964,29 @@ class LiveExecutionEngine(ExecutionEngine):
             for report in reports:
                 venue_positions[report.instrument_id] = report
 
-        return venue_positions
+        return venue_positions, failed_venues
 
     async def _process_cached_position_discrepancies(
         self,
         positions_by_instrument: dict[InstrumentId, list[Position]],
         venue_positions: dict[InstrumentId, PositionStatusReport],
+        failed_position_report_venues: set[Venue | None] | None = None,
     ) -> None:
         clients = self._clients.values()
 
         for instrument_id, cached_positions in positions_by_instrument.items():
             venue_report = venue_positions.get(instrument_id)
+
+            if venue_report is None and self._did_position_status_query_fail(
+                instrument_id,
+                failed_position_report_venues,
+            ):
+                self._log.warning(
+                    f"Skipping position reconciliation for {instrument_id}: "
+                    f"failed to query venue position status for {instrument_id.venue}",
+                    LogColor.YELLOW,
+                )
+                continue
 
             has_discrepancy = self._check_position_discrepancy(
                 cached_positions,
@@ -1060,6 +1079,19 @@ class LiveExecutionEngine(ExecutionEngine):
                     )
             else:
                 self._position_recon_retries.pop(instrument_id, None)
+
+    def _did_position_status_query_fail(
+        self,
+        instrument_id: InstrumentId,
+        failed_position_report_venues: set[Venue | None] | None,
+    ) -> bool:
+        if not failed_position_report_venues:
+            return False
+
+        return (
+            None in failed_position_report_venues
+            or instrument_id.venue in failed_position_report_venues
+        )
 
     def _create_flat_position_report(
         self,

@@ -3277,12 +3277,13 @@ async def test_query_position_status_reports_success(live_exec_engine, exec_clie
     exec_client.add_position_status_report(report)
 
     # Act
-    venue_positions = await live_exec_engine._query_position_status_reports()
+    venue_positions, failed_venues = await live_exec_engine._query_position_status_reports()
 
     # Assert
     assert len(venue_positions) == 1
     assert AUDUSD_SIM.id in venue_positions
     assert venue_positions[AUDUSD_SIM.id].quantity == Quantity.from_int(1000)
+    assert failed_venues == set()
 
 
 @pytest.mark.asyncio
@@ -3300,10 +3301,11 @@ async def test_query_position_status_reports_handles_exceptions(live_exec_engine
     exec_client.generate_position_status_reports = raise_error
 
     # Act
-    venue_positions = await live_exec_engine._query_position_status_reports()
+    venue_positions, failed_venues = await live_exec_engine._query_position_status_reports()
 
     # Assert
     assert len(venue_positions) == 0
+    assert failed_venues == {exec_client.venue}
 
 
 @pytest.mark.asyncio
@@ -3341,12 +3343,13 @@ async def test_query_position_status_reports_multiple_instruments(
     exec_client.add_position_status_report(report2)
 
     # Act
-    venue_positions = await live_exec_engine._query_position_status_reports()
+    venue_positions, failed_venues = await live_exec_engine._query_position_status_reports()
 
     # Assert
     assert len(venue_positions) == 2
     assert AUDUSD_SIM.id in venue_positions
     assert GBPUSD_SIM.id in venue_positions
+    assert failed_venues == set()
 
 
 # =============================================================================
@@ -3851,6 +3854,60 @@ async def test_process_cached_position_discrepancies_reconciles_missing_venue_po
     assert len(reconcile_calls) == 1
     assert reconcile_calls[0].instrument_id == AUDUSD_SIM.id
     assert reconcile_calls[0].position_side == PositionSide.FLAT
+
+
+@pytest.mark.asyncio
+async def test_process_cached_position_discrepancies_skips_flat_reconciliation_on_query_failure(
+    live_exec_engine,
+    exec_client,
+    cache,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    live_exec_engine.generate_missing_orders = True
+
+    if AUDUSD_SIM.id not in [i.id for i in cache.instruments()]:
+        cache.add_instrument(AUDUSD_SIM)
+
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM, order_side=OrderSide.BUY)
+    fill = TestEventStubs.order_filled(
+        order,
+        instrument=AUDUSD_SIM,
+        last_qty=Quantity.from_int(1000),
+        last_px=Price.from_str("1.00000"),
+        position_id=PositionId("P-FLAT-ERR-001"),
+    )
+    position = Position(instrument=AUDUSD_SIM, fill=fill)
+    cache.add_position(position, OmsType.NETTING)
+
+    query_called = False
+
+    async def capture_query(instrument_id, clients):
+        nonlocal query_called
+        query_called = True
+        return []
+
+    live_exec_engine._query_and_find_missing_fills = capture_query
+
+    reconcile_calls = []
+
+    def spy_reconcile(report):
+        reconcile_calls.append(report)
+        return True
+
+    live_exec_engine._reconcile_position_report = spy_reconcile
+
+    # Act
+    await live_exec_engine._process_cached_position_discrepancies(
+        {AUDUSD_SIM.id: [position]},
+        {},
+        {AUDUSD_SIM.id.venue},
+    )
+
+    # Assert
+    assert not query_called
+    assert reconcile_calls == []
+    assert AUDUSD_SIM.id not in live_exec_engine._position_recon_retries
 
 
 @pytest.mark.asyncio
