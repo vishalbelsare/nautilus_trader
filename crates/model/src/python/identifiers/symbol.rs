@@ -46,7 +46,8 @@ impl Symbol {
         let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
         let value = binding.cast::<PyString>()?.extract::<&str>()?;
-        self.set_inner(value);
+        let validated = Self::new_checked(value).map_err(to_pyvalue_err)?;
+        self.set_inner(validated.as_str());
         Ok(())
     }
 
@@ -60,7 +61,7 @@ impl Symbol {
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn __richcmp__(&self, other: Py<PyAny>, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         if let Ok(other) = other.extract::<Self>(py) {
             match op {

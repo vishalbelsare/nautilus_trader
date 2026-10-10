@@ -1,7 +1,7 @@
 # nautilus-infrastructure
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-infrastructure)](https://docs.rs/nautilus-infrastructure/latest/nautilus-infrastructure/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-infrastructure)](https://docs.rs/nautilus-infrastructure/latest/nautilus_infrastructure/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-infrastructure.svg)](https://crates.io/crates/nautilus-infrastructure)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -21,24 +21,22 @@ enterprise-grade data persistence and messaging capabilities:
 The crate supports multiple database backends through feature flags, allowing users to choose
 the appropriate infrastructure components for their specific deployment requirements and scale.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-- `redis`: Enables the Redis cache database and message bus backing implementations.
-- `postgres`: Enables the PostgreSQL SQLx models and cache database backend.
 - `extension-module`: Builds as a Python extension module.
+- `postgres`: Enables the PostgreSQL SQLx models and cache database backend.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `redis` (default): Enables the Redis cache database and message bus backing implementations.
 
 ## Documentation
 

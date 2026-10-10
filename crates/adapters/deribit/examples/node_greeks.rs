@@ -16,41 +16,51 @@
 //! Example demonstrating live option greeks subscription with the Deribit adapter.
 //!
 //! On start, this actor:
-//! 1. Queries the cache for all BTC option instruments
+//! 1. Queries the cache for all `UNDERLYING` option instruments
 //! 2. Finds the nearest expiry
 //! 3. Filters for CALL options at that expiry
 //! 4. Subscribes to OptionGreeks for each one
 //! 5. Logs received greeks in the `on_option_greeks` handler
 //!
-//! Run with: `cargo run --example deribit-greeks-tester --package nautilus-deribit`
+//! Edit the constants below to change the underlying and node name.
+//!
+//! Run with: `cargo run --example deribit-greeks-tester --package nautilus-deribit --features examples`
+//!
+//! Credentials are read from the environment when set:
+//! - `DERIBIT_API_KEY`
+//! - `DERIBIT_API_SECRET`
 
-use std::{
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::fmt::Debug;
 
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     enums::Environment,
+    nautilus_actor,
     timer::TimeEvent,
 };
 use nautilus_deribit::{
-    config::DeribitDataClientConfig, factories::DeribitDataClientFactory,
+    common::{
+        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
+        enums::DeribitEnvironment,
+    },
+    config::DeribitDataClientConfig,
+    factories::DeribitDataClientFactory,
     http::models::DeribitProductType,
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::OptionGreeks,
     enums::OptionKind,
-    identifiers::{ClientId, InstrumentId, TraderId, Venue},
+    identifiers::{ClientId, InstrumentId, TraderId},
     instruments::Instrument,
-    stubs::TestDefault,
 };
 use ustr::Ustr;
 
-// ---------------------------------------------------------------------------
-// GreeksTester actor
-// ---------------------------------------------------------------------------
+const DERIBIT_ENVIRONMENT: DeribitEnvironment = DeribitEnvironment::Mainnet;
+const TRADER_ID: &str = "TESTER-001";
+const NODE_NAME: &str = "DERIBIT-GREEKS-TESTER-001";
+const ACTOR_ID: &str = "GREEKS_TESTER-001";
+const UNDERLYING: &str = "BTC";
 
 #[derive(Debug)]
 struct GreeksTester {
@@ -59,24 +69,13 @@ struct GreeksTester {
     subscribed_instruments: Vec<InstrumentId>,
 }
 
-impl Deref for GreeksTester {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl DerefMut for GreeksTester {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
-    }
-}
+nautilus_actor!(GreeksTester);
 
 impl GreeksTester {
     fn new(client_id: ClientId) -> Self {
         Self {
             core: DataActorCore::new(DataActorConfig {
-                actor_id: Some("GREEKS_TESTER-001".into()),
+                actor_id: Some(ACTOR_ID.into()),
                 ..Default::default()
             }),
             client_id,
@@ -87,8 +86,8 @@ impl GreeksTester {
 
 impl DataActor for GreeksTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        let venue = Venue::new("DERIBIT");
-        let underlying_filter = Ustr::from("BTC");
+        let venue = *DERIBIT_VENUE;
+        let underlying_filter = Ustr::from(UNDERLYING);
 
         // Collect option instrument data from cache (owned copies to release borrow)
         // Each entry: (instrument_id, strike_f64, expiry_ns)
@@ -111,11 +110,11 @@ impl DataActor for GreeksTester {
         }; // cache borrow dropped here
 
         // Discard already-expired options
-        let now_ns = self.timestamp_ns().as_u64();
+        let now_ns = self.clock().timestamp_ns().as_u64();
         options.retain(|(_, _, exp)| *exp > now_ns);
 
         if options.is_empty() {
-            log::warn!("No BTC CALL options found in cache (all expired)");
+            log::warn!("No {UNDERLYING} CALL options found in cache (all expired)");
             return Ok(());
         }
 
@@ -127,7 +126,7 @@ impl DataActor for GreeksTester {
         options.sort_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap());
 
         log::info!(
-            "Found {} BTC CALL options at nearest expiry (ts={})",
+            "Found {} {UNDERLYING} CALL options at nearest expiry (ts={})",
             options.len(),
             nearest_expiry,
         );
@@ -178,7 +177,7 @@ impl DataActor for GreeksTester {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        let ids: Vec<InstrumentId> = self.subscribed_instruments.drain(..).collect();
+        let ids: Vec<InstrumentId> = std::mem::take(&mut self.subscribed_instruments);
         let client_id = self.client_id;
         for instrument_id in ids {
             self.unsubscribe_option_greeks(instrument_id, Some(client_id), None);
@@ -192,30 +191,26 @@ impl DataActor for GreeksTester {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::test_default();
-    let client_id = ClientId::new("DERIBIT");
+    let trader_id = TraderId::from(TRADER_ID);
+    let client_id = *DERIBIT_CLIENT_ID;
 
     let deribit_config = DeribitDataClientConfig {
         api_key: None,    // Will use 'DERIBIT_API_KEY' env var
         api_secret: None, // Will use 'DERIBIT_API_SECRET' env var
         product_types: vec![DeribitProductType::Option],
-        use_testnet: false,
+        environment: DERIBIT_ENVIRONMENT,
         ..Default::default()
     };
 
     let client_factory = DeribitDataClientFactory::new();
 
     let mut node = LiveNode::builder(trader_id, environment)?
-        .with_name("DERIBIT-GREEKS-TESTER-001".to_string())
+        .with_name(NODE_NAME.to_string())
         .add_data_client(None, Box::new(client_factory), Box::new(deribit_config))?
         .with_delay_post_stop_secs(5)
         .build()?;

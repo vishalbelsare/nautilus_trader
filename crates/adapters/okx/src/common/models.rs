@@ -15,13 +15,21 @@
 
 //! Data models representing OKX API payloads consumed by the adapter.
 
-use serde::{Deserialize, Serialize};
+use nautilus_core::serialization::{
+    deserialize_decimal_from_str, deserialize_optional_decimal_from_str, deserialize_string_to_u64,
+    serialize_decimal_as_str, serialize_optional_decimal_as_str,
+};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize, Serializer};
 use ustr::Ustr;
 
 use super::enums::{OKXOptionType, OKXTriggerType};
 use crate::common::{
-    enums::{OKXContractType, OKXInstrumentStatus, OKXInstrumentType},
-    parse::deserialize_optional_string_to_u64,
+    enums::{
+        OKXContractType, OKXInstrumentCategory, OKXInstrumentStatus, OKXInstrumentType,
+        OKXRpiPermission,
+    },
+    parse::{deserialize_empty_ustr_as_none, deserialize_optional_string_to_u64},
 };
 
 /// Attached TP/SL child order metadata returned by OKX on parent orders.
@@ -52,6 +60,51 @@ pub struct OKXAttachedAlgoOrd {
     /// Take-profit trigger price type.
     #[serde(default)]
     pub tp_trigger_px_type: Option<OKXTriggerType>,
+    /// Callback ratio for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_ratio: String,
+    /// Callback spread for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_spread: String,
+    /// Activation price for attached trailing stop orders.
+    #[serde(default)]
+    pub active_px: String,
+}
+
+/// Represents a Retail Price Improvement order book level.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OKXRpiBookLevel(
+    /// Price.
+    #[serde(
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub Decimal,
+    /// Total quantity, including RPI liquidity.
+    #[serde(
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub Decimal,
+    /// Quantity excluding RPI liquidity.
+    #[serde(
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub Decimal,
+    /// Number of orders at this price.
+    #[serde(
+        serialize_with = "serialize_u64_as_str",
+        deserialize_with = "deserialize_string_to_u64"
+    )]
+    pub u64,
+);
+
+fn serialize_u64_as_str<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
 }
 
 /// Represents an instrument on the OKX exchange.
@@ -63,13 +116,32 @@ pub struct OKXInstrument {
     /// Instrument ID, e.g. "BTC-USD-SWAP".
     pub inst_id: Ustr,
     /// Instrument ID code (numeric). Required for WebSocket order operations.
-    /// E.g., 10458 for BTC-USD-SWAP. May not be present for SPOT instruments.
+    /// E.g., 10458 for BTC-USD-SWAP.
     #[serde(default)]
     pub inst_id_code: Option<u64>,
     /// Underlying of the instrument, e.g. "BTC-USD". Only applicable to FUTURES/SWAP/OPTION.
     pub uly: Ustr,
     /// Instrument family, e.g. "BTC-USD". Only applicable to FUTURES/SWAP/OPTION.
     pub inst_family: Ustr,
+    /// Event contract series ID. Only applicable to EVENTS.
+    #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
+    pub series_id: Option<Ustr>,
+    /// Instrument category (the OKX `instCategory` field; the deprecated, distinct
+    /// `category` field is intentionally ignored).
+    #[serde(default)]
+    pub inst_category: Option<OKXInstrumentCategory>,
+    /// Fee group ID, interpreted together with `inst_type` for fee queries.
+    #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
+    pub group_id: Option<Ustr>,
+    /// Initial price-limit band for newly listed contracts.
+    #[serde(default)]
+    pub init_px_lmt_pct: String,
+    /// Floating price-limit band during normal trading.
+    #[serde(default)]
+    pub float_px_lmt_pct: String,
+    /// Maximum price-limit cap.
+    #[serde(default)]
+    pub max_px_lmt_pct: String,
     /// Base currency, e.g. "BTC" in BTC-USDT. Applicable to SPOT/MARGIN.
     pub base_ccy: Ustr,
     /// Quote currency, e.g. "USDT" in BTC-USDT.
@@ -104,7 +176,7 @@ pub struct OKXInstrument {
     pub ct_type: OKXContractType,
     /// Instrument status.
     pub state: OKXInstrumentStatus,
-    /// Rule type, e.g. "DynamicPL", "CT", etc.
+    /// Rule type, e.g. "`DynamicPL`", "CT", etc.
     pub rule_type: String,
     /// Maximum limit order size.
     #[serde(default)]
@@ -130,4 +202,20 @@ pub struct OKXInstrument {
     /// Maximum stop order size.
     #[serde(default)]
     pub max_stop_sz: String,
+    /// RPI maker permission: 0 disabled, 1 enabled without permission, 2 permitted.
+    #[serde(default, alias = "elp")]
+    pub rpi: Option<OKXRpiPermission>,
+    /// Minimum number of price levels between RPI buy and sell orders.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub rpi_min_level: Option<u64>,
+    /// Minimum distance from the opposite organic best price, in basis points.
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_decimal_as_str",
+        deserialize_with = "deserialize_optional_decimal_from_str"
+    )]
+    pub rpi_min_px_band: Option<Decimal>,
+    /// Quote currencies available for trading, e.g. `["USD", "USDC"]`.
+    #[serde(default)]
+    pub trade_quote_ccy_list: Vec<Ustr>,
 }

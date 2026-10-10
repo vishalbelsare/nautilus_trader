@@ -20,19 +20,33 @@
 //! 2. Compare TopicRouter<T> vs Any-based routing
 //! 3. Test with realistic topic patterns (exact + wildcards)
 //! 4. Large message counts for stable timings
+//! 5. External egress serialization and typed ingress processing
 
 use std::{
     any::Any,
     hint::black_box,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
+use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nautilus_common::msgbus::{
-    Handler, MStr, Pattern, Topic, TypedHandler, typed_handler::shareable_handler,
-    typed_router::TopicRouter,
+use nautilus_common::{
+    enums::SerializationEncoding,
+    messages::execution::{QueryAccount, TradingCommand},
+    msgbus::{
+        BusMessage, BusPayloadType, Endpoint, Handler, MStr, MessageBus, MessageBusConfig,
+        MessageBusExternalEgress, Pattern, Topic, TypedHandler, get_message_bus,
+        process_external_typed_message, publish_any, publish_quote, register_any, send_any,
+        send_any_value, set_message_bus, subscribe_quotes, typed_handler::shareable_handler,
+        typed_router::TopicRouter,
+    },
 };
-use nautilus_model::data::QuoteTick;
+use nautilus_core::{UUID4, UnixNanos};
+use nautilus_model::{
+    data::QuoteTick,
+    identifiers::{AccountId, ClientId, TraderId},
+};
 use ustr::Ustr;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -82,7 +96,7 @@ impl Handler<dyn Any> for CountingAnyHandler {
 
     fn handle(&self, message: &dyn Any) {
         let quote = message.downcast_ref::<QuoteTick>().unwrap();
-        COUNTER.fetch_add(quote.bid_price.raw as u64, Ordering::Relaxed);
+        COUNTER.fetch_add(quote.bid_price.raw() as u64, Ordering::Relaxed);
     }
 }
 
@@ -97,7 +111,7 @@ impl Handler<QuoteTick> for CountingTypedHandler {
     }
 
     fn handle(&self, quote: &QuoteTick) {
-        COUNTER.fetch_add(quote.bid_price.raw as u64, Ordering::Relaxed);
+        COUNTER.fetch_add(quote.bid_price.raw() as u64, Ordering::Relaxed);
     }
 }
 
@@ -180,6 +194,165 @@ fn bench_noop_dispatch(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+fn bench_message_bus_dispatch(c: &mut Criterion) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+
+    let endpoint: MStr<Endpoint> = "bench.endpoint".into();
+    register_any(
+        endpoint,
+        shareable_handler(Rc::new(NoopAnyHandler {
+            id: Ustr::from("endpoint-handler"),
+        })),
+    );
+
+    let topic: MStr<Topic> = "data.quotes.BINANCE.BTCUSDT".into();
+    subscribe_quotes(
+        "data.quotes.BINANCE.BTCUSDT".into(),
+        TypedHandler::new(NoopTypedHandler {
+            id: Ustr::from("quote-handler"),
+        }),
+        None,
+    );
+
+    let quote = QuoteTick::default();
+    publish_quote(topic, &quote);
+
+    let mut group = c.benchmark_group("Message bus dispatch");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("send_any", |b| {
+        b.iter(|| send_any(black_box(endpoint), black_box(&quote as &dyn Any)));
+    });
+
+    group.bench_function("send_any_value", |b| {
+        b.iter(|| send_any_value(black_box(endpoint), black_box(&quote)));
+    });
+
+    group.bench_function("publish_quote", |b| {
+        b.iter(|| publish_quote(black_box(topic), black_box(&quote)));
+    });
+
+    group.finish();
+}
+
+fn bench_external_egress(c: &mut Criterion) {
+    let quote = QuoteTick::default();
+    let command = trading_command();
+    let quote_topic: MStr<Topic> = "data.quotes.SIM.AUDUSD".into();
+    let command_topic: MStr<Topic> = "commands.execution.EXTERNAL".into();
+    let mut group = c.benchmark_group("Message bus external egress");
+    group.throughput(Throughput::Elements(1));
+
+    for (name, encoding) in [
+        ("json", SerializationEncoding::Json),
+        ("msgpack", SerializationEncoding::MsgPack),
+    ] {
+        install_external_egress(encoding);
+        group.bench_function(BenchmarkId::new("quote", name), |b| {
+            b.iter(|| publish_quote(black_box(quote_topic), black_box(&quote)));
+        });
+        group.bench_function(BenchmarkId::new("trading_command", name), |b| {
+            b.iter(|| publish_any(black_box(command_topic), black_box(&command)));
+        });
+    }
+
+    group.finish();
+    reset_message_bus();
+}
+
+fn bench_typed_ingress(c: &mut Criterion) {
+    reset_message_bus();
+    let command = trading_command();
+    let messages = [
+        (
+            "json",
+            BusMessage::with_str_topic(
+                "commands.execution.EXTERNAL",
+                BusPayloadType::TradingCommand,
+                Bytes::from(serde_json::to_vec(&command).expect("command must serialize as JSON")),
+                SerializationEncoding::Json,
+            ),
+        ),
+        (
+            "msgpack",
+            BusMessage::with_str_topic(
+                "commands.execution.EXTERNAL",
+                BusPayloadType::TradingCommand,
+                Bytes::from(
+                    rmp_serde::to_vec_named(&command)
+                        .expect("command must serialize as MessagePack"),
+                ),
+                SerializationEncoding::MsgPack,
+            ),
+        ),
+    ];
+    let mut group = c.benchmark_group("Message bus typed ingress");
+    group.throughput(Throughput::Elements(1));
+
+    for (name, message) in &messages {
+        group.bench_function(BenchmarkId::new("trading_command", name), |b| {
+            let mut processor = |value: &dyn Any, mapping: &serde_json::Value| {
+                black_box(value);
+                black_box(mapping);
+                Ok(())
+            };
+            b.iter(|| {
+                process_external_typed_message(black_box(message), &mut processor)
+                    .expect("external command must process");
+            });
+        });
+    }
+
+    group.finish();
+    reset_message_bus();
+}
+
+fn trading_command() -> TradingCommand {
+    TradingCommand::QueryAccount(QueryAccount::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("EXTERNAL")),
+        AccountId::from("SIM-001"),
+        UUID4::from("00000000-0000-4000-8000-000000000001"),
+        UnixNanos::from(1_000_000_000),
+        None,
+        None,
+    ))
+}
+
+fn install_external_egress(encoding: SerializationEncoding) {
+    let mut message_bus = MessageBus::default();
+    message_bus
+        .set_external_egress_config(
+            Box::new(DiscardingExternalEgress),
+            &MessageBusConfig {
+                encoding,
+                external_streams: Some(vec!["external.test".to_string()]),
+                ..Default::default()
+            },
+        )
+        .expect("external message bus config must be valid");
+    set_message_bus(Rc::new(RefCell::new(message_bus)));
+}
+
+fn reset_message_bus() {
+    get_message_bus().borrow_mut().dispose();
+    set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+}
+
+struct DiscardingExternalEgress;
+
+impl MessageBusExternalEgress for DiscardingExternalEgress {
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn publish(&self, message: BusMessage) {
+        black_box(message);
+    }
+
+    fn close(&mut self) {}
 }
 
 // --
@@ -400,6 +573,7 @@ fn bench_high_volume(c: &mut Criterion) {
     let quote = QuoteTick::default();
 
     let mut group = c.benchmark_group("High volume throughput");
+    group.measurement_time(Duration::from_secs(10));
 
     for msg_count in [100_000u64, 1_000_000] {
         group.throughput(Throughput::Elements(msg_count));
@@ -591,9 +765,56 @@ fn bench_refcell_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+// Subscribe-time backfill: cost of adding a wildcard subscription when
+// N concrete topics are already cached. Each cached topic requires one
+// pattern-vs-wildcard match.
+fn bench_subscribe_with_cached_topics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Subscribe with cached topics");
+
+    for cached_count in [0u64, 16, 64, 256] {
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new("Any-based", cached_count),
+            &cached_count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let mut router = AnyTopicRouter::new();
+                        let seed_handler = shareable_handler(Rc::new(CountingAnyHandler {
+                            id: Ustr::from("seed"),
+                        }));
+                        let seed_pattern: MStr<Pattern> = "data.quotes.BINANCE.*".into();
+                        router.subscribe(seed_pattern, seed_handler);
+                        let quote = QuoteTick::default();
+
+                        for i in 0..count {
+                            let topic: MStr<Topic> =
+                                MStr::from(&format!("data.quotes.BINANCE.SYM{i:04}"));
+                            router.publish(topic, &quote as &dyn Any);
+                        }
+                        router
+                    },
+                    |mut router| {
+                        let handler = shareable_handler(Rc::new(CountingAnyHandler {
+                            id: Ustr::from("late"),
+                        }));
+                        let pattern: MStr<Pattern> = "data.*.BINANCE.*".into();
+                        router.subscribe(black_box(pattern), black_box(handler));
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_noop_dispatch,
+    bench_message_bus_dispatch,
+    bench_external_egress,
+    bench_typed_ingress,
     bench_router_publish,
     bench_cold_path_publish,
     bench_router_multiple_subscribers,
@@ -601,5 +822,6 @@ criterion_group!(
     bench_high_volume,
     bench_mixed_topics,
     bench_refcell_overhead,
+    bench_subscribe_with_cached_topics,
 );
 criterion_main!(benches);

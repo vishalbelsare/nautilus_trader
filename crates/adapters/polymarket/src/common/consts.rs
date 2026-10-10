@@ -17,28 +17,71 @@
 
 use std::sync::LazyLock;
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use ustr::Ustr;
 
+/// Venue identifier string.
 pub const POLYMARKET: &str = "POLYMARKET";
 
+/// Static venue instance.
 pub static POLYMARKET_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(POLYMARKET)));
 
-pub const USDC: &str = "USDC";
+/// Static client ID instance.
+pub static POLYMARKET_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(POLYMARKET)));
+
+/// Polymarket builder code for order attribution.
+pub const POLYMARKET_NAUTILUS_BUILDER_CODE: &str =
+    "0x4f2c0bba608033563f74b82300e2ed59f54f8d0de08281031f03fb2c62819e63";
+
+pub const PUSD: &str = "pUSD";
+
+/// Canonical decimal precision for Polymarket prices.
+pub const POLYMARKET_PRICE_PRECISION: u8 = 4;
 
 pub const MAX_PRICE: &str = "0.999";
 pub const MIN_PRICE: &str = "0.001";
-pub const MAX_PRECISION_MAKER: u8 = 5;
-pub const MAX_PRECISION_TAKER: u8 = 2;
+pub const USDC_DECIMALS: u32 = 6;
+pub const LOT_SIZE_SCALE: u32 = 2;
 
-pub const WS_MAX_SUBSCRIPTIONS: usize = 200;
+/// Minimum position size (in shares) reported in position status reports.
+/// Smaller positions are filtered as dust during reconciliation.
+pub const DUST_POSITION_THRESHOLD: Decimal = dec!(0.01);
+
+/// Maximum six-decimal position difference below [`DUST_POSITION_THRESHOLD`].
+pub const POSITION_RECONCILIATION_TOLERANCE: Decimal = dec!(0.009999);
+
+/// Dust band (in shares) for underfill normalization. Set to one cent-share,
+/// matching Polymarket's CLOB tick quantization.
+///
+/// Fills keep the venue quantity. CLOB cent-tick truncation can leave a
+/// terminal order up to `0.01` shares short of its quantity; after terminal
+/// trade confirmation the order quantity is lowered to its venue-filled
+/// quantity, and `OrderStatusReport.filled_qty` at terminal `Filled` status
+/// snaps up to the quantity. A BUY overfill raises the order quantity instead.
+///
+/// A shortfall at or above this threshold is a real remainder and surfaces to
+/// the engine. See `docs/integrations/polymarket.md` (Fill quantity normalization).
+pub const DUST_SNAP_THRESHOLD_DEC: Decimal = dec!(0.01);
+
+/// Default per-connection market subscription cap.
+///
+/// A conservative, self-chosen reliability bound, not a venue limit: Polymarket
+/// documents no per-connection cap, and high per-connection counts have been
+/// observed to silently stall a connection. The market pool shards across
+/// connections at this bound.
 pub const WS_DEFAULT_SUBSCRIPTIONS: usize = 200;
+
+/// Maximum orders per `POST /orders` batch request; Polymarket caps batch submits at 15.
+pub const BATCH_ORDER_LIMIT: usize = 15;
 
 /// Requests per minute.
 pub const HTTP_RATE_LIMIT: u32 = 100;
 
+/// Maximum number of `condition_ids` accepted in a single Gamma `/markets` query.
+pub const GAMMA_CONDITION_IDS_BATCH_SIZE: usize = 100;
+
 pub const INVALID_API_KEY: &str = "Unauthorized/Invalid api key";
 pub const CANCEL_ALREADY_DONE: &str = "already canceled or matched";
-
-/// Polygon chain ID.
-pub const CHAIN_ID: u64 = 137;

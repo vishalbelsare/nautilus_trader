@@ -18,20 +18,20 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
+    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::ClientId,
+    identifiers::{ClientId, TraderId},
 };
-use nautilus_system::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 
 use crate::{
-    common::consts::DERIBIT_VENUE,
-    config::{DeribitDataClientConfig, DeribitExecClientConfig},
+    common::consts::{DERIBIT, DERIBIT_VENUE},
+    config::{DeribitDataClientConfig, DeribitExecutionClientConfig},
     data::DeribitDataClient,
     execution::DeribitExecutionClient,
 };
@@ -46,7 +46,11 @@ impl ClientConfig for DeribitDataClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
 )]
 pub struct DeribitDataClientFactory;
 
@@ -69,7 +73,7 @@ impl DataClientFactory for DeribitDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let deribit_config = config
@@ -88,7 +92,7 @@ impl DataClientFactory for DeribitDataClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "DERIBIT"
+        DERIBIT
     }
 
     fn config_type(&self) -> &'static str {
@@ -96,7 +100,7 @@ impl DataClientFactory for DeribitDataClientFactory {
     }
 }
 
-impl ClientConfig for DeribitExecClientConfig {
+impl ClientConfig for DeribitExecutionClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -106,7 +110,11 @@ impl ClientConfig for DeribitExecClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
 )]
 pub struct DeribitExecutionClientFactory;
 
@@ -127,16 +135,18 @@ impl Default for DeribitExecutionClientFactory {
 impl ExecutionClientFactory for DeribitExecutionClientFactory {
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let deribit_config = config
             .as_any()
-            .downcast_ref::<DeribitExecClientConfig>()
+            .downcast_ref::<DeribitExecutionClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for DeribitExecutionClientFactory. Expected DeribitExecClientConfig, was {config:?}",
+                    "Invalid config type for DeribitExecutionClientFactory. Expected DeribitExecutionClientConfig, was {config:?}",
                 )
             })?
             .clone();
@@ -147,7 +157,7 @@ impl ExecutionClientFactory for DeribitExecutionClientFactory {
 
         let client_id = ClientId::from(name);
         let core = ExecutionClientCore::new(
-            deribit_config.trader_id,
+            trader_id,
             client_id,
             *DERIBIT_VENUE,
             oms_type,
@@ -162,11 +172,11 @@ impl ExecutionClientFactory for DeribitExecutionClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "DERIBIT"
+        DERIBIT
     }
 
     fn config_type(&self) -> &'static str {
-        "DeribitExecClientConfig"
+        "DeribitExecutionClientConfig"
     }
 }
 
@@ -175,9 +185,12 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use nautilus_common::{
-        cache::Cache, clock::TestClock, live::runner::set_data_event_sender, messages::DataEvent,
+        cache::Cache,
+        clock::VirtualClock,
+        factories::{ClientConfig, DataClientFactory},
+        live::runner::set_data_event_sender,
+        messages::DataEvent,
     };
-    use nautilus_system::factories::{ClientConfig, DataClientFactory};
     use rstest::rstest;
 
     use super::*;
@@ -192,14 +205,14 @@ mod tests {
     #[rstest]
     fn test_deribit_data_client_factory_creation() {
         let factory = DeribitDataClientFactory::new();
-        assert_eq!(factory.name(), "DERIBIT");
+        assert_eq!(factory.name(), DERIBIT);
         assert_eq!(factory.config_type(), "DeribitDataClientConfig");
     }
 
     #[rstest]
     fn test_deribit_data_client_factory_default() {
         let factory = DeribitDataClientFactory::new();
-        assert_eq!(factory.name(), "DERIBIT");
+        assert_eq!(factory.name(), DERIBIT);
     }
 
     #[rstest]
@@ -224,14 +237,14 @@ mod tests {
         let factory = DeribitDataClientFactory::new();
         let config = DeribitDataClientConfig {
             product_types: vec![DeribitProductType::Future],
-            use_testnet: true,
+            environment: crate::common::enums::DeribitEnvironment::Testnet,
             ..Default::default()
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
-        let result = factory.create("DERIBIT-TEST", &config, cache, clock);
+        let result = factory.create("DERIBIT-TEST", &config, cache.into(), clock);
         assert!(result.is_ok());
 
         let client = result.unwrap();

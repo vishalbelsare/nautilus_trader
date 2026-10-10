@@ -20,7 +20,7 @@ use std::{
 
 use nautilus_core::{
     from_pydict,
-    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 
@@ -36,9 +36,9 @@ impl IndexInstrument {
     /// Represents a generic index instrument.
     ///
     /// An index is typically not directly tradable.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, currency, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, info=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, currency, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, tick_scheme=None, info=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -49,27 +49,29 @@ impl IndexInstrument {
         size_increment: Quantity,
         ts_event: u64,
         ts_init: u64,
+        tick_scheme: Option<String>,
         info: Option<Py<PyDict>>,
     ) -> PyResult<Self> {
         let info_map = if let Some(info_dict) = info {
-            Python::attach(|py| from_pydict(py, info_dict))?
+            Python::attach(|py| from_pydict(py, &info_dict))?
         } else {
             None
         };
 
-        Self::new_checked(
-            instrument_id,
-            raw_symbol,
-            currency,
-            price_precision,
-            size_precision,
-            price_increment,
-            size_increment,
-            info_map,
-            ts_event.into(),
-            ts_init.into(),
-        )
-        .map_err(to_pyvalue_err)
+        Self::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .currency(currency)
+            .price_precision(price_precision)
+            .size_precision(size_precision)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_tick_scheme(tick_scheme.map(|name| ustr::Ustr::from(name.as_str())))
+            .maybe_info(info_map)
+            .ts_event(ts_event.into())
+            .ts_init(ts_init.into())
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -150,6 +152,7 @@ impl IndexInstrument {
     fn py_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         if let Some(ref info_map) = self.info {
             let py_dict = PyDict::new(py);
+
             for (key, value) in info_map {
                 let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
                 let py_value =
@@ -165,7 +168,7 @@ impl IndexInstrument {
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
-        from_dict_pyo3(py, values)
+        crate::python::instruments::from_dict_instrument_pyo3(py, values)
     }
 
     #[pyo3(name = "to_dict")]
@@ -184,6 +187,7 @@ impl IndexInstrument {
 
         if let Some(ref info_map) = self.info {
             let info_dict = PyDict::new(py);
+
             for (key, value) in info_map {
                 let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
                 let py_value =
@@ -194,6 +198,10 @@ impl IndexInstrument {
         } else {
             dict.set_item("info", PyDict::new(py))?;
         }
+        dict.set_item(
+            "tick_scheme",
+            crate::python::instruments::tick_scheme_to_py(self),
+        )?;
         Ok(dict.into())
     }
 }

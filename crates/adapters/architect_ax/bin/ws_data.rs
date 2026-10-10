@@ -34,11 +34,11 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use nautilus_architect_ax::{
     common::{credential::Credential, enums::AxEnvironment},
-    http::{client::AxRawHttpClient, parse::parse_perp_instrument},
+    http::{client::AxRawHttpClient, parse::parse_instrument},
     websocket::{AxDataWsMessage, data::AxMdWebSocketClient},
 };
 use nautilus_core::time::get_atomic_clock_realtime;
-use rust_decimal::Decimal;
+use nautilus_network::websocket::TransportBackend;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,10 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = AxRawHttpClient::new(
         Some(environment.http_url().to_string()),
         Some(environment.orders_url().to_string()),
-        Some(30),
-        None,
-        None,
-        None,
+        30,
+        3,
+        1000,
+        10_000,
         None,
     )?;
 
@@ -109,8 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut client = AxMdWebSocketClient::new(
         environment.ws_md_url().to_string(),
-        auth_response.token,
-        Some(30),
+        auth_response.into_token(),
+        30,
+        TransportBackend::default(),
+        None,
     );
 
     let test_symbol = "EURUSD-PERP";
@@ -121,14 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|inst| inst.symbol.as_str() == test_symbol)
         .ok_or_else(|| format!("Instrument {test_symbol} not found in /instruments response"))?;
 
-    let _instrument = parse_perp_instrument(
-        maybe_instrument,
-        Decimal::ZERO,
-        Decimal::ZERO,
-        ts_init,
-        ts_init,
-    )
-    .map_err(|e| format!("Failed to parse instrument {test_symbol}: {e}"))?;
+    let _instrument = parse_instrument(maybe_instrument, ts_init, ts_init)
+        .map_err(|e| format!("Failed to parse instrument {test_symbol}: {e}"))?;
     log::info!("Parsed instrument {test_symbol}");
 
     log::info!("Establishing WebSocket connection...");

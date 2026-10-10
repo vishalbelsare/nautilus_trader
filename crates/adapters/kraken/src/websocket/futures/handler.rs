@@ -23,6 +23,7 @@ use std::{
     },
 };
 
+use nautilus_core::string::secret::SecretString;
 use nautilus_network::{
     RECONNECTED,
     websocket::{SubscriptionState, WebSocketClient},
@@ -38,22 +39,16 @@ use super::messages::{
     KrakenFuturesOpenOrdersDelta, KrakenFuturesTickerData, KrakenFuturesTradeData,
     KrakenFuturesWsMessage, classify_futures_message,
 };
+use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
 pub enum FuturesHandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
-    Subscribe {
-        payload: String,
-    },
-    Unsubscribe {
-        payload: String,
-    },
-    RequestChallenge {
-        payload: String,
-        response_tx: tokio::sync::oneshot::Sender<String>,
-    },
+    Subscribe { payload: SecretString },
+    Unsubscribe { payload: SecretString },
+    RequestChallenge { payload: SecretString },
 }
 
 /// WebSocket message handler for Kraken Futures.
@@ -64,7 +59,6 @@ pub struct FuturesFeedHandler {
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     subscriptions: SubscriptionState,
     pending_messages: VecDeque<KrakenFuturesWsMessage>,
-    pending_challenge_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 impl FuturesFeedHandler {
@@ -82,7 +76,6 @@ impl FuturesFeedHandler {
             raw_rx,
             subscriptions,
             pending_messages: VecDeque::new(),
-            pending_challenge_tx: None,
         }
     }
 
@@ -120,18 +113,16 @@ impl FuturesFeedHandler {
                         FuturesHandlerCommand::Subscribe { payload }
                         | FuturesHandlerCommand::Unsubscribe { payload } => {
                             if let Some(ref client) = self.inner
-                                && let Err(e) = client.send_text(payload, None).await
+                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
                             {
                                 log::error!("Failed to send text: {e}");
                             }
                         }
-                        FuturesHandlerCommand::RequestChallenge { payload, response_tx } => {
-                            log::debug!("Requesting challenge for authentication");
-                            self.pending_challenge_tx = Some(response_tx);
+                        FuturesHandlerCommand::RequestChallenge { payload } => {
                             if let Some(ref client) = self.inner
-                                && let Err(e) = client.send_text(payload, None).await
+                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), None).await
                             {
-                                log::error!("Failed to send challenge request: {e}");
+                                log::error!("Failed to send text: {e}");
                             }
                         }
                     }
@@ -168,7 +159,7 @@ impl FuturesFeedHandler {
                             continue;
                         }
                         Message::Close(_) => {
-                            log::info!("WebSocket connection closed");
+                            log::debug!("WebSocket connection closed");
                             return None;
                         }
                         Message::Frame(_) => {
@@ -188,7 +179,7 @@ impl FuturesFeedHandler {
                     };
 
                     if text == RECONNECTED {
-                        log::info!("Received WebSocket reconnected signal");
+                        log::debug!("Received WebSocket reconnected signal");
                         return Some(KrakenFuturesWsMessage::Reconnected);
                     }
 
@@ -218,31 +209,31 @@ impl FuturesFeedHandler {
                 );
             }
             KrakenFuturesMessageType::OpenOrdersCancel => {
-                self.handle_open_orders_cancel_value(value);
+                self.handle_open_orders_cancel_text(text);
             }
             KrakenFuturesMessageType::OpenOrdersDelta => {
-                self.handle_open_orders_delta_value(value);
+                self.handle_open_orders_delta_text(text);
             }
             KrakenFuturesMessageType::FillsSnapshot => {
                 log::debug!("Skipping fills_snapshot (REST reconciliation handles initial state)");
             }
             KrakenFuturesMessageType::FillsDelta => {
-                self.handle_fills_delta_value(value);
+                self.handle_fills_delta_text(text);
             }
             KrakenFuturesMessageType::Ticker => {
-                self.handle_ticker_message_value(value);
+                self.handle_ticker_message_text(text);
             }
             KrakenFuturesMessageType::TradeSnapshot => {
                 log::debug!("Skipping trade_snapshot (only streaming live trades)");
             }
             KrakenFuturesMessageType::Trade => {
-                self.handle_trade_message_value(value);
+                self.handle_trade_message_text(text);
             }
             KrakenFuturesMessageType::BookSnapshot => {
-                self.handle_book_snapshot_value(value);
+                self.handle_book_snapshot_text(text);
             }
             KrakenFuturesMessageType::BookDelta => {
-                self.handle_book_delta_value(value);
+                self.handle_book_delta_text(text);
             }
             KrakenFuturesMessageType::Info => {
                 log::debug!("Received info message: {text}");
@@ -257,7 +248,7 @@ impl FuturesFeedHandler {
                 log::debug!("Unsubscription confirmed: {text}");
             }
             KrakenFuturesMessageType::Challenge => {
-                self.handle_challenge_response_value(value);
+                self.handle_challenge_response_text(text);
             }
             KrakenFuturesMessageType::Heartbeat => {
                 log::trace!("Heartbeat received");
@@ -267,7 +258,7 @@ impl FuturesFeedHandler {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error");
-                log::error!("Kraken Futures WebSocket error: {message}");
+                log::warn!("Kraken Futures WebSocket error: {message}");
             }
             KrakenFuturesMessageType::Alert => {
                 let message = value
@@ -282,24 +273,19 @@ impl FuturesFeedHandler {
         }
     }
 
-    fn handle_challenge_response_value(&mut self, value: Value) {
+    fn handle_challenge_response_text(&mut self, text: &str) {
         #[derive(Deserialize)]
         struct ChallengeResponse {
             message: String,
         }
 
-        match serde_json::from_value::<ChallengeResponse>(value) {
+        match serde_json::from_str::<ChallengeResponse>(text) {
             Ok(response) => {
                 let len = response.message.len();
                 log::debug!("Challenge received, length: {len}");
 
-                if let Some(tx) = self.pending_challenge_tx.take() {
-                    if tx.send(response.message).is_err() {
-                        log::warn!("Failed to send challenge response - receiver dropped");
-                    }
-                } else {
-                    log::warn!("Received challenge but no pending request");
-                }
+                self.pending_messages
+                    .push_back(KrakenFuturesWsMessage::Challenge(response.message));
             }
             Err(e) => {
                 log::error!("Failed to parse challenge response: {e}");
@@ -307,8 +293,8 @@ impl FuturesFeedHandler {
         }
     }
 
-    fn handle_ticker_message_value(&mut self, value: Value) {
-        let ticker = match serde_json::from_value::<KrakenFuturesTickerData>(value) {
+    fn handle_ticker_message_text(&mut self, text: &str) {
+        let ticker = match serde_json::from_str::<KrakenFuturesTickerData>(text) {
             Ok(t) => t,
             Err(e) => {
                 log::debug!("Failed to parse ticker: {e}");
@@ -320,8 +306,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::Ticker(ticker));
     }
 
-    fn handle_trade_message_value(&mut self, value: Value) {
-        let trade = match serde_json::from_value::<KrakenFuturesTradeData>(value) {
+    fn handle_trade_message_text(&mut self, text: &str) {
+        let trade = match serde_json::from_str::<KrakenFuturesTradeData>(text) {
             Ok(t) => t,
             Err(e) => {
                 log::warn!("Failed to parse trade: {e}");
@@ -341,8 +327,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::Trade(trade));
     }
 
-    fn handle_book_snapshot_value(&mut self, value: Value) {
-        let snapshot = match serde_json::from_value::<KrakenFuturesBookSnapshot>(value) {
+    fn handle_book_snapshot_text(&mut self, text: &str) {
+        let snapshot = match serde_json::from_str::<KrakenFuturesBookSnapshot>(text) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("Failed to parse book snapshot: {e}");
@@ -365,8 +351,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::BookSnapshot(snapshot));
     }
 
-    fn handle_book_delta_value(&mut self, value: Value) {
-        let delta = match serde_json::from_value::<KrakenFuturesBookDelta>(value) {
+    fn handle_book_delta_text(&mut self, text: &str) {
+        let delta = match serde_json::from_str::<KrakenFuturesBookDelta>(text) {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("Failed to parse book delta: {e}");
@@ -389,8 +375,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::BookDelta(delta));
     }
 
-    fn handle_open_orders_delta_value(&mut self, value: Value) {
-        let delta = match serde_json::from_value::<KrakenFuturesOpenOrdersDelta>(value) {
+    fn handle_open_orders_delta_text(&mut self, text: &str) {
+        let delta = match serde_json::from_str::<KrakenFuturesOpenOrdersDelta>(text) {
             Ok(d) => d,
             Err(e) => {
                 log::error!("Failed to parse open_orders delta: {e}");
@@ -409,8 +395,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::OpenOrdersDelta(delta));
     }
 
-    fn handle_open_orders_cancel_value(&mut self, value: Value) {
-        let cancel = match serde_json::from_value::<KrakenFuturesOpenOrdersCancel>(value) {
+    fn handle_open_orders_cancel_text(&mut self, text: &str) {
+        let cancel = match serde_json::from_str::<KrakenFuturesOpenOrdersCancel>(text) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Failed to parse open_orders cancel: {e}");
@@ -429,8 +415,8 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::OpenOrdersCancel(cancel));
     }
 
-    fn handle_fills_delta_value(&mut self, value: Value) {
-        let delta = match serde_json::from_value::<KrakenFuturesFillsDelta>(value) {
+    fn handle_fills_delta_text(&mut self, text: &str) {
+        let delta = match serde_json::from_str::<KrakenFuturesFillsDelta>(text) {
             Ok(d) => d,
             Err(e) => {
                 log::error!("Failed to parse fills delta: {e}");
@@ -447,7 +433,9 @@ impl FuturesFeedHandler {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::string::secret::REDACTED;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -458,6 +446,18 @@ mod tests {
         let subscriptions = SubscriptionState::new(':');
 
         FuturesFeedHandler::new(signal, cmd_rx, raw_rx, subscriptions)
+    }
+
+    #[rstest]
+    fn test_command_debug_redacts_payload() {
+        let command = FuturesHandlerCommand::RequestChallenge {
+            payload: SecretString::from("private-challenge-payload"),
+        };
+
+        assert_eq!(
+            format!("{command:?}"),
+            format!("RequestChallenge {{ payload: {REDACTED} }}")
+        );
     }
 
     #[rstest]
@@ -473,8 +473,8 @@ mod tests {
             panic!("Expected Ticker message, was {msg:?}");
         };
         assert_eq!(ticker.product_id, Ustr::from("PI_XBTUSD"));
-        assert_eq!(ticker.bid, Some(21978.5));
-        assert_eq!(ticker.ask, Some(21987.0));
+        assert_eq!(ticker.bid, Some(dec!(21978.5)));
+        assert_eq!(ticker.ask, Some(dec!(21987)));
     }
 
     #[rstest]
@@ -493,8 +493,8 @@ mod tests {
             panic!("Expected Trade message, was {msg:?}");
         };
         assert_eq!(trade.product_id, Ustr::from("PI_XBTUSD"));
-        assert_eq!(trade.price, 34969.5);
-        assert_eq!(trade.qty, 15000.0);
+        assert_eq!(trade.price, dec!(34969.5));
+        assert_eq!(trade.qty, dec!(15000));
     }
 
     #[rstest]
@@ -559,7 +559,24 @@ mod tests {
             panic!("Expected BookDelta message, was {msg:?}");
         };
         assert_eq!(delta.product_id, Ustr::from("PI_XBTUSD"));
-        assert_eq!(delta.price, 34981.0);
+        assert_eq!(delta.price, dec!(34981));
+    }
+
+    #[rstest]
+    fn test_parse_book_delta_preserves_decimal_precision() {
+        let mut handler = create_test_handler();
+        handler.subscriptions.mark_subscribe("book:PI_XBTUSD");
+        handler.subscriptions.confirm_subscribe("book:PI_XBTUSD");
+        let json = include_str!("../../../test_data/ws_futures_book_precision.json");
+
+        handler.parse_message(json);
+
+        let message = handler.pending_messages.pop_front().unwrap();
+        let KrakenFuturesWsMessage::BookDelta(delta) = message else {
+            panic!("Expected BookDelta message, was {message:?}");
+        };
+        assert_eq!(delta.price, dec!(123456789.123456789));
+        assert_eq!(delta.qty, dec!(0.1234567890123456789012345678));
     }
 
     #[rstest]
@@ -624,6 +641,21 @@ mod tests {
             fills.fills[0].fill_id,
             "6a22a3fb-e18e-4e76-b841-8689735c9158"
         );
+    }
+
+    #[rstest]
+    fn test_parse_challenge_emits_challenge_message() {
+        let mut handler = create_test_handler();
+        let json = r#"{"event":"challenge","message":"server-challenge-abc"}"#;
+
+        handler.parse_message(json);
+
+        assert_eq!(handler.pending_messages.len(), 1);
+        let msg = handler.pending_messages.pop_front().unwrap();
+        let KrakenFuturesWsMessage::Challenge(challenge) = msg else {
+            panic!("Expected Challenge message, was {msg:?}");
+        };
+        assert_eq!(challenge, "server-challenge-abc");
     }
 
     #[rstest]

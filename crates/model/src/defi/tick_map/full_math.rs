@@ -17,6 +17,7 @@ use alloy_primitives::{I256, U160, U256};
 
 pub const Q128: U256 = U256::from_limbs([0, 0, 1, 0]);
 pub const Q96_U160: U160 = U160::from_limbs([0, 1 << 32, 0]);
+pub(crate) const DECIMAL_EXPONENT_MAX: u8 = 77;
 
 /// Contains 512-bit math functions for Uniswap V3 style calculations
 /// Handles "phantom overflow" - allows multiplication and division where
@@ -27,7 +28,7 @@ pub struct FullMath;
 impl FullMath {
     /// Calculates floor(a×b÷denominator) with full precision
     ///
-    /// Follows the Solidity implementation from Uniswap V3's FullMath library:
+    /// Follows the Solidity implementation from Uniswap V3's `FullMath` library:
     /// <https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/FullMath.sol>
     ///
     /// # Errors
@@ -43,7 +44,7 @@ impl FullMath {
 
         // Least significant 256 bits of the product
         let mut prod_0 = a * b;
-        let mut prod_1 = mm - prod_0 - U256::from_limbs([(mm < prod_0) as u64, 0, 0, 0]);
+        let mut prod_1 = mm - prod_0 - U256::from_limbs([u64::from(mm < prod_0), 0, 0, 0]);
 
         // Make sure the result is less than 2**256.
         // Also prevents denominator == 0
@@ -60,7 +61,7 @@ impl FullMath {
         let remainder = a.mul_mod(b, denominator);
 
         // Subtract 256 bit number from 512 bit number
-        prod_1 -= U256::from_limbs([(remainder > prod_0) as u64, 0, 0, 0]);
+        prod_1 -= U256::from_limbs([u64::from(remainder > prod_0), 0, 0, 0]);
         prod_0 -= remainder;
 
         // Factor powers of two out of denominator
@@ -114,6 +115,44 @@ impl FullMath {
         Ok(result)
     }
 
+    pub(crate) fn mul_div_scaled(
+        a: U256,
+        b: U256,
+        denominator: U256,
+        scales: &[U256],
+    ) -> anyhow::Result<U256> {
+        let mut quotient = Self::mul_div(a, b, denominator)?;
+        let mut remainder = a.mul_mod(b, denominator);
+
+        for &scale in scales {
+            let scaled_quotient = quotient
+                .checked_mul(scale)
+                .ok_or_else(|| anyhow::anyhow!("Scaled result exceeds 256-bit range"))?;
+            let scaled_remainder = Self::mul_div(remainder, scale, denominator)?;
+            quotient = scaled_quotient
+                .checked_add(scaled_remainder)
+                .ok_or_else(|| anyhow::anyhow!("Scaled result exceeds 256-bit range"))?;
+            remainder = remainder.mul_mod(scale, denominator);
+        }
+
+        Ok(quotient)
+    }
+
+    pub(crate) fn check_decimal_exponent(exponent: u8) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            exponent <= DECIMAL_EXPONENT_MAX,
+            "Decimal exponent {exponent} exceeds supported maximum {DECIMAL_EXPONENT_MAX}"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn pow10(exponent: u8) -> anyhow::Result<U256> {
+        Self::check_decimal_exponent(exponent)?;
+        U256::from(10)
+            .checked_pow(U256::from(exponent))
+            .ok_or_else(|| anyhow::anyhow!("Decimal exponent {exponent} exceeds U256 range"))
+    }
+
     /// Calculates ceil(a×b÷denominator) with full precision
     /// Returns `Ok` with the rounded result or an error when rounding cannot be performed safely.
     ///
@@ -160,6 +199,7 @@ impl FullMath {
     }
 
     /// Computes the integer square root of a 256-bit unsigned integer using the Babylonian method
+    #[must_use]
     pub fn sqrt(x: U256) -> U256 {
         if x.is_zero() {
             return U256::ZERO;
@@ -203,10 +243,10 @@ impl FullMath {
     /// Converts a U256 unsigned integer to I256, mimicking Solidity's `int256(uint256)` cast.
     ///
     /// This performs a reinterpret cast, preserving the bit pattern.
-    /// Solidity's SafeCast.toInt256() checks the value fits in I256::MAX, then reinterprets.
+    /// Solidity's `SafeCast.toInt256()` checks the value fits in `I256::MAX`, then reinterprets.
     ///
     /// # Panics
-    /// Panics if the value exceeds I256::MAX (matching Solidity's require check)
+    /// Panics if the value exceeds `I256::MAX` (matching Solidity's require check)
     #[must_use]
     pub fn truncate_to_i256(value: U256) -> I256 {
         I256::from_raw(value)
@@ -302,6 +342,42 @@ mod tests {
         assert_eq!(
             FullMath::mul_div(U256::from(1), U256::from(1), U256::from(3)).unwrap(),
             U256::ZERO
+        );
+    }
+
+    #[rstest]
+    fn test_mul_div_scaled_preserves_fractional_precision() {
+        let result = FullMath::mul_div_scaled(
+            U256::from(1),
+            U256::from(1),
+            U256::from(3),
+            &[U256::from(10), U256::from(10)],
+        )
+        .unwrap();
+
+        assert_eq!(result, U256::from(33));
+    }
+
+    #[rstest]
+    fn test_pow10_accepts_largest_supported_exponent() {
+        let result = FullMath::pow10(DECIMAL_EXPONENT_MAX).unwrap();
+        let expected = U256::from_str_radix(
+            "100000000000000000000000000000000000000000000000000000000000000000000000000000",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_pow10_rejects_first_unsupported_exponent() {
+        let exponent = DECIMAL_EXPONENT_MAX + 1;
+        let error = FullMath::pow10(exponent).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Decimal exponent 78 exceeds supported maximum 77"
         );
     }
 

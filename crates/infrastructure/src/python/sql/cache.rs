@@ -14,12 +14,17 @@
 // -------------------------------------------------------------------------------------------------
 
 use bytes::Bytes;
-use nautilus_common::{cache::database::CacheDatabaseAdapter, live::get_runtime, signal::Signal};
+use nautilus_common::{
+    cache::database::{CacheDatabaseAdapter, CacheDatabaseFactory},
+    live::get_runtime,
+    python::cache::get_global_cache_database_factory_registry,
+    signal::Signal,
+};
 use nautilus_core::python::to_pyruntime_err;
 use nautilus_model::{
     data::{Bar, CustomData, DataType, QuoteTick, TradeTick},
     events::{OrderSnapshot, PositionSnapshot},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, TraderId},
     python::{
         account::{account_any_to_pyobject, pyobject_to_account_any},
         events::order::pyobject_to_order_event,
@@ -30,27 +35,37 @@ use nautilus_model::{
 };
 use pyo3::{IntoPyObjectExt, prelude::*};
 
-use crate::sql::{cache::PostgresCacheDatabase, queries::DatabaseQueries};
+use crate::sql::{
+    cache::{PostgresCacheConfig, PostgresCacheDatabase},
+    queries::DatabaseQueries,
+};
 
 #[pymethods]
 impl PostgresCacheDatabase {
     /// Connects to the Postgres cache database using the provided connection parameters.
     ///
+    /// Loads, trader-owned writes and flushes are scoped to `trader_id`, and account events are
+    /// stamped with it.
+    ///
     /// # Errors
     ///
-    /// Returns an error if establishing the database connection fails.
+    /// Returns an error if establishing the database connection fails, if the schema is out of
+    /// date, if any account events have no trader (the error lists the accounts to assign), or if
+    /// checking account ownership fails.
     #[staticmethod]
     #[pyo3(name = "connect")]
-    #[pyo3(signature = (host=None, port=None, username=None, password=None, database=None))]
+    #[pyo3(signature = (host=None, port=None, username=None, password=None, database=None, *, trader_id))]
     fn py_connect(
         host: Option<String>,
         port: Option<u16>,
         username: Option<String>,
         password: Option<String>,
         database: Option<String>,
+        trader_id: TraderId,
     ) -> PyResult<Self> {
-        let result = get_runtime()
-            .block_on(async { Self::connect(host, port, username, password, database).await });
+        let result = get_runtime().block_on(async {
+            Self::connect(host, port, username, password, database, trader_id).await
+        });
         result.map_err(to_pyruntime_err)
     }
 
@@ -95,7 +110,8 @@ impl PostgresCacheDatabase {
         get_runtime().block_on(async {
             let result = DatabaseQueries::load_instrument(&self.pool, &instrument_id)
                 .await
-                .unwrap();
+                .map_err(to_pyruntime_err)?;
+
             match result {
                 Some(instrument) => {
                     let py_object = instrument_any_to_pyobject(py, instrument)?;
@@ -109,8 +125,11 @@ impl PostgresCacheDatabase {
     #[pyo3(name = "load_instruments")]
     fn py_load_instruments(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
         get_runtime().block_on(async {
-            let result = DatabaseQueries::load_instruments(&self.pool).await.unwrap();
+            let result = DatabaseQueries::load_instruments(&self.pool)
+                .await
+                .map_err(to_pyruntime_err)?;
             let mut instruments = Vec::new();
+
             for instrument in result {
                 let py_object = instrument_any_to_pyobject(py, instrument)?;
                 instruments.push(py_object);
@@ -126,9 +145,11 @@ impl PostgresCacheDatabase {
         client_order_id: ClientOrderId,
     ) -> PyResult<Option<Py<PyAny>>> {
         get_runtime().block_on(async {
-            let result = DatabaseQueries::load_order(&self.pool, &client_order_id)
-                .await
-                .unwrap();
+            let result =
+                DatabaseQueries::load_order(&self.pool, &client_order_id, &self.trader_id())
+                    .await
+                    .map_err(to_pyruntime_err)?;
+
             match result {
                 Some(order) => {
                     let py_object = order_any_to_pyobject(py, order)?;
@@ -142,9 +163,10 @@ impl PostgresCacheDatabase {
     #[pyo3(name = "load_account")]
     fn py_load_account(&self, py: Python, account_id: AccountId) -> PyResult<Option<Py<PyAny>>> {
         get_runtime().block_on(async {
-            let result = DatabaseQueries::load_account(&self.pool, &account_id)
+            let result = DatabaseQueries::load_account(&self.pool, &account_id, &self.trader_id())
                 .await
-                .unwrap();
+                .map_err(to_pyruntime_err)?;
+
             match result {
                 Some(account) => {
                     let py_object = account_any_to_pyobject(py, account)?;
@@ -160,8 +182,9 @@ impl PostgresCacheDatabase {
         get_runtime().block_on(async {
             let result = DatabaseQueries::load_quotes(&self.pool, &instrument_id)
                 .await
-                .unwrap();
+                .map_err(to_pyruntime_err)?;
             let mut quotes = Vec::new();
+
             for quote in result {
                 let py_object = quote.into_py_any(py)?;
                 quotes.push(py_object);
@@ -175,8 +198,9 @@ impl PostgresCacheDatabase {
         get_runtime().block_on(async {
             let result = DatabaseQueries::load_trades(&self.pool, &instrument_id)
                 .await
-                .unwrap();
+                .map_err(to_pyruntime_err)?;
             let mut trades = Vec::new();
+
             for trade in result {
                 let py_object = trade.into_py_any(py)?;
                 trades.push(py_object);
@@ -190,8 +214,9 @@ impl PostgresCacheDatabase {
         get_runtime().block_on(async {
             let result = DatabaseQueries::load_bars(&self.pool, &instrument_id)
                 .await
-                .unwrap();
+                .map_err(to_pyruntime_err)?;
             let mut bars = Vec::new();
+
             for bar in result {
                 let py_object = bar.into_py_any(py)?;
                 bars.push(py_object);
@@ -210,7 +235,7 @@ impl PostgresCacheDatabase {
     }
 
     #[pyo3(name = "load_custom_data")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_load_custom_data(&self, data_type: DataType) -> PyResult<Vec<CustomData>> {
         get_runtime()
             .block_on(async { DatabaseQueries::load_custom_data(&self.pool, &data_type).await })
@@ -223,7 +248,7 @@ impl PostgresCacheDatabase {
         client_order_id: ClientOrderId,
     ) -> PyResult<Option<OrderSnapshot>> {
         get_runtime().block_on(async {
-            DatabaseQueries::load_order_snapshot(&self.pool, &client_order_id)
+            DatabaseQueries::load_order_snapshot(&self.pool, &client_order_id, &self.trader_id())
                 .await
                 .map_err(to_pyruntime_err)
         })
@@ -235,7 +260,7 @@ impl PostgresCacheDatabase {
         position_id: PositionId,
     ) -> PyResult<Option<PositionSnapshot>> {
         get_runtime().block_on(async {
-            DatabaseQueries::load_position_snapshot(&self.pool, &position_id)
+            DatabaseQueries::load_position_snapshot(&self.pool, &position_id, &self.trader_id())
                 .await
                 .map_err(to_pyruntime_err)
         })
@@ -272,13 +297,13 @@ impl PostgresCacheDatabase {
     }
 
     #[pyo3(name = "add_order_snapshot")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_order_snapshot(&self, snapshot: OrderSnapshot) -> PyResult<()> {
         self.add_order_snapshot(&snapshot).map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "add_position_snapshot")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_position_snapshot(&self, snapshot: PositionSnapshot) -> PyResult<()> {
         self.add_position_snapshot(&snapshot)
             .map_err(to_pyruntime_err)
@@ -306,13 +331,13 @@ impl PostgresCacheDatabase {
     }
 
     #[pyo3(name = "add_signal")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_signal(&self, signal: Signal) -> PyResult<()> {
         self.add_signal(&signal).map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "add_custom_data")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_add_custom_data(&self, data: CustomData) -> PyResult<()> {
         self.add_custom_data(&data).map_err(to_pyruntime_err)
     }
@@ -328,4 +353,71 @@ impl PostgresCacheDatabase {
         let order_any = pyobject_to_account_any(py, order)?;
         self.update_account(&order_any).map_err(to_pyruntime_err)
     }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PostgresCacheConfig {
+    /// Configuration for a Postgres-backed cache database.
+    ///
+    /// Missing fields are resolved from Postgres environment variables and then built-in defaults.
+    #[new]
+    #[pyo3(signature = (host=None, port=None, username=None, password=None, database=None))]
+    fn py_new(
+        host: Option<String>,
+        port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            username,
+            password,
+            database,
+        }
+    }
+
+    #[getter]
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    #[getter]
+    const fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    #[getter]
+    fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    #[getter]
+    fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    #[getter]
+    fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+}
+
+#[expect(clippy::needless_pass_by_value)]
+fn extract_postgres_cache_database_factory(
+    py: Python<'_>,
+    factory: Py<PyAny>,
+) -> PyResult<Box<dyn CacheDatabaseFactory>> {
+    Ok(Box::new(factory.extract::<PostgresCacheConfig>(py)?))
+}
+
+pub(in crate::python) fn register_postgres_cache_database_factory() -> PyResult<()> {
+    get_global_cache_database_factory_registry()
+        .register(
+            stringify!(PostgresCacheConfig).to_string(),
+            extract_postgres_cache_database_factory,
+        )
+        .map_err(to_pyruntime_err)
 }

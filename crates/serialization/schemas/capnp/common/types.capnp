@@ -1,5 +1,8 @@
 @0xa1b2c3d4e5f60718;
 # Cap'n Proto schema for Nautilus value types
+#
+# WARNING: This schema is not yet stable and may change without notice
+# between releases. Do not depend on wire compatibility across versions.
 
 using Identifiers = import "identifiers.capnp";
 using Enums = import "enums.capnp";
@@ -19,9 +22,9 @@ struct UInt128 {
 # Rust Decimal representation (rust_decimal crate)
 # Used for arbitrary precision decimal values in orders and positions
 struct Decimal {
-    lo @0 :UInt64;    # Low 64 bits of coefficient
-    mid @1 :UInt64;   # Middle 64 bits of coefficient
-    hi @2 :UInt64;    # High 64 bits of coefficient
+    lo @0 :UInt64;    # Low 32-bit limb; upper 32 bits must be zero
+    mid @1 :UInt64;   # Middle 32-bit limb; upper 32 bits must be zero
+    hi @2 :UInt64;    # High 32-bit limb; upper 32 bits must be zero
     flags @3 :UInt32; # Scale and sign information
 }
 

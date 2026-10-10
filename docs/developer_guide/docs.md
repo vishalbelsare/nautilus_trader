@@ -2,12 +2,53 @@
 
 This guide outlines the style conventions and best practices for writing documentation for NautilusTrader.
 
+The [Markdown Style](markdown_style.md) guide is the shared baseline for Markdown syntax and
+formatting, and `.markdownlint.jsonc` enforces its mechanical subset. This guide covers what is
+specific to NautilusTrader documentation rather than repeating that baseline.
+
 ## General principles
 
 - We favor simplicity over complexity, less is more.
 - We favor concise yet readable prose and documentation.
 - We value standardization in conventions, style, patterns, etc.
 - Documentation should be accessible to users of varying technical backgrounds.
+
+## Documentation types
+
+Most pages should fit one of four types
+([Divio documentation system](https://docs.divio.com/documentation-system/)).
+Mixing types in a single page makes it harder to read and harder to maintain.
+
+| Type             | Purpose                         | Section          |
+| ---------------- | ------------------------------- | ---------------- |
+| **Tutorial**     | Teach by walking through a task | `tutorials/`     |
+| **How-to guide** | Solve a specific problem        | `how_to/`        |
+| **Explanation**  | Clarify design and architecture | `concepts/`      |
+| **Reference**    | Describe the machinery          | `api_reference/` |
+
+Two sections are exceptions: `getting_started/` is an onboarding path that
+combines tutorial-style walkthroughs with setup instructions, and
+`integrations/` pages mix reference (capabilities, symbology) with how-to
+content (setup, configuration) so each venue page is self-contained.
+Standalone how-to content that is not venue-specific belongs in `how_to/`.
+
+### Choosing the right type
+
+- **Does your page walk a newcomer through a learning experience?** Tutorial.
+- **Does it answer "How do I...?" for someone who already knows the system?** How-to guide.
+- **Does it explain why something works the way it does?** Explanation.
+- **Does it list classes, config fields, enums, or capabilities?** Reference.
+
+A tutorial says "do this, then this, then this." The author picks the path.
+A how-to guide says "here is how to achieve X." The reader already knows
+they want X. Keep these distinct:
+
+- Tutorials should not assume prior knowledge.
+- How-to guides should not teach background concepts.
+
+When one type needs to reference another, link to it instead of inlining. For
+example, a how-to guide that configures `LiveNodeConfig` should link to the
+API reference for field definitions rather than listing them again.
 
 ## Language and tone
 
@@ -20,11 +61,8 @@ This guide outlines the style conventions and best practices for writing documen
 
 ## Markdown tables
 
-### Column alignment and spacing
-
-- Use symmetrical column widths based on the space dictated by the widest content in each column.
-- Align column separators (`|`) vertically for better readability.
-- Use consistent spacing around cell content.
+Table syntax, pipe alignment, and delimiter padding follow the
+[Markdown Style](markdown_style.md#tables) guide.
 
 ### Notes and descriptions
 
@@ -36,7 +74,7 @@ This guide outlines the style conventions and best practices for writing documen
 
 ```markdown
 | Order Type             | Spot | Margin | USDT Futures | Coin Futures | Notes                   |
-|------------------------|------|--------|--------------|--------------|-------------------------|
+| ---------------------- | ---- | ------ | ------------ | ------------ | ----------------------- |
 | `MARKET`               | ✓    | ✓      | ✓            | ✓            |                         |
 | `STOP_MARKET`          | -    | ✓      | ✓            | ✓            | Not supported for Spot. |
 | `MARKET_IF_TOUCHED`    | -    | -      | ✓            | ✓            | Futures only.           |
@@ -47,50 +85,41 @@ This guide outlines the style conventions and best practices for writing documen
 - Use `✓` for supported features.
 - Use `-` for unsupported features (not `✗` or other symbols).
 - When adding notes for unsupported features, emphasize with italics: `*Not supported*`.
+- Make unsupported notes specific when the reason matters: use `*Not supported by <venue>*`
+  for venue gaps, or `*Not currently implemented*` for adapter gaps.
 - Leave cells empty when no content is needed.
 
 ## Code references
 
-- Use backticks for inline code, method names, class names, and configuration options.
-- Use code blocks for multi-line examples.
-- When referencing code locations, use `file_path::function_name` or `file_path::ClassName` rather than line numbers, which become stale as code changes.
+Inline code and fenced code blocks follow the [Markdown Style](markdown_style.md#code) guide.
+
+When referencing code locations, use `file_path::function_name` or `file_path::ClassName` rather
+than line numbers, which become stale as code changes.
 
 ## Headings
 
-We follow modern documentation conventions that prioritize readability and accessibility:
+Heading style, case, and hierarchy follow the [Markdown Style](markdown_style.md#headings) guide:
+title case for the page heading, sentence case below it.
 
-- Use title case for the main page heading (# Level 1 only).
-- Use sentence case for all subheadings (## Level 2 and below).
-- Always capitalize proper nouns regardless of heading level (product names, technologies, companies, acronyms).
-- Use proper heading hierarchy (don't skip levels).
+NautilusTrader makes one exception for `index.md` pages: headings and navigation links that name
+individual documents use the target document's exact H1 title, including its capitalization.
+General section headings retain sentence case.
 
-This convention aligns with industry standards used by major technology companies including Google Developer Documentation, Microsoft Docs, and Anthropic's documentation.
-It improves readability, reduces cognitive load, and is more accessible for international users and screen readers.
-
-### Examples
-
-```markdown
-# NautilusTrader Developer Guide
-
-## Getting started with Python
-## Using the Binance adapter
-## REST API implementation
-## WebSocket data streaming
-## Testing with pytest
-```
+Always capitalize proper nouns regardless of heading level (product names, technologies,
+companies, acronyms).
 
 ## Lists
 
-- Use hyphens (`-`) for unordered list bullets; avoid `*` or `+` to keep the Markdown style consistent across the project.
-- Use numbered lists only when order matters.
-- Maintain consistent indentation for nested lists.
-- End list items with periods when they are complete sentences.
+List markers, ordering, and indentation follow the [Markdown Style](markdown_style.md#lists) guide.
+
+End list items with periods when they are complete sentences.
 
 ## Links and references
 
-- Use descriptive link text (avoid "click here" or "this link").
-- Reference external documentation when appropriate.
-- Keep all internal links relative and accurate.
+Link text, link style, and images follow the
+[Markdown Style](markdown_style.md#links-and-images) guide.
+
+Reference external documentation when appropriate.
 
 ## Technical terminology
 
@@ -110,7 +139,7 @@ It improves readability, reduces cognitive load, and is more accessible for inte
 Use admonition blocks to highlight important information:
 
 | Admonition   | Purpose                                                       |
-|--------------|---------------------------------------------------------------|
+| ------------ | ------------------------------------------------------------- |
 | `:::note`    | Supplementary context that clarifies but isn't essential.     |
 | `:::info`    | Important information the reader should be aware of.          |
 | `:::tip`     | Helpful suggestions or best practices.                        |
@@ -119,12 +148,105 @@ Use admonition blocks to highlight important information:
 
 Avoid overusing admonitions; too many diminish their impact.
 
-## Line length and wrapping
+## MDX components
 
-- Wrap lines at no more than ~100-120 characters for better readability and diff reviews.
-- Break long sentences at natural points (after commas, conjunctions, or phrases).
-- Avoid orphaned words on new lines when possible.
-- Code blocks and URLs can exceed the line limit when necessary.
+The docs site (fumadocs) provides built-in MDX components available in all `.md` files.
+No imports are needed.
+
+### Tabs
+
+Use tabs for language-specific or variant content. List Rust before Python so Rust is the
+default (left-most) tab.
+
+For code examples, add `tab="..."` to consecutive fenced code blocks:
+
+```markdown
+\`\`\`rust tab="Rust"
+let params = Params::from([("close_position", true.into())]);
+\`\`\`
+
+\`\`\`python tab="Python"
+strategy.submit_order(order, params={"close_position": True})
+\`\`\`
+```
+
+For tables or other content, wrap each variant in `<Tabs>` and `<Tab>`. The instrument Fields
+tables use this so each language shows a single type column instead of side-by-side Rust and
+Python columns. Leave a blank line above and below the inner content so the Markdown renders.
+
+```markdown
+<Tabs items={["Rust", "Python"]}>
+<Tab value="Rust">
+
+| Field           | Type           | Required/default | Notes                   |
+| --------------- | -------------- | ---------------- | ----------------------- |
+| `instrument_id` | `InstrumentId` | Required         | Stored as `id` in Rust. |
+
+</Tab>
+<Tab value="Python">
+
+| Field           | Type           | Required/default | Notes |
+| --------------- | -------------- | ---------------- | ----- |
+| `instrument_id` | `InstrumentId` | Required         |       |
+
+</Tab>
+</Tabs>
+```
+
+### Steps
+
+Use `Steps` and `Step` for sequential procedures.
+
+```markdown
+<Steps>
+<Step>
+Configure the adapter.
+</Step>
+<Step>
+Start the trading node.
+</Step>
+</Steps>
+```
+
+### Accordions
+
+Use `Accordions` and `Accordion` for collapsible content.
+
+```markdown
+<Accordions>
+<Accordion title="Advanced configuration">
+Content here.
+</Accordion>
+</Accordions>
+```
+
+### Files
+
+Use `Files`, `Folder`, and `File` for directory tree visualizations.
+
+```markdown
+<Files>
+<Folder name="src" defaultOpen>
+<File name="main.rs" />
+<File name="lib.rs" />
+</Folder>
+</Files>
+```
+
+### Cards
+
+Use `Cards` and `Card` for linked content grids.
+
+```markdown
+<Cards>
+<Card title="Getting started" href="/latest/getting_started" />
+<Card title="Concepts" href="/latest/concepts" />
+</Cards>
+```
+
+### TypeTable
+
+Use `TypeTable` for parameter or type documentation tables.
 
 ## API documentation
 

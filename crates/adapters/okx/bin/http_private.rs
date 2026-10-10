@@ -13,7 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_model::identifiers::{AccountId, InstrumentId};
+use nautilus_model::{
+    enums::AccountType,
+    identifiers::{AccountId, InstrumentId},
+};
 use nautilus_okx::{
     common::enums::{OKXInstrumentType, OKXPositionMode},
     http::client::OKXHttpClient,
@@ -28,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let inst_type = OKXInstrumentType::Swap;
     let (instruments, _inst_id_codes) = client.request_instruments(inst_type, None).await?;
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
 
     // Set position mode
     let resp = client.set_position_mode(OKXPositionMode::NetMode).await;
@@ -38,7 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Request account state
-    let resp = client.request_account_state(account_id).await;
+    let resp = client
+        .request_account_state(account_id, AccountType::Margin)
+        .await;
+
     match resp {
         Ok(account_state) => log::debug!("{account_state:?}"),
         Err(e) => log::error!("{e:?}"),
@@ -58,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
         )
         .await;
+
     match result {
         Ok(reports) => log::debug!("{reports:?}"),
         Err(e) => log::error!("{e:?}"),
@@ -68,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = client
         .request_position_status_reports(account_id, Some(instrument_type), None)
         .await;
+
     match result {
         Ok(reports) => log::debug!("{reports:?}"),
         Err(e) => log::error!("{e:?}"),

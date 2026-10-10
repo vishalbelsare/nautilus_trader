@@ -19,6 +19,9 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
 pub enum KrakenHttpError {
+    #[error("Request not started: {0}")]
+    RequestNotStarted(String),
+
     #[error("Network error: {0}")]
     NetworkError(String),
 
@@ -35,6 +38,57 @@ pub enum KrakenHttpError {
     MissingCredentials,
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum KrakenSubmitOrderError {
+    #[error("Order rejected: {reason}")]
+    Rejected { reason: String },
+
+    #[error("No send status in successful response")]
+    MissingStatus,
+
+    #[error("Unknown send status: {status}")]
+    UnknownStatus { status: String },
+
+    #[error("No order ID in submit response: {detail}")]
+    MissingOrderId { detail: String },
+
+    #[error("Order lookup failed after submission: {source}")]
+    PostSubmitLookup {
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum KrakenModifyOrderError {
+    #[error("Order modification rejected: {reason}")]
+    Rejected { reason: String },
+
+    #[error("Unknown edit status: {status}")]
+    UnknownStatus { status: String },
+
+    #[error("No order ID in edit response")]
+    MissingOrderId,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum KrakenBatchOrderError {
+    #[error("Order validation failed: {reason}")]
+    Validation { reason: String },
+
+    #[error("Order not sent after an earlier chunk failed")]
+    NotAttempted,
+
+    #[error("Batch response item count {actual} did not match request count {expected}")]
+    ResponseCount { expected: usize, actual: usize },
+
+    #[error("Missing batch response for {key}")]
+    MissingResponse { key: String },
+
+    #[error("Duplicate batch responses for {key}")]
+    DuplicateResponse { key: String },
+}
+
 /// Formats API error messages, handling empty error arrays.
 fn format_api_errors(errors: &[String]) -> String {
     if errors.is_empty() {
@@ -47,5 +101,17 @@ fn format_api_errors(errors: &[String]) -> String {
 impl From<anyhow::Error> for KrakenHttpError {
     fn from(err: anyhow::Error) -> Self {
         Self::NetworkError(err.to_string())
+    }
+}
+
+/// Returns `true` if a request producing this error should be retried.
+pub fn kraken_http_should_retry(error: &KrakenHttpError) -> bool {
+    match error {
+        KrakenHttpError::NetworkError(_) => true,
+        KrakenHttpError::ApiError(errors) => errors.iter().any(|e| e.contains("Rate limit")),
+        KrakenHttpError::RequestNotStarted(_)
+        | KrakenHttpError::ParseError(_)
+        | KrakenHttpError::AuthenticationError(_)
+        | KrakenHttpError::MissingCredentials => false,
     }
 }

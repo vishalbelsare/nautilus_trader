@@ -15,63 +15,89 @@
 
 //! Example demonstrating live execution testing with the Betfair adapter.
 //!
-//! Run with: `cargo run -p nautilus-betfair --example betfair-exec-tester`
+//! Run with: `cargo run -p nautilus-betfair --example betfair-exec-tester --features examples`
 //!
-//! Environment variables:
+//! Required environment variables:
 //! - `BETFAIR_USERNAME`: Your Betfair username
 //! - `BETFAIR_PASSWORD`: Your Betfair password
 //! - `BETFAIR_APP_KEY`: Your Betfair application key
-//! - `BETFAIR_MARKET_ID`: Optional market ID override. Defaults to `1.254209667`
-//! - `BETFAIR_INSTRUMENT_ID`: Optional instrument ID override after market preload
+//! - `BETFAIR_MARKET_ID`: An active Betfair market ID
+//! - `BETFAIR_INSTRUMENT_ID` (optional): A runner in that market. When omitted, the example
+//!   selects the active runner with the most matched volume
 //!
 //! Market IDs can be found from `https://www.betfair.com.au/exchange/plus/`
 
 use std::sync::Arc;
 
 use nautilus_betfair::{
-    config::{BetfairDataConfig, BetfairExecConfig},
+    common::{consts::BETFAIR_CLIENT_ID, enums::RunnerStatus},
+    config::{BetfairDataClientConfig, BetfairExecutionClientConfig},
     factories::{BetfairDataClientFactory, BetfairExecutionClientFactory},
     http::client::BetfairHttpClient,
     provider::{BetfairInstrumentProvider, NavigationFilter},
 };
 use nautilus_common::{enums::Environment, providers::InstrumentProvider};
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
     enums::TimeInForce,
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     instruments::{Instrument, InstrumentAny},
     types::{Currency, Quantity},
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
+use nautilus_trading::strategy::StrategyConfig;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+// WARNING: With `DRY_RUN = false`, this tester submits orders to the configured
+// environment and may use real funds. Set `DRY_RUN = true` to connect without
+// submitting orders or sending shutdown cancel/close commands.
+const DRY_RUN: bool = false;
+const TRADER_ID: &str = "TESTER-001";
+const ACCOUNT_ID: &str = "BETFAIR-001";
+const NODE_NAME: &str = "BETFAIR-EXEC-TESTER-001";
+const STRATEGY_ID: &str = "EXEC_TESTER-001";
+const ORDER_QTY: &str = "2.00";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    let market_id =
-        std::env::var("BETFAIR_MARKET_ID").unwrap_or_else(|_| "1.254209667".to_string());
-    let (account_currency, instruments) = load_market_context(&market_id).await?;
-    let instrument_id = select_exec_instrument(&instruments)?;
-    let instrument_ids = instrument_ids(&instruments);
+    let market_id = std::env::var("BETFAIR_MARKET_ID").map_err(|_| {
+        anyhow::anyhow!("BETFAIR_MARKET_ID must be set to an active Betfair market")
+    })?;
+    let requested_instrument_id = std::env::var("BETFAIR_INSTRUMENT_ID").ok();
+    let (account_currency, instruments, http_client) = load_market_context(&market_id).await?;
+    let instrument_id = select_exec_instrument(
+        &http_client,
+        &market_id,
+        &instruments,
+        requested_instrument_id.as_deref(),
+    )
+    .await?;
+    http_client.disconnect().await;
+    let instrument_choices = instrument_choices(&instruments);
 
-    println!("Found instruments for market {market_id}: {instrument_ids:?}");
+    println!("Found instruments for market {market_id}:");
+    for choice in &instrument_choices {
+        println!("  {choice}");
+    }
     println!("Using execution instrument: {instrument_id}");
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("BETFAIR-001");
-    let node_name = "BETFAIR-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("BETFAIR");
+    let trader_id = TraderId::from(TRADER_ID);
+    let account_id = AccountId::from(ACCOUNT_ID);
+    let node_name = NODE_NAME.to_string();
+    let client_id = *BETFAIR_CLIENT_ID;
 
-    let data_config = BetfairDataConfig {
+    let data_config = BetfairDataClientConfig {
         account_currency: account_currency.clone(),
         market_ids: Some(vec![market_id.clone()]),
         stream_conflate_ms: Some(0),
         ..Default::default()
     };
 
-    let exec_config = BetfairExecConfig {
-        trader_id,
+    let exec_config = BetfairExecutionClientConfig {
         account_id,
         account_currency,
         stream_market_ids_filter: Some(vec![market_id.clone()]),
@@ -83,38 +109,45 @@ async fn main() -> anyhow::Result<()> {
 
     let data_factory = BetfairDataClientFactory::new();
     let exec_factory = BetfairExecutionClientFactory::new();
+    let exec_engine_config = LiveExecutionEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: None,
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let order_qty = Quantity::from("2.00");
-
-    let mut tester_config = ExecTesterConfig::new(
-        StrategyId::from("EXEC_TESTER-001"),
-        instrument_id,
-        client_id,
-        order_qty,
-    )
-    .with_subscribe_quotes(false)
-    .with_subscribe_trades(false)
-    .with_enable_limit_buys(false)
-    .with_enable_limit_sells(false)
-    .with_open_position_on_start(order_qty.as_decimal())
-    .with_cancel_orders_on_stop(true)
-    .with_close_positions_on_stop(false)
-    .with_can_unsubscribe(false)
-    .with_log_data(false);
+    let order_qty = Quantity::from(ORDER_QTY);
 
     // Betfair does not expose quote subscriptions or normal market orders.
     // Use a BSP market-on-close order so ExecTester can still submit one order on start.
-    tester_config.open_position_time_in_force = TimeInForce::AtTheClose;
-    tester_config.base.external_order_claims = Some(vec![instrument_id]);
-    tester_config.base.use_uuid_client_order_ids = true;
+    let tester_config = ExecTesterConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from(STRATEGY_ID)),
+            external_order_instrument_ids: Some(vec![instrument_id]),
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .client_id(client_id)
+        .order_qty(order_qty)
+        .dry_run(DRY_RUN)
+        .subscribe_quotes(false)
+        .subscribe_trades(false)
+        .enable_limit_buys(false)
+        .enable_limit_sells(false)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .open_position_time_in_force(TimeInForce::AtTheClose)
+        .close_positions_on_stop(false)
+        .can_unsubscribe(false)
+        .log_data(false)
+        .build()?;
 
     let tester = ExecTester::new(tester_config);
 
@@ -124,8 +157,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn load_market_context(market_id: &str) -> anyhow::Result<(String, Vec<InstrumentAny>)> {
-    let credential = BetfairDataConfig::default().credential()?;
+async fn load_market_context(
+    market_id: &str,
+) -> anyhow::Result<(String, Vec<InstrumentAny>, Arc<BetfairHttpClient>)> {
+    let credential = BetfairDataClientConfig::default().credential()?;
     let http_client = Arc::new(BetfairHttpClient::new(
         credential,
         None,
@@ -157,7 +192,6 @@ async fn load_market_context(market_id: &str) -> anyhow::Result<(String, Vec<Ins
     );
 
     provider.load_all(None).await?;
-    http_client.disconnect().await;
 
     let instruments: Vec<InstrumentAny> =
         provider.store().list_all().into_iter().cloned().collect();
@@ -165,16 +199,21 @@ async fn load_market_context(market_id: &str) -> anyhow::Result<(String, Vec<Ins
     if instruments.is_empty() {
         anyhow::bail!(
             "No instruments found for BETFAIR_MARKET_ID={market_id}, find an active market ID \
-             from https://www.betfair.com.au/exchange/plus/ and ensure the market is still available"
+             from https://www.betfair.com.au/exchange/plus/ and confirm the market is still available"
         );
     }
 
-    Ok((account_currency.code.as_str().to_string(), instruments))
+    Ok((account_currency.code.to_string(), instruments, http_client))
 }
 
-fn select_exec_instrument(instruments: &[InstrumentAny]) -> anyhow::Result<InstrumentId> {
-    if let Ok(instrument_id) = std::env::var("BETFAIR_INSTRUMENT_ID") {
-        let instrument_id = InstrumentId::from(instrument_id.as_str());
+async fn select_exec_instrument(
+    http_client: &BetfairHttpClient,
+    market_id: &str,
+    instruments: &[InstrumentAny],
+    requested_instrument_id: Option<&str>,
+) -> anyhow::Result<InstrumentId> {
+    if let Some(instrument_id) = requested_instrument_id {
+        let instrument_id = InstrumentId::from(instrument_id);
 
         if instruments
             .iter()
@@ -183,15 +222,111 @@ fn select_exec_instrument(instruments: &[InstrumentAny]) -> anyhow::Result<Instr
             return Ok(instrument_id);
         }
 
-        anyhow::bail!("BETFAIR_INSTRUMENT_ID={instrument_id} was not found in the loaded market");
+        anyhow::bail!(
+            "BETFAIR_INSTRUMENT_ID={instrument_id} was not found in BETFAIR_MARKET_ID={market_id}"
+        );
     }
 
-    instruments
-        .first()
-        .map(InstrumentAny::id)
-        .ok_or_else(|| anyhow::anyhow!("No Betfair instruments available for execution testing"))
+    match instruments {
+        [] => anyhow::bail!("No Betfair instruments available for execution testing"),
+        [instrument] => Ok(instrument.id()),
+        _ => match auto_select_active_instrument(http_client, market_id, instruments).await? {
+            Some(instrument_id) => Ok(instrument_id),
+            None => {
+                let available = instrument_choices(instruments).join("\n  ");
+                anyhow::bail!(
+                    "Could not auto-select an active Betfair runner for market {market_id}.\n\n  \
+                     Set BETFAIR_INSTRUMENT_ID to one of:\n  {available}"
+                );
+            }
+        },
+    }
 }
 
-fn instrument_ids(instruments: &[InstrumentAny]) -> Vec<InstrumentId> {
-    instruments.iter().map(InstrumentAny::id).collect()
+async fn auto_select_active_instrument(
+    http_client: &BetfairHttpClient,
+    market_id: &str,
+    instruments: &[InstrumentAny],
+) -> anyhow::Result<Option<InstrumentId>> {
+    let params = ListMarketBookParams {
+        market_ids: vec![market_id.to_string()],
+    };
+
+    let books: Vec<MarketBook> = http_client
+        .send_betting("SportsAPING/v1.0/listMarketBook", &params)
+        .await?;
+
+    let Some(book) = books.first() else {
+        return Ok(None);
+    };
+
+    let mut active_runners: Vec<&RunnerBook> = book
+        .runners
+        .iter()
+        .filter(|runner| runner.status == RunnerStatus::Active)
+        .collect();
+
+    active_runners.sort_by(|a, b| {
+        b.total_matched
+            .partial_cmp(&a.total_matched)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for runner in active_runners {
+        let handicap = runner.handicap.unwrap_or(Decimal::ZERO);
+
+        if let Some(instrument_id) = instruments.iter().find_map(|instrument| match instrument {
+            InstrumentAny::Betting(betting)
+                if betting.selection_id == runner.selection_id
+                    && (betting.selection_handicap
+                        - handicap.to_string().parse::<f64>().unwrap_or(0.0))
+                    .abs()
+                        < f64::EPSILON =>
+            {
+                Some(betting.id)
+            }
+            _ => None,
+        }) {
+            return Ok(Some(instrument_id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn instrument_choices(instruments: &[InstrumentAny]) -> Vec<String> {
+    let mut choices: Vec<String> = instruments
+        .iter()
+        .map(|instrument| match instrument {
+            InstrumentAny::Betting(betting) => {
+                format!("{} ({})", betting.id, betting.selection_name)
+            }
+            _ => instrument.id().to_string(),
+        })
+        .collect();
+    choices.sort();
+    choices
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMarketBookParams {
+    market_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketBook {
+    runners: Vec<RunnerBook>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerBook {
+    selection_id: u64,
+    #[serde(default)]
+    handicap: Option<Decimal>,
+    status: RunnerStatus,
+    #[serde(default)]
+    total_matched: f64,
 }

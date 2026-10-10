@@ -40,16 +40,6 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
     Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        eq,
-        eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.deribit",
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE",
-    )
-)]
 pub enum DeribitUpdateInterval {
     /// Raw updates - immediate delivery of each event.
     /// Requires authentication.
@@ -104,15 +94,6 @@ impl Display for DeribitUpdateInterval {
     EnumString,
     Serialize,
     Deserialize,
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        eq,
-        eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.deribit",
-        from_py_object
-    )
 )]
 pub enum DeribitWsChannel {
     // Public Market Data Channels
@@ -351,7 +332,6 @@ pub enum DeribitWsMethod {
     #[strum(serialize = "public/get_time")]
     GetTime,
 
-    // Private methods (for future execution support)
     /// Subscribe to private channels.
     #[serde(rename = "private/subscribe")]
     #[strum(serialize = "private/subscribe")]
@@ -364,25 +344,37 @@ pub enum DeribitWsMethod {
     #[serde(rename = "private/logout")]
     #[strum(serialize = "private/logout")]
     Logout,
+    /// Submit a buy order.
+    #[serde(rename = "private/buy")]
+    #[strum(serialize = "private/buy")]
+    Buy,
+    /// Submit a sell order.
+    #[serde(rename = "private/sell")]
+    #[strum(serialize = "private/sell")]
+    Sell,
+    /// Modify an order.
+    #[serde(rename = "private/edit")]
+    #[strum(serialize = "private/edit")]
+    Edit,
+    /// Cancel an order.
+    #[serde(rename = "private/cancel")]
+    #[strum(serialize = "private/cancel")]
+    Cancel,
+    /// Cancel all orders for an instrument.
+    #[serde(rename = "private/cancel_all_by_instrument")]
+    #[strum(serialize = "private/cancel_all_by_instrument")]
+    CancelAllByInstrument,
+    /// Get order state.
+    #[serde(rename = "private/get_order_state")]
+    #[strum(serialize = "private/get_order_state")]
+    GetOrderState,
 }
 
 impl DeribitWsMethod {
     /// Returns the JSON-RPC method string.
     #[must_use]
-    pub fn as_method_str(&self) -> &'static str {
-        match self {
-            Self::PublicSubscribe => "public/subscribe",
-            Self::PublicUnsubscribe => "public/unsubscribe",
-            Self::PublicAuth => "public/auth",
-            Self::SetHeartbeat => "public/set_heartbeat",
-            Self::DisableHeartbeat => "public/disable_heartbeat",
-            Self::Test => "public/test",
-            Self::Hello => "public/hello",
-            Self::GetTime => "public/get_time",
-            Self::PrivateSubscribe => "private/subscribe",
-            Self::PrivateUnsubscribe => "private/unsubscribe",
-            Self::Logout => "private/logout",
-        }
+    pub fn as_method_str(&self) -> &str {
+        self.as_ref()
     }
 }
 

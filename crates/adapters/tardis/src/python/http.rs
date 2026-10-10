@@ -14,28 +14,39 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::{
-    UnixNanos,
-    python::{IntoPyObjectNautilusExt, enums::parse_enum, to_pyruntime_err},
+    DurationNanos, UnixNanos,
+    python::{enums::parse_enum, to_pyruntime_err},
 };
 use nautilus_model::python::instruments::instrument_any_to_pyobject;
-use pyo3::prelude::*;
+use pyo3::{IntoPyObjectExt, prelude::*};
 
 use crate::{
-    enums::TardisExchange,
+    common::enums::TardisExchange,
     http::{TardisHttpClient, query::InstrumentFilterBuilder},
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TardisHttpClient {
+    /// A Tardis HTTP API client.
+    /// See <https://docs.tardis.dev/api/http>.
     #[new]
-    #[pyo3(signature = (api_key=None, base_url=None, timeout_secs=None, normalize_symbols=true))]
+    #[pyo3(signature = (api_key=None, base_url=None, timeout_secs=None, normalize_symbols=true, proxy_url=None))]
     fn py_new(
         api_key: Option<&str>,
         base_url: Option<&str>,
         timeout_secs: Option<u64>,
         normalize_symbols: bool,
+        proxy_url: Option<String>,
     ) -> PyResult<Self> {
-        Self::new(api_key, base_url, timeout_secs, normalize_symbols).map_err(to_pyruntime_err)
+        Self::new(
+            api_key,
+            base_url,
+            timeout_secs,
+            normalize_symbols,
+            proxy_url,
+        )
+        .map_err(to_pyruntime_err)
     }
 
     #[getter]
@@ -50,7 +61,14 @@ impl TardisHttpClient {
         self.credential().map(|c| c.api_key_masked())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Returns all Nautilus instrument definitions for the given `exchange`, and filter params.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching instrument info or parsing into domain types fails.
+    ///
+    /// See <https://docs.tardis.dev/api/instruments-metadata-api>.
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(name = "instruments")]
     #[pyo3(signature = (exchange, symbol=None, base_currency=None, quote_currency=None, instrument_type=None, contract_type=None, active=None, start=None, end=None, available_offset=None, effective=None, ts_init=None))]
     fn py_instruments<'py>(
@@ -79,10 +97,10 @@ impl TardisHttpClient {
             .active(active)
             // NOTE: The Tardis instruments metadata API does not function correctly when using
             // the `availableSince` and `availableTo` params.
-            // .available_since(start.map(|x| DateTime::from_timestamp_nanos(x as i64)))
-            // .available_to(end.map(|x| DateTime::from_timestamp_nanos(x as i64)))
+            // .available_since(start.and_then(|x| Timestamp::from_nanosecond(x.into()).ok()))
+            // .available_to(end.and_then(|x| Timestamp::from_nanosecond(x.into()).ok()))
             .build()
-            .unwrap(); // SAFETY: Safe since all fields are Option
+            .unwrap(); // All fields are Option, so build cannot fail
 
         let self_clone = self.clone();
 
@@ -94,7 +112,7 @@ impl TardisHttpClient {
                     Some(&filter),
                     start.map(UnixNanos::from),
                     end.map(UnixNanos::from),
-                    available_offset.map(UnixNanos::from),
+                    available_offset.map(DurationNanos::new),
                     effective.map(UnixNanos::from),
                     ts_init.map(UnixNanos::from),
                 )
@@ -106,7 +124,7 @@ impl TardisHttpClient {
                 for inst in instruments {
                     py_instruments.push(instrument_any_to_pyobject(py, inst)?);
                 }
-                Ok(py_instruments.into_py_any_unwrap(py))
+                py_instruments.into_py_any(py)
             })
         })
     }

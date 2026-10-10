@@ -1,17 +1,7 @@
-# NautilusTrader v2
+# NautilusTrader Python package
 
-> [!WARNING]
->
-> **Under active development and not yet considered usable.**
-
-This directory contains the `nautilus_trader` v2 Python package, built entirely with PyO3 bindings.
-This replaces the legacy Cython layer with Rust core bindings.
-
-**Rules during the transition:**
-
-- The `python/` directory is self-contained. Everything Python-related for v2 lives here.
-- This directory will remain when v1 is removed (the top-level `nautilus_trader/` goes away).
-- Nothing outside this directory should reference anything inside it for now.
+This directory contains the `nautilus_trader` Python package. Rust core bindings are exposed
+through PyO3.
 
 ## Project structure
 
@@ -22,9 +12,15 @@ python/
 ├── generate_stubs.py           # Generates Python type stubs from Rust bindings
 ├── pyproject.toml              # Maturin build configuration
 ├── uv.lock                     # Dependency lock file
+├── tests/
+│   ├── conftest.py             # Shared pytest fixtures
+│   ├── unit/
+│   │   ├── common/actor.py     # Test actor/strategy/algorithm fixtures
+│   │   └── test_live_node.py   # LiveNode registration tests
+│   └── acceptance/             # Acceptance tests
 └── nautilus_trader/
     ├── __init__.py             # Re-exports from _libnautilus
-    ├── _libnautilus.so         # Single compiled Rust extension (created by the build)
+    ├── _libnautilus/            # Compiled Rust extension (created by the build)
     ├── core/
     │   ├── __init__.py         # Re-exports from _libnautilus.core
     │   └── __init__.pyi        # Type stubs (auto-generated)
@@ -36,16 +32,12 @@ python/
 
 ## Build targets
 
-> [!NOTE]
-> The v2 build uses `target-v2/` for Cargo artifacts to avoid conflicts with
-> the v1 build in `target/`. This separation is temporary until the full
-> transition to v2.
-
 From the repository root:
 
 ```bash
-make build-debug-v2   # Compile and install into python/.venv (debug mode)
-make py-stubs-v2      # Regenerate type stubs and docstrings
+make build-debug  # Compile and install into python/.venv (debug mode)
+make py-stubs     # Regenerate type stubs and docstrings
+make pytest       # Run Python tests
 ```
 
 ## Development setup
@@ -53,25 +45,26 @@ make py-stubs-v2      # Regenerate type stubs and docstrings
 ### Prerequisites
 
 - Rust toolchain (via `rustup`)
-- Python 3.12-3.14
+- Python 3.13-3.14
 - `patchelf` (Linux only) for setting rpath on the compiled extension
 
 ### Quick start
 
-From within this `python/` directory:
+From the repository root:
 
 ```bash
-uv run maturin develop --extras dev,test
+make build-debug
 ```
 
-This compiles the Rust extension and installs it into the project venv (`python/.venv`).
-Run again after Rust changes to recompile.
+This compiles the Rust extension and installs it into the project environment (`python/.venv`). Run
+it again after Rust changes.
 
 ## How it works
 
-1. **Build**: `maturin develop` compiles all Rust code into `nautilus_trader/_libnautilus.so`.
+1. **Build**: `maturin develop` compiles all Rust code into a single extension module
+   under `nautilus_trader/_libnautilus/`.
 2. **Re-exports**: Each submodule's `__init__.py` re-exports components from `_libnautilus`.
-3. **Type stubs**: `.pyi` files provide type information for IDEs and `mypy`.
+3. **Type stubs**: `.pyi` files provide type information for IDEs and `ty`.
 4. **Docstrings**: `generate_docstrings.py` copies `///` doc comments from the Rust source
    to PyO3 wrappers, so `__doc__` stays in sync without manual duplication.
 
@@ -89,38 +82,59 @@ UUID4()
 
 ```bash
 git clone https://github.com/nautechsystems/nautilus_trader.git
-cd nautilus_trader/python
-uv run maturin develop --extras dev,test
+cd nautilus_trader
+make build
 ```
 
 ### Development wheels (pre-release)
 
-Every successful build from the `develop` or `nightly` branches publishes a wheel to the
-private v2 index.
+CI publishes development wheels on successful `develop` and `nightly` builds.
 
 ```bash
-pip install --index-url https://packages.nautechsystems.io/v2/simple/ --pre nautilus-trader
+uv pip install --pre --index-url=https://packages.nautechsystems.io/simple/ nautilus-trader
 ```
 
-| Platform         | Python  | Develop | Nightly |
-| :--------------- | :------ | :------ | :------ |
-| `Linux (x86_64)` | 3.12-14 | ✓       | ✓       |
-| `macOS (ARM64)`  | 3.12-14 | ✓       | ✓       |
+| Platform           | Python    | Develop | Nightly |
+| :----------------- | :-------- | :------ | :------ |
+| `Linux (x86_64)`   | 3.13-3.14 | ✓       | ✓       |
+| `Linux (ARM64)`    | 3.13-3.14 | -       | ✓       |
+| `macOS (ARM64)`    | 3.13-3.14 | -       | ✓       |
+| `Windows (x86_64)` | 3.13-3.14 | -       | ✓       |
 
-The `--pre` flag is required because wheels are tagged as development releases.
+The nightly merge builds and tests wheels on every listed platform.
 
-## Python type stubs
+The `--pre` flag is required because wheels are tagged as pre-release builds. Run this command
+outside the NautilusTrader source checkout so the repository's `exclude-newer` uv policy does not
+filter out newly published wheels. The installed package imports as `nautilus_trader`.
+
+Build from source inside a checkout, when a wheel is not available for your platform, or when you
+need local Rust changes:
+
+```bash
+make build-debug
+```
+
+## Testing
+
+Tests live in `tests/` and require a built extension module.
+
+```bash
+make build-debug  # Build first
+make pytest       # Run tests
+```
+
+Use pytest-style free functions and fixtures. Do not use test classes.
+Importable test fixtures (actors, strategies, algorithms) live in `tests/unit/common/actor.py`.
+
+## Type stubs
 
 Type stubs (`.pyi` files) are auto-generated using
 [`pyo3-stub-gen`](https://github.com/Jij-Inc/pyo3-stub-gen). To regenerate after modifying
 Rust bindings:
 
 ```bash
-python generate_stubs.py
+make py-stubs
 ```
 
-This first runs `generate_docstrings.py` to copy doc comments from the underlying Rust source
-to PyO3 wrapper functions, then generates the `.pyi` stub files.
-
-> [!NOTE]
-> Stub generation is a work in progress and may not cover all exported types yet.
+This runs `generate_docstrings.py` first to copy doc comments from Rust source to PyO3
+wrappers, then generates the `.pyi` stub files.

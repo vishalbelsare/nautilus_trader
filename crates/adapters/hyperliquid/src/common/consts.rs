@@ -15,12 +15,24 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use nautilus_model::{enums::OrderType, identifiers::Venue};
+use nautilus_model::{
+    enums::OrderType,
+    identifiers::{ClientId, Venue},
+};
 use ustr::Ustr;
 
+use super::enums::HyperliquidEnvironment;
+
+/// Venue identifier string.
 pub const HYPERLIQUID: &str = "HYPERLIQUID";
+
+/// Static venue instance.
 pub static HYPERLIQUID_VENUE: LazyLock<Venue> =
     LazyLock::new(|| Venue::new(Ustr::from(HYPERLIQUID)));
+
+/// Static client ID instance.
+pub static HYPERLIQUID_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(HYPERLIQUID)));
 
 pub const HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -30,26 +42,50 @@ pub const HYPERLIQUID_TESTNET_WS_URL: &str = "wss://api.hyperliquid-testnet.xyz/
 pub const HYPERLIQUID_TESTNET_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
 pub const HYPERLIQUID_TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-testnet.xyz/exchange";
 
+pub(crate) const HYPERLIQUID_REST_WEIGHT_PER_MINUTE: u32 = 1_200;
+pub(crate) const HYPERLIQUID_WS_MESSAGES_PER_MINUTE: u32 = 2_000;
+pub(crate) const HYPERLIQUID_WS_CONNECTIONS_MAX: usize = 10;
+pub(crate) const HYPERLIQUID_WS_CONNECTIONS_PER_MINUTE: u32 = 30;
+pub(crate) const HYPERLIQUID_WS_SUBSCRIPTIONS_MAX: usize = 1_000;
+pub(crate) const HYPERLIQUID_WS_SUBSCRIPTION_USERS_MAX: usize = 10;
+pub(crate) const HYPERLIQUID_WS_POST_INFLIGHT_MAX: usize = 100;
+pub const INFLIGHT_MAX: usize = HYPERLIQUID_WS_POST_INFLIGHT_MAX;
+
 // Builder code address for order attribution (zero-fee)
 // Address MUST be lowercase for msgpack serialization
 pub const NAUTILUS_BUILDER_ADDRESS: &str = "0x0c8d970c462726e014ad36f6c5a63e99db48a8e7";
 
+/// Public docs anchor for builder fee approval.
+pub const HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL: &str =
+    "https://nautilustrader.io/docs/nightly/integrations/hyperliquid/#builder-fee-approval";
+
 /// Hyperliquid signing chain ID (0x66eee = 421614 decimal).
 pub const HYPERLIQUID_CHAIN_ID: u64 = 421614;
+
+/// Key carrying the venue asset index on an instrument's `info` map.
+///
+/// Order signing needs the numeric asset index, and `InstrumentAny` is the only
+/// shape published on the message bus, so the index travels with the instrument.
+pub const ASSET_INDEX_INFO_KEY: &str = "asset_index";
 
 // Error message substrings for detecting specific rejection reasons
 pub const HYPERLIQUID_POST_ONLY_WOULD_MATCH: &str =
     "Post only order would have immediately matched";
+pub const HYPERLIQUID_BUILDER_FEE_NOT_APPROVED: &str = "Builder fee has not been approved";
 
 /// Hyperliquid supported order types.
 ///
 /// # Notes
 ///
 /// - All order types support trigger prices except Market and Limit.
-/// - Conditional orders follow patterns from OKX, Bybit, and BitMEX adapters.
 /// - Stop orders (StopMarket/StopLimit) are protective stops (sl).
 /// - If Touched orders (MarketIfTouched/LimitIfTouched) are profit-taking or entry orders (tp).
 /// - Post-only orders are implemented via ALO (Add Liquidity Only) time-in-force.
+///
+/// Trailing stops (TrailingStopMarket/TrailingStopLimit) are supported by the exchange
+/// and can be parsed from incoming WS messages, but the outgoing request model does not
+/// yet serialize the trailing offset parameters. Add them once HyperliquidExchangeTriggerParams
+/// is extended with trailing offset fields.
 pub const HYPERLIQUID_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
     OrderType::Market,          // IOC limit order
     OrderType::Limit,           // Standard limit with GTC/IOC/ALO
@@ -62,7 +98,7 @@ pub const HYPERLIQUID_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
 /// Conditional order types that use trigger orders on Hyperliquid.
 ///
 /// These order types require a trigger_price and are implemented using
-/// HyperliquidExecOrderKind::Trigger with appropriate parameters.
+/// HyperliquidExchangeOrderKind::Trigger with appropriate parameters.
 pub const HYPERLIQUID_CONDITIONAL_ORDER_TYPES: &[OrderType] = &[
     OrderType::StopMarket,
     OrderType::StopLimit,
@@ -70,30 +106,27 @@ pub const HYPERLIQUID_CONDITIONAL_ORDER_TYPES: &[OrderType] = &[
     OrderType::LimitIfTouched,
 ];
 
-/// Gets WebSocket URL for the specified network.
-pub fn ws_url(is_testnet: bool) -> &'static str {
-    if is_testnet {
-        HYPERLIQUID_TESTNET_WS_URL
-    } else {
-        HYPERLIQUID_WS_URL
+/// Gets WebSocket URL for the specified environment.
+pub fn ws_url(environment: HyperliquidEnvironment) -> &'static str {
+    match environment {
+        HyperliquidEnvironment::Testnet => HYPERLIQUID_TESTNET_WS_URL,
+        HyperliquidEnvironment::Mainnet => HYPERLIQUID_WS_URL,
     }
 }
 
-/// Gets info API URL for the specified network.
-pub fn info_url(is_testnet: bool) -> &'static str {
-    if is_testnet {
-        HYPERLIQUID_TESTNET_INFO_URL
-    } else {
-        HYPERLIQUID_INFO_URL
+/// Gets info API URL for the specified environment.
+pub fn info_url(environment: HyperliquidEnvironment) -> &'static str {
+    match environment {
+        HyperliquidEnvironment::Testnet => HYPERLIQUID_TESTNET_INFO_URL,
+        HyperliquidEnvironment::Mainnet => HYPERLIQUID_INFO_URL,
     }
 }
 
-/// Gets exchange API URL for the specified network.
-pub fn exchange_url(is_testnet: bool) -> &'static str {
-    if is_testnet {
-        HYPERLIQUID_TESTNET_EXCHANGE_URL
-    } else {
-        HYPERLIQUID_EXCHANGE_URL
+/// Gets exchange API URL for the specified environment.
+pub fn exchange_url(environment: HyperliquidEnvironment) -> &'static str {
+    match environment {
+        HyperliquidEnvironment::Testnet => HYPERLIQUID_TESTNET_EXCHANGE_URL,
+        HyperliquidEnvironment::Mainnet => HYPERLIQUID_EXCHANGE_URL,
     }
 }
 
@@ -103,8 +136,6 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 pub const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(250);
 pub const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-// Max 100 inflight WS post messages per Hyperliquid docs
-pub const INFLIGHT_MAX: usize = 100;
 pub const QUEUE_MAX: usize = 1000;
 
 #[cfg(test)]
@@ -115,20 +146,35 @@ mod tests {
 
     #[rstest]
     fn test_ws_url() {
-        assert_eq!(ws_url(false), HYPERLIQUID_WS_URL);
-        assert_eq!(ws_url(true), HYPERLIQUID_TESTNET_WS_URL);
+        assert_eq!(ws_url(HyperliquidEnvironment::Mainnet), HYPERLIQUID_WS_URL);
+        assert_eq!(
+            ws_url(HyperliquidEnvironment::Testnet),
+            HYPERLIQUID_TESTNET_WS_URL
+        );
     }
 
     #[rstest]
     fn test_info_url() {
-        assert_eq!(info_url(false), HYPERLIQUID_INFO_URL);
-        assert_eq!(info_url(true), HYPERLIQUID_TESTNET_INFO_URL);
+        assert_eq!(
+            info_url(HyperliquidEnvironment::Mainnet),
+            HYPERLIQUID_INFO_URL
+        );
+        assert_eq!(
+            info_url(HyperliquidEnvironment::Testnet),
+            HYPERLIQUID_TESTNET_INFO_URL
+        );
     }
 
     #[rstest]
     fn test_exchange_url() {
-        assert_eq!(exchange_url(false), HYPERLIQUID_EXCHANGE_URL);
-        assert_eq!(exchange_url(true), HYPERLIQUID_TESTNET_EXCHANGE_URL);
+        assert_eq!(
+            exchange_url(HyperliquidEnvironment::Mainnet),
+            HYPERLIQUID_EXCHANGE_URL
+        );
+        assert_eq!(
+            exchange_url(HyperliquidEnvironment::Testnet),
+            HYPERLIQUID_TESTNET_EXCHANGE_URL
+        );
     }
 
     #[rstest]
@@ -137,7 +183,14 @@ mod tests {
         assert_eq!(RECONNECT_BASE_BACKOFF, Duration::from_millis(250));
         assert_eq!(RECONNECT_MAX_BACKOFF, Duration::from_secs(30));
         assert_eq!(HTTP_TIMEOUT, Duration::from_secs(10));
-        assert_eq!(INFLIGHT_MAX, 100);
+        assert_eq!(HYPERLIQUID_REST_WEIGHT_PER_MINUTE, 1_200);
+        assert_eq!(HYPERLIQUID_WS_MESSAGES_PER_MINUTE, 2_000);
+        assert_eq!(HYPERLIQUID_WS_CONNECTIONS_MAX, 10);
+        assert_eq!(HYPERLIQUID_WS_CONNECTIONS_PER_MINUTE, 30);
+        assert_eq!(HYPERLIQUID_WS_SUBSCRIPTIONS_MAX, 1_000);
+        assert_eq!(HYPERLIQUID_WS_SUBSCRIPTION_USERS_MAX, 10);
+        assert_eq!(HYPERLIQUID_WS_POST_INFLIGHT_MAX, 100);
+        assert_eq!(INFLIGHT_MAX, HYPERLIQUID_WS_POST_INFLIGHT_MAX);
         assert_eq!(QUEUE_MAX, 1000);
     }
 }

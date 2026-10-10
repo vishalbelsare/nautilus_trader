@@ -24,17 +24,22 @@
 //! See [dYdX order types](https://docs.dydx.xyz/concepts/trading/orders).
 
 #[cfg(test)]
-use chrono::Duration;
-use chrono::{DateTime, Utc};
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use nautilus_model::enums::OrderType;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
-use crate::proto::dydxprotocol::{
-    clob::{
-        Order, OrderId,
-        order::{ConditionType, GoodTilOneof, Side as OrderSide, TimeInForce as OrderTimeInForce},
+use crate::{
+    common::consts::DYDX_NAUTILUS_ORDER_ROUTER_ADDRESS,
+    proto::dydxprotocol::{
+        clob::{
+            Order, OrderId,
+            order::{
+                ConditionType, GoodTilOneof, Side as OrderSide, TimeInForce as OrderTimeInForce,
+            },
+        },
+        subaccounts::SubaccountId,
     },
-    subaccounts::SubaccountId,
 };
 
 /// Maximum short-term order lifetime in blocks.
@@ -60,7 +65,7 @@ pub enum OrderGoodUntil {
     Block(u32),
     /// Time expiration is used for long-term orders.
     /// The order expires at the specified timestamp.
-    Time(DateTime<Utc>),
+    Time(Timestamp),
 }
 
 /// Order flags indicating order lifetime and execution type.
@@ -191,7 +196,7 @@ impl OrderMarketParams {
 /// Two main classes of orders in dYdX from persistence perspective are
 /// [short-term and long-term (stateful) orders](https://docs.dydx.xyz/concepts/trading/orders#short-term-vs-long-term).
 ///
-/// For different types of orders see also [Stop-Limit Versus Stop-Loss](https://dydx.exchange/crypto-learning/stop-limit-versus-stop-loss)
+/// For different types of orders see also [Stop-Limit Versus Stop-Loss](https://www.dydx.xyz/crypto-learning/stop-limit-versus-stop-loss)
 /// and [dYdX order types](https://docs.dydx.xyz/concepts/trading/orders).
 #[derive(Clone, Debug)]
 pub struct OrderBuilder {
@@ -443,7 +448,7 @@ impl OrderBuilder {
         let good_til_oneof = match until {
             OrderGoodUntil::Block(height) => Some(GoodTilOneof::GoodTilBlock(height)),
             OrderGoodUntil::Time(time) => {
-                Some(GoodTilOneof::GoodTilBlockTime(time.timestamp().try_into()?))
+                Some(GoodTilOneof::GoodTilBlockTime(time.as_second().try_into()?))
             }
         };
 
@@ -479,7 +484,7 @@ impl OrderBuilder {
                 .unwrap_or(0),
             twap_parameters: None,
             builder_code_parameters: None,
-            order_router_address: String::new(),
+            order_router_address: DYDX_NAUTILUS_ORDER_ROUTER_ADDRESS.to_string(),
         })
     }
 }
@@ -797,8 +802,8 @@ mod tests {
             DEFAULT_RUST_CLIENT_METADATA,
         );
 
-        let now = Utc::now();
-        let until = now + Duration::hours(1);
+        let now = Timestamp::now();
+        let until = now + SignedDuration::from_hours(1);
 
         let order = builder
             .long_term()

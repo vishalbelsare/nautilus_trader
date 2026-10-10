@@ -17,15 +17,20 @@
 
 use std::fmt::{Debug, Display};
 
-use nautilus_core::correctness::{FAILED, check_string_contains, check_valid_string_ascii};
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_predicate_false, check_string_contains,
+    check_valid_string_ascii,
+};
 use ustr::Ustr;
+
+const EXTERNAL_TRADER_ID: &str = "EXTERNAL-0";
 
 /// Represents a valid trader ID.
 #[repr(C)]
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -55,20 +60,20 @@ impl TraderId {
     /// # Notes
     ///
     /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
-    pub fn new_checked<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
+    pub fn new_checked<T: AsRef<str>>(value: T) -> CorrectnessResult<Self> {
         let value = value.as_ref();
         check_valid_string_ascii(value, stringify!(value))?;
         check_string_contains(value, "-", stringify!(value))?;
 
         if let Some((name, tag)) = value.rsplit_once('-') {
-            anyhow::ensure!(
-                !name.is_empty(),
-                "`value` name part (before '-') cannot be empty"
-            );
-            anyhow::ensure!(
-                !tag.is_empty(),
-                "`value` tag part (after '-') cannot be empty"
-            );
+            check_predicate_false(
+                name.is_empty(),
+                "`value` name part (before '-') cannot be empty",
+            )?;
+            check_predicate_false(
+                tag.is_empty(),
+                "`value` tag part (after '-') cannot be empty",
+            )?;
         }
 
         Ok(Self(Ustr::from(value)))
@@ -80,7 +85,7 @@ impl TraderId {
     ///
     /// Panics if `value` is not a valid string, or does not contain a hyphen '-' separator.
     pub fn new<T: AsRef<str>>(value: T) -> Self {
-        Self::new_checked(value).expect(FAILED)
+        Self::new_checked(value).expect_display(FAILED)
     }
 
     /// Sets the inner identifier value.
@@ -114,13 +119,13 @@ impl TraderId {
     /// Creates an external trader ID used for orders from external sources.
     #[must_use]
     pub fn external() -> Self {
-        Self::new("EXTERNAL-0")
+        Self::new(EXTERNAL_TRADER_ID)
     }
 
     /// Returns whether this trader ID is external.
     #[must_use]
     pub fn is_external(&self) -> bool {
-        self.0.as_str() == "EXTERNAL-0"
+        self.0 == EXTERNAL_TRADER_ID
     }
 }
 
@@ -145,6 +150,7 @@ impl Display for TraderId {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::correctness::CorrectnessError;
     use rstest::rstest;
 
     use crate::identifiers::{stubs::*, trader_id::TraderId};
@@ -161,6 +167,16 @@ mod tests {
     }
 
     #[rstest]
+    fn test_external() {
+        let external = TraderId::external();
+        let local = TraderId::new("TRADER-001");
+
+        assert_eq!(external.as_str(), "EXTERNAL-0");
+        assert!(external.is_external());
+        assert!(!local.is_external());
+    }
+
+    #[rstest]
     #[should_panic(expected = "name part (before '-') cannot be empty")]
     fn test_new_with_empty_name_panics() {
         let _ = TraderId::new("-001");
@@ -173,12 +189,38 @@ mod tests {
     }
 
     #[rstest]
-    fn test_new_checked_with_empty_name_returns_error() {
-        assert!(TraderId::new_checked("-001").is_err());
+    fn test_new_checked_without_separator_returns_typed_error() {
+        let error = TraderId::new_checked("TRADER001").unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::MissingSubstring {
+                param: "value".to_string(),
+                pattern: "-".to_string(),
+                value: "TRADER001".to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "invalid string for 'value' did not contain '-', was 'TRADER001'"
+        );
     }
 
     #[rstest]
-    fn test_new_checked_with_empty_tag_returns_error() {
-        assert!(TraderId::new_checked("TRADER-").is_err());
+    #[case("-001", "`value` name part (before '-') cannot be empty")]
+    #[case("TRADER-", "`value` tag part (after '-') cannot be empty")]
+    fn test_new_checked_with_empty_component_returns_typed_error(
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        let error = TraderId::new_checked(value).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: expected.to_string(),
+            }
+        );
+        assert_eq!(error.to_string(), expected);
     }
 }

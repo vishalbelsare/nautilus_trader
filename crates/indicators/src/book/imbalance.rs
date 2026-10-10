@@ -23,7 +23,11 @@ use crate::indicator::Indicator;
 #[derive(Debug, Default)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+    pyo3::pyclass(module = "nautilus_trader.indicators")
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
 )]
 pub struct BookImbalanceRatio {
     pub value: f64,

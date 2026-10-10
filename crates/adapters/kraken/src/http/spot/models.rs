@@ -15,13 +15,24 @@
 
 //! Data models for Kraken Spot HTTP API responses.
 
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
-use ustr::Ustr;
+use std::fmt::Debug;
 
-use crate::common::enums::{
-    KrakenAssetClass, KrakenOrderSide, KrakenOrderStatus, KrakenOrderType, KrakenPairStatus,
-    KrakenSpotTrigger, KrakenSystemStatus,
+use indexmap::IndexMap;
+use nautilus_core::string::secret::SecretString;
+use rust_decimal::Decimal;
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, SeqAccess, Visitor},
+};
+use ustr::Ustr;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::common::{
+    enums::{
+        KrakenAssetClass, KrakenOrderSide, KrakenOrderStatus, KrakenOrderType, KrakenPairStatus,
+        KrakenSpotTrigger, KrakenSystemStatus,
+    },
+    serialization::{decimal, decimal_pairs},
 };
 
 /// Wrapper for Kraken API responses.
@@ -36,6 +47,120 @@ pub struct KrakenResponse<T> {
 /// Response from Kraken Balance endpoint.
 /// Maps currency codes (e.g., "USDT", "ETH") to their balance amounts as strings.
 pub type BalanceResponse = IndexMap<String, String>;
+
+/// A single per-asset entry from `POST /0/private/BalanceEx`.
+///
+/// Distinct from [`BalanceResponse`], which carries only the total wallet amount: this also
+/// reports the portion Kraken holds against resting orders, which maps to the `locked` component
+/// of [`nautilus_model::types::AccountBalance`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceExEntry {
+    /// Total balance amount for the asset.
+    pub balance: String,
+    /// Total held amount for the asset, reserved by the venue against resting orders.
+    pub hold_trade: String,
+    /// Total credit amount, present only for accounts with a credit line.
+    #[serde(default)]
+    pub credit: Option<String>,
+    /// Used credit amount, present only for accounts with a credit line.
+    #[serde(default)]
+    pub credit_used: Option<String>,
+}
+
+/// Response from `POST /0/private/BalanceEx`.
+/// Maps currency codes (e.g., "ZUSD", "XXBT") to their total and held amounts.
+pub type BalanceExResponse = IndexMap<String, BalanceExEntry>;
+
+/// Response from `POST /0/private/TradeBalance` (margin accounts only).
+///
+/// Distinct from [`BalanceResponse`]: wallet balances give currency amounts held; this gives
+/// margin accounting metrics (equity, used margin, free margin) denominated in a single asset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeBalanceResponse {
+    pub eb: String, // equivalent balance (all currencies combined)
+    pub tb: String, // trade balance (equity currency collateral)
+    pub m: String,  // margin amount of open positions (used margin)
+    pub uv: String, // unexecuted value of partly filled orders/positions
+    pub n: String,  // unrealized net profit/loss of open positions
+    pub c: String,  // cost basis of open positions
+    pub v: String,  // current floating valuation of open positions
+    pub e: String,  // equity = eb + n
+    pub mf: String, // free margin = e - m
+    #[serde(default)]
+    pub ml: Option<String>, // margin level % (absent when no positions are open)
+}
+
+/// A single open spot margin position from `POST /0/private/OpenPositions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpotOpenPosition {
+    pub ordertxid: String,
+    pub pair: String,
+    pub time: f64,
+    #[serde(rename = "type")]
+    pub side: KrakenOrderSide,
+    pub ordertype: KrakenOrderType,
+    pub cost: String,
+    pub fee: String,
+    pub vol: String,
+    pub vol_closed: String,
+    pub margin: String,
+    #[serde(default)]
+    pub posstatus: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>, // present when docalcs=true
+    #[serde(default)]
+    pub net: Option<String>, // present when docalcs=true
+    #[serde(default)]
+    pub terms: Option<String>,
+    #[serde(default)]
+    pub rollovertm: Option<String>,
+    #[serde(default)]
+    pub misc: Option<String>,
+    #[serde(default)]
+    pub oflags: Option<String>,
+}
+
+/// Response from `POST /0/private/OpenPositions`: maps position ID to position data.
+///
+/// Kraken returns `[]` (empty array) when there are no open positions, and a JSON object
+/// (map) when positions exist. The custom deserializer handles both forms.
+#[derive(Debug, Clone, Default)]
+pub struct SpotOpenPositionsResponse(IndexMap<String, SpotOpenPosition>);
+
+impl std::ops::Deref for SpotOpenPositionsResponse {
+    type Target = IndexMap<String, SpotOpenPosition>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SpotOpenPositionsResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = SpotOpenPositionsResponse;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a map of open positions or an empty array")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = IndexMap::new();
+                while let Some((k, v)) = map.next_entry::<String, SpotOpenPosition>()? {
+                    out.insert(k, v);
+                }
+                Ok(SpotOpenPositionsResponse(out))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "OpenPositions: expected empty array or object map, received non-empty array",
+                    ));
+                }
+                Ok(SpotOpenPositionsResponse(IndexMap::new()))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
 
 // Asset Pairs (Instruments) Models
 
@@ -55,10 +180,10 @@ pub struct AssetPairInfo {
     pub leverage_buy: Vec<i32>,
     #[serde(default)]
     pub leverage_sell: Vec<i32>,
-    #[serde(default)]
-    pub fees: Vec<(i32, f64)>,
-    #[serde(default)]
-    pub fees_maker: Vec<(i32, f64)>,
+    #[serde(default, with = "decimal_pairs")]
+    pub fees: Vec<(i32, Decimal)>,
+    #[serde(default, with = "decimal_pairs")]
+    pub fees_maker: Vec<(i32, Decimal)>,
     pub fee_volume_currency: Option<Ustr>,
     pub margin_call: Option<i32>,
     pub margin_stop: Option<i32>,
@@ -73,6 +198,27 @@ pub struct AssetPairInfo {
 }
 
 pub type AssetPairsResponse = IndexMap<String, AssetPairInfo>;
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "TradeVolume response retained for account fee-rate follow-up"
+)]
+pub(crate) struct SpotTradeVolumeFee {
+    #[serde(with = "decimal")]
+    pub fee: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "TradeVolume response retained for account fee-rate follow-up"
+)]
+pub(crate) struct SpotTradeVolumeResponse {
+    pub fees: IndexMap<String, SpotTradeVolumeFee>,
+    #[serde(default)]
+    pub fees_maker: IndexMap<String, SpotTradeVolumeFee>,
+}
 
 // Ticker Models
 
@@ -177,10 +323,18 @@ pub struct ServerTime {
 
 // WebSocket Token Models
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct WebSocketToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires: i32,
+}
+
+impl WebSocketToken {
+    /// Consumes the response and returns the WebSocket token.
+    #[must_use]
+    pub fn into_token(mut self) -> SecretString {
+        std::mem::take(&mut self.token)
+    }
 }
 
 // Spot Private Trading Models
@@ -310,6 +464,22 @@ pub struct SpotAddOrderResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpotBatchOrderResponse {
+    #[serde(default)]
+    pub descr: Option<AddOrderDescription>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub txid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpotAddOrderBatchResponse {
+    #[serde(default)]
+    pub orders: Vec<SpotBatchOrderResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpotCancelOrderResponse {
     pub count: i32,
     #[serde(default)]
@@ -350,10 +520,29 @@ mod tests {
 
     use super::*;
 
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
     fn load_test_data(filename: &str) -> String {
         let path = format!("test_data/{filename}");
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load test data from {path}: {e}"))
+    }
+
+    #[rstest]
+    fn test_websocket_token_zeroizes_on_drop() {
+        assert_zeroize_on_drop::<WebSocketToken>();
+
+        let token = WebSocketToken {
+            token: SecretString::from("websocket-token-value"),
+            expires: 900,
+        };
+        let formatted = format!("{token:?}");
+
+        assert_eq!(
+            formatted,
+            "WebSocketToken { token: <redacted>, expires: 900 }"
+        );
+        assert!(!formatted.contains(token.token.expose_secret()));
     }
 
     #[rstest]
@@ -390,9 +579,9 @@ mod tests {
         assert!(!result.is_empty());
 
         let pair = result.get("XBTUSDT").expect("XBTUSDT pair not found");
-        assert_eq!(pair.altname.as_str(), "XBTUSDT");
-        assert_eq!(pair.base.as_str(), "XXBT");
-        assert_eq!(pair.quote.as_str(), "USDT");
+        assert_eq!(pair.altname, "XBTUSDT");
+        assert_eq!(pair.base, "XXBT");
+        assert_eq!(pair.quote, "USDT");
         assert!(pair.wsname.is_some());
     }
 
@@ -446,5 +635,28 @@ mod tests {
         assert!(response.error.is_empty());
         let result = response.result.expect("Missing result");
         assert!(!result.data.is_empty());
+    }
+
+    #[rstest]
+    fn test_open_positions_empty_array() {
+        let result: SpotOpenPositionsResponse = serde_json::from_str("[]").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[rstest]
+    fn test_open_positions_empty_object() {
+        let result: SpotOpenPositionsResponse = serde_json::from_str("{}").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[rstest]
+    fn test_open_positions_non_empty_array_errors() {
+        let err =
+            serde_json::from_str::<SpotOpenPositionsResponse>(r#"[{"posid": "123"}]"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("OpenPositions: expected empty array or object map"),
+            "unexpected error: {err}"
+        );
     }
 }

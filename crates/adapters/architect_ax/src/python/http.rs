@@ -15,8 +15,11 @@
 
 //! Python bindings for the Ax HTTP client.
 
-use chrono::{DateTime, Utc};
-use nautilus_core::{datetime::datetime_to_unix_nanos, python::to_pyvalue_err};
+use ahash::AHashMap;
+use jiff::Timestamp;
+use nautilus_core::{
+    datetime::datetime_to_unix_nanos, python::to_pyvalue_err, string::secret::SecretString,
+};
 use nautilus_model::{
     data::BarType,
     enums::{OrderSide, OrderType, TimeInForce},
@@ -25,36 +28,39 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
-use rust_decimal::Decimal;
 
 use crate::{
     common::{
         enums::{AxCandleWidth, AxOrderSide},
-        parse::quantity_to_contracts,
+        parse::{client_order_id_to_cid, quantity_to_contracts},
     },
     http::{client::AxHttpClient, error::AxHttpError, models::PreviewAggressiveLimitOrderRequest},
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl AxHttpClient {
+    /// High-level HTTP client for the Ax REST API.
+    ///
+    /// This client wraps the underlying `AxRawHttpClient` to provide a convenient
+    /// interface for Python bindings and instrument caching.
     #[new]
     #[pyo3(signature = (
         base_url=None,
         orders_base_url=None,
-        timeout_secs=None,
-        max_retries=None,
-        retry_delay_ms=None,
-        retry_delay_max_ms=None,
+        timeout_secs=60,
+        max_retries=3,
+        retry_delay_ms=1000,
+        retry_delay_max_ms=10_000,
         proxy_url=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn py_new(
         base_url: Option<String>,
         orders_base_url: Option<String>,
-        timeout_secs: Option<u64>,
-        max_retries: Option<u32>,
-        retry_delay_ms: Option<u64>,
-        retry_delay_max_ms: Option<u64>,
+        timeout_secs: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        retry_delay_max_ms: u64,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
         Self::new(
@@ -69,6 +75,11 @@ impl AxHttpClient {
         .map_err(to_pyvalue_err)
     }
 
+    /// Creates a new `AxHttpClient` configured with credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
     #[staticmethod]
     #[pyo3(name = "with_credentials")]
     #[pyo3(signature = (
@@ -76,22 +87,22 @@ impl AxHttpClient {
         api_secret,
         base_url=None,
         orders_base_url=None,
-        timeout_secs=None,
-        max_retries=None,
-        retry_delay_ms=None,
-        retry_delay_max_ms=None,
+        timeout_secs=60,
+        max_retries=3,
+        retry_delay_ms=1000,
+        retry_delay_max_ms=10_000,
         proxy_url=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_with_credentials(
         api_key: String,
         api_secret: String,
         base_url: Option<String>,
         orders_base_url: Option<String>,
-        timeout_secs: Option<u64>,
-        max_retries: Option<u32>,
-        retry_delay_ms: Option<u64>,
-        retry_delay_max_ms: Option<u64>,
+        timeout_secs: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        retry_delay_max_ms: u64,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
         Self::with_credentials(
@@ -108,6 +119,7 @@ impl AxHttpClient {
         .map_err(to_pyvalue_err)
     }
 
+    /// Returns the base URL for this client.
     #[getter]
     #[pyo3(name = "base_url")]
     #[must_use]
@@ -115,6 +127,7 @@ impl AxHttpClient {
         self.base_url()
     }
 
+    /// Returns a masked version of the API key for logging purposes.
     #[getter]
     #[pyo3(name = "api_key_masked")]
     #[must_use]
@@ -122,20 +135,48 @@ impl AxHttpClient {
         self.api_key_masked()
     }
 
+    /// Cancel all pending HTTP requests.
     #[pyo3(name = "cancel_all_requests")]
     pub fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
     }
 
+    /// Cancels all open orders for an instrument.
+    ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if the instrument cannot be converted from Python.
+    /// Returns an error if the request fails.
+    #[pyo3(name = "cancel_all_orders")]
+    pub fn py_cancel_all_orders<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .cancel_all_orders(instrument_id)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Caches a single instrument.
+    ///
+    /// Any existing instrument with the same symbol will be replaced.
     #[pyo3(name = "cache_instrument")]
     pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.cache_instrument(pyobject_to_instrument_any(py, instrument)?);
         Ok(())
     }
 
+    /// Authenticates with Ax using API credentials.
+    ///
+    /// On success, the session token is automatically stored for subsequent authenticated requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or credentials are invalid.
     #[pyo3(name = "authenticate")]
     #[pyo3(signature = (api_key, api_secret, expiration_seconds=86400))]
     fn py_authenticate<'py>(
@@ -151,10 +192,27 @@ impl AxHttpClient {
             client
                 .authenticate(&api_key, &api_secret, expiration_seconds)
                 .await
+                .map(SecretString::into_inner)
                 .map_err(to_pyvalue_err)
         })
     }
 
+    /// Authenticates using stored credentials or environment variables.
+    ///
+    /// # Credential Resolution
+    ///
+    /// Credentials are resolved in the following order:
+    /// 1. Stored credentials (from `with_credentials` constructor)
+    /// 2. Environment variables (`AX_API_KEY` and `AX_API_SECRET`)
+    ///
+    /// On success, the session token is automatically stored for subsequent authenticated requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No credentials are available from either source
+    /// - The HTTP request fails
+    /// - The credentials are invalid
     #[pyo3(name = "authenticate_auto")]
     #[pyo3(signature = (expiration_seconds=86400))]
     fn py_authenticate_auto<'py>(
@@ -168,25 +226,22 @@ impl AxHttpClient {
             client
                 .authenticate_auto(expiration_seconds)
                 .await
+                .map(SecretString::into_inner)
                 .map_err(to_pyvalue_err)
         })
     }
 
+    /// Requests all instruments from Ax.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or instrument parsing fails.
     #[pyo3(name = "request_instruments")]
-    #[pyo3(signature = (maker_fee=None, taker_fee=None))]
-    fn py_request_instruments<'py>(
-        &self,
-        py: Python<'py>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn py_request_instruments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let instruments = client
-                .request_instruments(maker_fee, taker_fee)
-                .await
-                .map_err(to_pyvalue_err)?;
+            let instruments = client.request_instruments().await.map_err(to_pyvalue_err)?;
 
             Python::attach(|py| {
                 let py_instruments: PyResult<Vec<_>> = instruments
@@ -199,6 +254,19 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests recent trades from Ax and parses them to Nautilus `TradeTick`.
+    ///
+    /// The AX trades endpoint does not accept time range parameters, so
+    /// `start` and `end` are applied as client-side filters after fetching.
+    ///
+    /// Requires the instrument to be cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    /// - Trade parsing fails.
     #[pyo3(name = "request_trade_ticks")]
     #[pyo3(signature = (instrument_id, limit=None, start=None, end=None))]
     fn py_request_trade_ticks<'py>(
@@ -206,8 +274,8 @@ impl AxHttpClient {
         py: Python<'py>,
         instrument_id: InstrumentId,
         limit: Option<i32>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let symbol = instrument_id.symbol.inner();
@@ -231,14 +299,24 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests historical bars from Ax and parses them to Nautilus Bar types.
+    ///
+    /// Requires the instrument to be cached (call `request_instruments` first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    /// - Bar parsing fails.
     #[pyo3(name = "request_bars")]
     #[pyo3(signature = (bar_type, start=None, end=None))]
     fn py_request_bars<'py>(
         &self,
         py: Python<'py>,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let symbol = bar_type.instrument_id().symbol.inner();
@@ -259,14 +337,52 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests an order book snapshot from Ax and builds a Nautilus `OrderBook`.
+    ///
+    /// Requires the instrument to be cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    #[pyo3(name = "request_book_snapshot")]
+    #[pyo3(signature = (instrument_id, depth=None))]
+    fn py_request_book_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        depth: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let symbol = instrument_id.symbol.inner();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let book = client
+                .request_book_snapshot(symbol, depth.map(|value| value as usize))
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| book.into_py_any(py))
+        })
+    }
+
+    /// Requests funding rates from Ax and parses them to Nautilus types.
+    ///
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     #[pyo3(name = "request_funding_rates")]
     #[pyo3(signature = (instrument_id, start=None, end=None))]
     fn py_request_funding_rates<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -287,6 +403,11 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests account state from Ax and parses to a Nautilus `AccountState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(
         &self,
@@ -305,6 +426,20 @@ impl AxHttpClient {
         })
     }
 
+    /// Queries a single order by venue order ID or client order ID using the
+    /// dedicated `/order-status` endpoint, which works for any order state.
+    ///
+    /// The caller must supply `order_side`, `order_type`, and `time_in_force`
+    /// because the endpoint does not return these fields.
+    /// Canceled, expired, and rejected orders with no remaining quantity use `/orders`
+    /// to recover their original quantity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Neither `venue_order_id` nor `client_order_id` is provided.
+    /// - The HTTP request fails.
+    /// - The original quantity is unavailable in order history.
     #[pyo3(name = "request_order_status")]
     #[pyo3(signature = (
         account_id,
@@ -315,7 +450,7 @@ impl AxHttpClient {
         client_order_id=None,
         venue_order_id=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_order_status<'py>(
         &self,
         py: Python<'py>,
@@ -336,7 +471,7 @@ impl AxHttpClient {
                     instrument_id,
                     client_order_id,
                     venue_order_id,
-                    order_side,
+                    Some(order_side),
                     order_type,
                     time_in_force,
                 )
@@ -347,17 +482,37 @@ impl AxHttpClient {
         })
     }
 
-    #[pyo3(name = "request_order_status_reports")]
+    /// Requests open orders from Ax and parses them to Nautilus `OrderStatusReport`.
+    ///
+    /// Missing instruments are requested from Ax and cached before parsing order details.
+    ///
+    /// The `cid_resolver` parameter is an optional function that resolves a `cid` (u64)
+    /// to a `ClientOrderId`. This is needed for correlating orders submitted via WebSocket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - An order's instrument cannot be fetched or parsed.
+    /// - An order cannot be mapped to a complete status report.
+    #[pyo3(name = "request_order_status_reports", signature = (account_id, client_order_ids=None))]
     fn py_request_order_status_reports<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
+        client_order_ids: Option<Vec<ClientOrderId>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
+        let cid_map = client_order_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|client_order_id| (client_order_id_to_cid(&client_order_id), client_order_id))
+            .collect::<AHashMap<_, _>>();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cid_resolver = move |cid: u64| cid_map.get(&cid).copied();
             let reports = client
-                .request_order_status_reports(account_id, None::<fn(u64) -> Option<ClientOrderId>>)
+                .request_order_status_reports(account_id, Some(cid_resolver))
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -372,6 +527,18 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests fills from Ax and parses them to Nautilus `FillReport`.
+    ///
+    /// Missing instruments are requested from Ax and cached before parsing fill details.
+    /// Traverses the provider's cursor chain. This is a best-effort historical
+    /// read, not an atomic snapshot if AX corrects rows during the traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - A fill's instrument cannot be fetched or parsed.
+    /// - Fill parsing fails.
     #[pyo3(name = "request_fill_reports")]
     fn py_request_fill_reports<'py>(
         &self,
@@ -382,7 +549,7 @@ impl AxHttpClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let reports = client
-                .request_fill_reports(account_id)
+                .request_fill_reports(account_id, None, None)
                 .await
                 .map_err(to_pyvalue_err)?;
 
@@ -397,6 +564,19 @@ impl AxHttpClient {
         })
     }
 
+    /// Requests positions from Ax and parses them to Nautilus `PositionStatusReport`.
+    ///
+    /// Missing instruments are requested from Ax and cached before parsing position details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - A position's instrument cannot be fetched or parsed.
+    ///
+    /// # Notes
+    ///
+    /// Position parsing failures are skipped with a warning.
     #[pyo3(name = "request_position_reports")]
     fn py_request_position_reports<'py>(
         &self,
@@ -431,7 +611,7 @@ impl AxHttpClient {
         side: OrderSide,
     ) -> PyResult<Bound<'py, PyAny>> {
         let symbol = instrument_id.symbol.inner();
-        let ax_side = AxOrderSide::try_from(side).map_err(to_pyvalue_err)?;
+        let ax_side = AxOrderSide::from(side);
         let qty_contracts = quantity_to_contracts(quantity).map_err(to_pyvalue_err)?;
 
         let client = self.clone();

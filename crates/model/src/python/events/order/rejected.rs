@@ -30,8 +30,9 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderRejected {
     /// Represents an event where an order has been rejected by the trading venue.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
+    #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, account_id, reason, event_id, ts_event, ts_init, reconciliation, due_post_only=false))]
     fn py_new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -43,6 +44,7 @@ impl OrderRejected {
         ts_event: u64,
         ts_init: u64,
         reconciliation: bool,
+        due_post_only: bool,
     ) -> PyResult<Self> {
         let reason = Ustr::from_str(reason).map_err(to_pyvalue_err)?;
         Ok(Self::new(
@@ -56,7 +58,7 @@ impl OrderRejected {
             ts_event.into(),
             ts_init.into(),
             reconciliation,
-            false, // due_post_only defaults to false for Python constructor
+            due_post_only,
         ))
     }
 
@@ -74,6 +76,12 @@ impl OrderRejected {
 
     fn __str__(&self) -> String {
         self.to_string()
+    }
+
+    #[getter]
+    #[pyo3(name = "causation_id")]
+    fn py_causation_id(&self) -> Option<UUID4> {
+        self.causation_id
     }
 
     #[staticmethod]
@@ -115,7 +123,7 @@ impl OrderRejected {
     #[getter]
     #[pyo3(name = "reason")]
     fn py_reason(&self) -> String {
-        self.reason.as_str().to_string()
+        self.reason.to_string()
     }
 
     #[getter]
@@ -139,13 +147,13 @@ impl OrderRejected {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[getter]
     #[pyo3(name = "due_post_only")]
     fn py_due_post_only(&self) -> bool {
-        self.due_post_only != 0
+        self.due_post_only
     }
 
     #[pyo3(name = "to_dict")]
@@ -163,6 +171,10 @@ impl OrderRejected {
         dict.set_item("ts_init", self.ts_init.as_u64())?;
         dict.set_item("reconciliation", self.reconciliation)?;
         dict.set_item("due_post_only", self.due_post_only)?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

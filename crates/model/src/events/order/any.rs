@@ -23,15 +23,18 @@ use super::{OrderEvent, OrderEventType};
 use crate::{
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
-        OrderUpdated,
+        OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected,
+        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
+        OrderTriggered, OrderUpdated,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
 };
 
 /// Wraps an `OrderEvent` allowing polymorphism.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "lint fires only with high-precision feature"
+)]
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum OrderEventAny {
     Initialized(OrderInitialized),
@@ -50,6 +53,7 @@ pub enum OrderEventAny {
     CancelRejected(OrderCancelRejected),
     Updated(OrderUpdated),
     Filled(OrderFilled),
+    FillVoided(OrderFillVoided),
 }
 
 impl OrderEventAny {
@@ -72,6 +76,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => Box::new(event),
             Self::Updated(event) => Box::new(event),
             Self::Filled(event) => Box::new(event),
+            Self::FillVoided(event) => Box::new(event),
         }
     }
 
@@ -94,6 +99,7 @@ impl OrderEventAny {
             Self::CancelRejected(_) => OrderEventType::CancelRejected,
             Self::Updated(_) => OrderEventType::Updated,
             Self::Filled(_) => OrderEventType::Filled,
+            Self::FillVoided(_) => OrderEventType::FillVoided,
         }
     }
 
@@ -116,6 +122,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.trader_id,
             Self::Updated(event) => event.trader_id,
             Self::Filled(event) => event.trader_id,
+            Self::FillVoided(event) => event.trader_id,
         }
     }
 
@@ -138,7 +145,33 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.client_order_id,
             Self::Updated(event) => event.client_order_id,
             Self::Filled(event) => event.client_order_id,
+            Self::FillVoided(event) => event.client_order_id,
         }
+    }
+
+    #[must_use]
+    pub fn with_client_order_id(mut self, client_order_id: ClientOrderId) -> Self {
+        match &mut self {
+            Self::Initialized(event) => event.client_order_id = client_order_id,
+            Self::Denied(event) => event.client_order_id = client_order_id,
+            Self::Emulated(event) => event.client_order_id = client_order_id,
+            Self::Released(event) => event.client_order_id = client_order_id,
+            Self::Submitted(event) => event.client_order_id = client_order_id,
+            Self::Accepted(event) => event.client_order_id = client_order_id,
+            Self::Rejected(event) => event.client_order_id = client_order_id,
+            Self::Canceled(event) => event.client_order_id = client_order_id,
+            Self::Expired(event) => event.client_order_id = client_order_id,
+            Self::Triggered(event) => event.client_order_id = client_order_id,
+            Self::PendingUpdate(event) => event.client_order_id = client_order_id,
+            Self::PendingCancel(event) => event.client_order_id = client_order_id,
+            Self::ModifyRejected(event) => event.client_order_id = client_order_id,
+            Self::CancelRejected(event) => event.client_order_id = client_order_id,
+            Self::Updated(event) => event.client_order_id = client_order_id,
+            Self::Filled(event) => event.client_order_id = client_order_id,
+            Self::FillVoided(event) => event.client_order_id = client_order_id,
+        }
+
+        self
     }
 
     #[must_use]
@@ -160,6 +193,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.venue_order_id(),
             Self::Updated(event) => event.venue_order_id(),
             Self::Filled(event) => event.venue_order_id(),
+            Self::FillVoided(event) => event.venue_order_id(),
         }
     }
 
@@ -182,6 +216,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.account_id(),
             Self::Updated(event) => event.account_id(),
             Self::Filled(event) => event.account_id(),
+            Self::FillVoided(event) => event.account_id(),
         }
     }
 
@@ -204,6 +239,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.instrument_id(),
             Self::Updated(event) => event.instrument_id(),
             Self::Filled(event) => event.instrument_id(),
+            Self::FillVoided(event) => event.instrument_id(),
         }
     }
 
@@ -226,6 +262,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.strategy_id,
             Self::Updated(event) => event.strategy_id,
             Self::Filled(event) => event.strategy_id,
+            Self::FillVoided(event) => event.strategy_id,
         }
     }
 
@@ -248,6 +285,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => event.ts_event,
             Self::Updated(event) => event.ts_event,
             Self::Filled(event) => event.ts_event,
+            Self::FillVoided(event) => event.ts_event,
         }
     }
 
@@ -270,6 +308,7 @@ impl OrderEventAny {
             Self::CancelRejected(event) => Some(event.reason),
             Self::Updated(_) => None,
             Self::Filled(_) => None,
+            Self::FillVoided(event) => event.reason,
         }
     }
 }
@@ -308,6 +347,37 @@ impl Display for OrderEventAny {
             Self::CancelRejected(e) => write!(f, "{e}"),
             Self::Updated(e) => write!(f, "{e}"),
             Self::Filled(e) => write!(f, "{e}"),
+            Self::FillVoided(e) => write!(f, "{e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::OrderEventAny;
+    use crate::events::{OrderAccepted, OrderFilled, order::stubs::*};
+
+    #[rstest]
+    fn test_from_order_event_any_to_filled(order_filled: OrderFilled) {
+        let expected_trade_id = order_filled.trade_id;
+        let event = OrderEventAny::Filled(order_filled);
+        let filled: OrderFilled = event.into();
+        assert_eq!(filled.trade_id, expected_trade_id);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Invalid `OrderEventAny` not `OrderFilled`")]
+    fn test_from_order_event_any_to_filled_panics_on_wrong_variant(order_accepted: OrderAccepted) {
+        let event = OrderEventAny::Accepted(order_accepted);
+        let _filled: OrderFilled = event.into();
+    }
+
+    #[rstest]
+    fn test_display_delegates_to_inner(order_filled: OrderFilled) {
+        let inner_display = format!("{order_filled}");
+        let event = OrderEventAny::Filled(order_filled);
+        assert_eq!(format!("{event}"), inner_display);
     }
 }

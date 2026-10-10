@@ -15,7 +15,7 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
-#![allow(
+#![expect(
     clippy::missing_errors_doc,
     reason = "errors documented on underlying Rust methods"
 )]
@@ -27,23 +27,26 @@ pub mod loader;
 pub mod types;
 
 #[cfg(feature = "live")]
+pub mod data;
+#[cfg(feature = "live")]
 pub mod factories;
 #[cfg(feature = "live")]
 pub mod live;
 
-use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 #[cfg(feature = "live")]
-use nautilus_system::{
-    factories::{ClientConfig, DataClientFactory},
-    get_global_pyo3_registry,
-};
+use nautilus_common::factories::{ClientConfig, DataClientFactory};
+use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
+use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 #[cfg(feature = "live")]
-use crate::factories::{DatabentoDataClientFactory, DatabentoLiveClientConfig};
+use crate::types::register_databento_custom_data;
+use crate::{
+    common::DATABENTO, data::DatabentoDataClientConfig, factories::DatabentoDataClientFactory,
+};
 
 #[cfg(feature = "live")]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn extract_databento_data_factory(
     py: Python<'_>,
     factory: Py<PyAny>,
@@ -57,30 +60,30 @@ fn extract_databento_data_factory(
 }
 
 #[cfg(feature = "live")]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn extract_databento_data_config(
     py: Python<'_>,
     config: Py<PyAny>,
 ) -> PyResult<Box<dyn ClientConfig>> {
-    match config.extract::<DatabentoLiveClientConfig>(py) {
+    match config.extract::<DatabentoDataClientConfig>(py) {
         Ok(c) => Ok(Box::new(c)),
         Err(e) => Err(to_pyvalue_err(format!(
-            "Failed to extract DatabentoLiveClientConfig: {e}"
+            "Failed to extract DatabentoDataClientConfig: {e}"
         ))),
     }
 }
 
 /// Databento Python module.
 ///
-/// The module is exposed under different paths depending on the build configuration:
-/// - With `cython-compat` feature: `nautilus_trader.core.nautilus_pyo3.databento`
-/// - Without `cython-compat`: `nautilus_trader.databento` (via re-export)
+/// The module is exposed as `nautilus_trader._libnautilus.databento`.
 ///
 /// # Errors
 ///
 /// Returns a `PyErr` if registering any module components fails.
 #[pymodule]
 pub fn databento(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_databento_custom_data();
+
     m.add_class::<super::enums::DatabentoStatisticType>()?;
     m.add_class::<super::enums::DatabentoStatisticUpdateAction>()?;
     m.add_class::<super::types::DatabentoPublisher>()?;
@@ -107,20 +110,22 @@ pub fn databento(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
 
     #[cfg(feature = "live")]
+    m.add_class::<crate::data::DatabentoDataClient>()?;
+    #[cfg(feature = "live")]
+    m.add_class::<DatabentoDataClientConfig>()?;
+    #[cfg(feature = "live")]
+    m.add_class::<DatabentoDataClientFactory>()?;
+    #[cfg(feature = "live")]
     m.add_class::<live::DatabentoLiveClient>()?;
     #[cfg(feature = "live")]
     m.add_class::<types::DatabentoSubscriptionAck>()?;
-    #[cfg(feature = "live")]
-    m.add_class::<DatabentoLiveClientConfig>()?;
-    #[cfg(feature = "live")]
-    m.add_class::<DatabentoDataClientFactory>()?;
 
     #[cfg(feature = "live")]
     {
         let registry = get_global_pyo3_registry();
 
         if let Err(e) = registry
-            .register_factory_extractor("DATABENTO".to_string(), extract_databento_data_factory)
+            .register_factory_extractor(DATABENTO.to_string(), extract_databento_data_factory)
         {
             return Err(to_pyruntime_err(format!(
                 "Failed to register Databento data factory extractor: {e}"
@@ -128,21 +133,11 @@ pub fn databento(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         }
 
         if let Err(e) = registry.register_config_extractor(
-            "DatabentoLiveClientConfig".to_string(),
-            extract_databento_data_config,
-        ) {
-            return Err(to_pyruntime_err(format!(
-                "Failed to register Databento data config extractor: {e}"
-            )));
-        }
-
-        // Register alias so callers using the generic name also resolve
-        if let Err(e) = registry.register_config_extractor(
             "DatabentoDataClientConfig".to_string(),
             extract_databento_data_config,
         ) {
             return Err(to_pyruntime_err(format!(
-                "Failed to register Databento data config alias extractor: {e}"
+                "Failed to register Databento data config extractor: {e}"
             )));
         }
     }

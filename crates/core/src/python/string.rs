@@ -13,8 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-#![allow(clippy::doc_markdown, reason = "Python docstrings")]
-
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
@@ -25,17 +23,32 @@ use pyo3_stub_gen::derive::gen_stub_pyfunction;
 /// # Examples
 ///
 /// ```
-/// use nautilus_core::string::mask_api_key;
+/// use nautilus_core::string::secret::mask_api_key;
 ///
 /// assert_eq!(mask_api_key("abcdefghijklmnop"), "abcd...mnop");
 /// assert_eq!(mask_api_key("short"), "*****");
 /// ```
-#[gen_stub_pyfunction(module = "nautilus_trader.core")]
 #[pyfunction(name = "mask_api_key")]
-#[allow(
+#[gen_stub_pyfunction(module = "nautilus_trader.core")]
+#[must_use]
+#[expect(
     clippy::needless_pass_by_value,
     reason = "Python FFI requires owned types"
 )]
 pub fn py_mask_api_key(api_key: String) -> String {
-    crate::string::mask_api_key(&api_key)
+    crate::string::secret::mask_api_key(&api_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case("sk-abc123xyz789", "sk-a...z789")]
+    #[case("abc", "***")]
+    fn test_py_mask_api_key(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(py_mask_api_key(input.to_string()), expected);
+    }
 }

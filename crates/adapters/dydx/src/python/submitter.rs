@@ -15,11 +15,9 @@
 
 //! Python bindings for dYdX order submitter.
 
-#![allow(clippy::missing_errors_doc)]
-
 use std::{num::NonZeroU32, str::FromStr, sync::Arc};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use nautilus_core::{
     UnixNanos,
     python::{to_pyruntime_err, to_pyvalue_err},
@@ -57,6 +55,7 @@ use crate::{
 /// submitter.submit_market_order(instrument_id, ...)  # no wallet param
 /// ```
 #[pyclass(name = "DydxOrderSubmitter")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")]
 #[derive(Debug)]
 pub struct PyDydxOrderSubmitter {
     pub(crate) inner: Arc<OrderSubmitter>,
@@ -65,6 +64,7 @@ pub struct PyDydxOrderSubmitter {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyDydxOrderSubmitter {
     /// Create a new order submitter with wallet owned internally.
     ///
@@ -91,7 +91,7 @@ impl PyDydxOrderSubmitter {
         chain_id=None,
         grpc_rate_limit_per_second=None,
     ))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn py_new(
         grpc_client: PyDydxGrpcClient,
         http_client: DydxHttpClient,
@@ -143,11 +143,10 @@ impl PyDydxOrderSubmitter {
     #[pyo3(name = "record_block")]
     fn py_record_block(&self, height: u64, timestamp: Option<&str>) -> PyResult<()> {
         let time = if let Some(ts) = timestamp {
-            chrono::DateTime::parse_from_rfc3339(ts)
-                .map(|dt| dt.with_timezone(&Utc))
+            ts.parse::<Timestamp>()
                 .map_err(|e| to_pyvalue_err(format!("Invalid timestamp: {e}")))?
         } else {
-            Utc::now()
+            Timestamp::now()
         };
         self.block_time_monitor.record_block(height, time);
         Ok(())
@@ -159,7 +158,8 @@ impl PyDydxOrderSubmitter {
     /// block time estimation.
     #[pyo3(name = "set_block_height")]
     fn py_set_block_height(&self, height: u64) {
-        self.block_time_monitor.record_block(height, Utc::now());
+        self.block_time_monitor
+            .record_block(height, Timestamp::now());
     }
 
     /// Get the current block height.
@@ -253,7 +253,7 @@ impl PyDydxOrderSubmitter {
     /// Block height is read from the internal state (set via `set_block_height`).
     #[pyo3(name = "submit_limit_order")]
     #[pyo3(signature = (instrument_id, client_order_id, side, price, quantity, time_in_force, post_only, reduce_only, expire_time=None, client_metadata=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_limit_order<'py>(
         &self,
         py: Python<'py>,
@@ -301,7 +301,7 @@ impl PyDydxOrderSubmitter {
     /// Submit a stop market order to dYdX via gRPC.
     #[pyo3(name = "submit_stop_market_order")]
     #[pyo3(signature = (instrument_id, client_order_id, side, trigger_price, quantity, reduce_only, expire_time=None, client_metadata=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_stop_market_order<'py>(
         &self,
         py: Python<'py>,
@@ -343,7 +343,7 @@ impl PyDydxOrderSubmitter {
     /// Submit a stop limit order to dYdX via gRPC.
     #[pyo3(name = "submit_stop_limit_order")]
     #[pyo3(signature = (instrument_id, client_order_id, side, trigger_price, limit_price, quantity, time_in_force, post_only, reduce_only, expire_time=None, client_metadata=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_stop_limit_order<'py>(
         &self,
         py: Python<'py>,
@@ -394,7 +394,7 @@ impl PyDydxOrderSubmitter {
     /// Submit a take profit market order to dYdX via gRPC.
     #[pyo3(name = "submit_take_profit_market_order")]
     #[pyo3(signature = (instrument_id, client_order_id, side, trigger_price, quantity, reduce_only, expire_time=None, client_metadata=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_take_profit_market_order<'py>(
         &self,
         py: Python<'py>,
@@ -436,7 +436,7 @@ impl PyDydxOrderSubmitter {
     /// Submit a take profit limit order to dYdX via gRPC.
     #[pyo3(name = "submit_take_profit_limit_order")]
     #[pyo3(signature = (instrument_id, client_order_id, side, trigger_price, limit_price, quantity, time_in_force, post_only, reduce_only, expire_time=None, client_metadata=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_take_profit_limit_order<'py>(
         &self,
         py: Python<'py>,

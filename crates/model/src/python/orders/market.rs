@@ -53,7 +53,7 @@ use crate::{
 impl MarketOrder {
     /// Creates a new `MarketOrder` instance.
     #[new]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, order_side, quantity, init_id, ts_init, time_in_force, reduce_only, quote_quantity, contingency_type=None, order_list_id=None, linked_order_ids=None, parent_order_id=None, exec_algorithm_id=None, exec_algorithm_params=None, exec_spawn_id=None, tags=None))]
     fn py_new(
         trader_id: TraderId,
@@ -118,8 +118,8 @@ impl MarketOrder {
 
     #[staticmethod]
     #[pyo3(name = "create")]
-    fn py_create(init: OrderInitialized) -> Self {
-        Self::from(init)
+    fn py_create(init: OrderInitialized) -> PyResult<Self> {
+        Self::try_from(init).map_err(to_pyvalue_err)
     }
 
     #[staticmethod]
@@ -130,7 +130,7 @@ impl MarketOrder {
 
     #[staticmethod]
     #[pyo3(name = "closing_side")]
-    fn py_closing_side(side: PositionSide) -> OrderSide {
+    fn py_closing_side(side: PositionSide) -> Option<OrderSide> {
         OrderCore::closing_side(side)
     }
 
@@ -283,10 +283,9 @@ impl MarketOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
-    #[getter]
     #[pyo3(name = "events")]
     fn py_events(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.events()
@@ -307,7 +306,7 @@ impl MarketOrder {
 
     #[pyo3(name = "apply")]
     fn py_apply(&mut self, event: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
-        let event_any = pyobject_to_order_event(py, event).unwrap();
+        let event_any = pyobject_to_order_event(py, event)?;
         self.apply(event_any).map_err(to_pyruntime_err)
     }
 
@@ -422,8 +421,7 @@ impl MarketOrder {
             || dict.set_item("linked_order_ids", py.None()),
             |linked_order_ids| {
                 let linked_order_ids_list =
-                    PyList::new(py, linked_order_ids.iter().map(ToString::to_string))
-                        .expect("Invalid `ExactSizeIterator`");
+                    PyList::new(py, linked_order_ids.iter().map(ToString::to_string))?;
                 dict.set_item("linked_order_ids", linked_order_ids_list)
             },
         )?;
@@ -435,6 +433,7 @@ impl MarketOrder {
             || dict.set_item("exec_algorithm_id", py.None()),
             |x| dict.set_item("exec_algorithm_id", x.to_string()),
         )?;
+
         match &self.exec_algorithm_params {
             Some(exec_algorithm_params) => {
                 let py_exec_algorithm_params = PyDict::new(py);
@@ -454,7 +453,7 @@ impl MarketOrder {
             |x| {
                 dict.set_item(
                     "tags",
-                    x.iter().map(|x| x.to_string()).collect::<Vec<String>>(),
+                    x.iter().map(ToString::to_string).collect::<Vec<String>>(),
                 )
             },
         )?;

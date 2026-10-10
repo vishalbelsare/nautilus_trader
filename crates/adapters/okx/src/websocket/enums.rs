@@ -144,12 +144,16 @@ pub enum OKXWsChannel {
     Books50Tbt,
     #[serde(rename = "books-l2-tbt")]
     BooksTbt,
+    #[serde(rename = "books-rpi")]
+    BooksRpi,
     #[serde(rename = "bbo-tbt")]
     BboTbt,
     #[serde(rename = "opt-summary")]
     OptionSummary,
     #[serde(rename = "funding-rate")]
     FundingRate,
+    #[serde(rename = "event-contract-markets")]
+    EventContractMarkets,
     #[serde(rename = "index-tickers")]
     IndexTickers,
     #[serde(rename = "status")]
@@ -163,8 +167,16 @@ pub enum OKXWsChannel {
     // BalanceAndPosition,
     #[serde(rename = "orders")]
     Orders,
-    #[serde(rename = "fills")]
-    Fills,
+    #[serde(rename = "sprd-orders")]
+    SprdOrders,
+    #[serde(rename = "sprd-bbo-tbt")]
+    SprdBboTbt,
+    #[serde(rename = "sprd-books5")]
+    SprdBooks5,
+    #[serde(rename = "sprd-public-trades")]
+    SprdPublicTrades,
+    #[serde(rename = "liquidation-warning")]
+    LiquidationWarning,
     #[serde(rename = "orders-algo")]
     OrdersAlgo,
     #[serde(rename = "algo-advance")]
@@ -277,4 +289,31 @@ pub enum OKXWsChannel {
     MarkPriceCandle1Month,
     #[serde(rename = "mark-price-candle3M")]
     MarkPriceCandle3Month,
+}
+
+impl OKXWsChannel {
+    /// Returns `true` for OKX Nitro spread channels, which key on `sprdId`
+    /// rather than `instId` and are served on the business WebSocket.
+    #[must_use]
+    pub const fn is_spread(&self) -> bool {
+        matches!(
+            self,
+            Self::SprdOrders | Self::SprdBboTbt | Self::SprdBooks5 | Self::SprdPublicTrades
+        )
+    }
+
+    /// Returns `true` for channels that feed the adapter's order book
+    /// subscription bookkeeping.
+    #[must_use]
+    pub const fn is_book(&self) -> bool {
+        matches!(
+            self,
+            Self::Books
+                | Self::Books5
+                | Self::Books50Tbt
+                | Self::BooksTbt
+                | Self::BooksRpi
+                | Self::SprdBooks5
+        )
+    }
 }

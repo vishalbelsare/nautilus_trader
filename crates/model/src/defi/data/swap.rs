@@ -39,6 +39,7 @@ pub struct RawSwapData {
 
 impl RawSwapData {
     /// Creates a new [`RawSwapData`] instance with the specified values.
+    #[must_use]
     pub fn new(amount0: I256, amount1: I256, sqrt_price_x96: U160) -> Self {
         Self {
             amount0,
@@ -56,7 +57,7 @@ impl RawSwapData {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -73,6 +74,8 @@ pub struct PoolSwap {
     pub pool_identifier: PoolIdentifier,
     /// The blockchain block number at which the swap was executed.
     pub block: u64,
+    /// The hash of the block observed when this swap was ingested.
+    pub block_hash: Option<String>,
     /// The unique hash identifier of the blockchain transaction containing the swap.
     pub transaction_hash: String,
     /// The index position of the transaction within the block.
@@ -93,10 +96,10 @@ pub struct PoolSwap {
     pub liquidity: u128,
     /// The current tick of the pool after the swap occurred.
     pub tick: i32,
-    /// UNIX timestamp (nanoseconds) when the swap occurred.
-    pub timestamp: Option<UnixNanos>,
+    /// UNIX timestamp (nanoseconds) when the swap event occurred.
+    pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was initialized.
-    pub ts_init: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
     /// Optional computed trade information in market-oriented format.
     /// This translates raw blockchain data into standard trading terminology.
     pub trade_info: Option<SwapTradeInfo>,
@@ -105,7 +108,7 @@ pub struct PoolSwap {
 impl PoolSwap {
     /// Creates a new [`PoolSwap`] instance with the specified properties.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         chain: SharedChain,
         dex: SharedDex,
@@ -115,7 +118,8 @@ impl PoolSwap {
         transaction_hash: String,
         transaction_index: u32,
         log_index: u32,
-        timestamp: Option<UnixNanos>,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
         sender: Address,
         recipient: Address,
         amount0: I256,
@@ -130,10 +134,12 @@ impl PoolSwap {
             instrument_id,
             pool_identifier,
             block,
+            block_hash: None,
             transaction_hash,
             transaction_index,
             log_index,
-            timestamp,
+            ts_event,
+            ts_init,
             sender,
             recipient,
             amount0,
@@ -141,7 +147,6 @@ impl PoolSwap {
             sqrt_price_x96,
             liquidity,
             tick,
-            ts_init: timestamp, // TODO: Use swap timestamp as init timestamp for now
             trade_info: None,
         }
     }
@@ -161,7 +166,6 @@ impl PoolSwap {
     /// # Errors
     ///
     /// Returns an error if the trade info computation or price calculations fail.
-    ///
     pub fn calculate_trade_info(
         &mut self,
         token0: &Token,

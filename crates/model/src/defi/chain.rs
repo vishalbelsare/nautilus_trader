@@ -138,7 +138,7 @@ pub enum Blockchain {
 /// Defines a blockchain with its unique identifiers and connection details for network interaction.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(feature = "python", pyo3_stub_gen::derive::gen_stub_pyclass)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +160,7 @@ pub type SharedChain = Arc<Chain>;
 
 impl Chain {
     /// Creates a new [`Chain`] instance with the specified blockchain and chain ID.
+    #[must_use]
     pub fn new(name: Blockchain, chain_id: u32) -> Self {
         Self {
             chain_id,
@@ -182,6 +183,7 @@ impl Chain {
     /// # Panics
     ///
     /// Panics if the native currency has not been defined for this blockchain.
+    #[must_use]
     pub fn native_currency(&self) -> Currency {
         use crate::enums::CurrencyType;
 
@@ -217,26 +219,27 @@ impl Chain {
     }
 
     /// Returns a reference to the `Chain` corresponding to the given `chain_id`, or `None` if it is not found.
+    #[must_use]
     pub fn from_chain_id(chain_id: u32) -> Option<&'static Self> {
         match chain_id {
             2741 => Some(&chains::ABSTRACT),
             42161 => Some(&chains::ARBITRUM),
             42170 => Some(&chains::ARBITRUM_NOVA),
-            421614 => Some(&chains::ARBITRUM_SEPOLIA),
-            1313161554 => Some(&chains::AURORA),
+            421_614 => Some(&chains::ARBITRUM_SEPOLIA),
+            1_313_161_554 => Some(&chains::AURORA),
             43114 => Some(&chains::AVALANCHE),
             8453 => Some(&chains::BASE),
             84532 => Some(&chains::BASE_SEPOLIA),
             80094 => Some(&chains::BERACHAIN),
             80085 => Some(&chains::BERACHAIN_BARTIO),
             81457 => Some(&chains::BLAST),
-            168587773 => Some(&chains::BLAST_SEPOLIA),
+            168_587_773 => Some(&chains::BLAST_SEPOLIA),
             288 => Some(&chains::BOBA),
             56 => Some(&chains::BSC),
             97 => Some(&chains::BSC_TESTNET),
             42220 => Some(&chains::CELO),
-            8888 => Some(&chains::CHILIZ),
-            3333 => Some(&chains::CITREA_TESTNET),
+            88888 => Some(&chains::CHILIZ),
+            5115 => Some(&chains::CITREA_TESTNET),
             33111 => Some(&chains::CURTIS),
             7560 => Some(&chains::CYBER),
             46 => Some(&chains::DARWINIA),
@@ -245,60 +248,60 @@ impl Chain {
             14 => Some(&chains::FLARE),
             252 => Some(&chains::FRAXTAL),
             43113 => Some(&chains::FUJI),
-            696969 => Some(&chains::GALADRIEL_DEVNET),
+            696_969 => Some(&chains::GALADRIEL_DEVNET),
             100 => Some(&chains::GNOSIS),
             10200 => Some(&chains::GNOSIS_CHIADO),
             10300 => Some(&chains::GNOSIS_TRACES),
-            1666600000 => Some(&chains::HARMONY_SHARD_0),
+            1_666_600_000 => Some(&chains::HARMONY_SHARD_0),
             17000 => Some(&chains::HOLESKY),
             17001 => Some(&chains::HOLESKY_TOKEN_TEST),
-            7979 => Some(&chains::HYPERLIQUID),
+            999 => Some(&chains::HYPERLIQUID),
             7978 => Some(&chains::HYPERLIQUID_TEMP),
-            222 => Some(&chains::INK),
+            57073 => Some(&chains::INK),
             13337 => Some(&chains::INTERNAL_TEST_CHAIN),
             255 => Some(&chains::KROMA),
             59144 => Some(&chains::LINEA),
-            501 => Some(&chains::LISK),
+            1135 => Some(&chains::LISK),
             42 => Some(&chains::LUKSO),
             4201 => Some(&chains::LUKSO_TESTNET),
             169 => Some(&chains::MANTA),
             5000 => Some(&chains::MANTLE),
             777 => Some(&chains::MEGAETH_TESTNET),
             4200 => Some(&chains::MERLIN),
-            90 => Some(&chains::METALL2),
+            1750 => Some(&chains::METALL2),
             1088 => Some(&chains::METIS),
             11 => Some(&chains::MEV_COMMIT),
             34443 => Some(&chains::MODE),
-            2323 => Some(&chains::MONAD_TESTNET),
+            10143 => Some(&chains::MONAD_TESTNET),
             2358 => Some(&chains::MONAD_TESTNET_BACKUP),
             1287 => Some(&chains::MOONBASE_ALPHA),
             1284 => Some(&chains::MOONBEAM),
-            2710 => Some(&chains::MORPH),
-            2710111 => Some(&chains::MORPH_HOLESKY),
+            2818 => Some(&chains::MORPH),
+            2_710_111 => Some(&chains::MORPH_HOLESKY),
             204 => Some(&chains::OPBNB),
             10 => Some(&chains::OPTIMISM),
-            11155420 => Some(&chains::OPTIMISM_SEPOLIA),
+            11_155_420 => Some(&chains::OPTIMISM_SEPOLIA),
             1337 => Some(&chains::PHAROS_DEVNET),
             137 => Some(&chains::POLYGON),
             80002 => Some(&chains::POLYGON_AMOY),
             1101 => Some(&chains::POLYGON_ZKEVM),
             30 => Some(&chains::ROOTSTOCK),
             1204 => Some(&chains::SAAKURU),
-            534352 => Some(&chains::SCROLL),
-            11155111 => Some(&chains::SEPOLIA),
+            534_352 => Some(&chains::SCROLL),
+            11_155_111 => Some(&chains::SEPOLIA),
             148 => Some(&chains::SHIMMER_EVM),
-            109 => Some(&chains::SONEIUM),
-            138 => Some(&chains::SOPHON),
+            1868 => Some(&chains::SONEIUM),
+            50104 => Some(&chains::SOPHON),
             139 => Some(&chains::SOPHON_TESTNET),
-            10001 => Some(&chains::SUPERSEDE),
-            9999 => Some(&chains::UNICHAIN),
+            5330 => Some(&chains::SUPERSEDE),
+            130 => Some(&chains::UNICHAIN),
             9997 => Some(&chains::UNICHAIN_SEPOLIA),
             50 => Some(&chains::XDC),
             51 => Some(&chains::XDC_TESTNET),
             7000 => Some(&chains::ZETA),
             78600 => Some(&chains::ZIRCUIT),
             324 => Some(&chains::ZKSYNC),
-            7777777 => Some(&chains::ZORA),
+            7_777_777 => Some(&chains::ZORA),
             _ => None,
         }
     }
@@ -306,6 +309,7 @@ impl Chain {
     /// Returns a reference to the `Chain` corresponding to the given chain name, or `None` if it is not found.
     ///
     /// String matching is case-insensitive.
+    #[must_use]
     pub fn from_chain_name(chain_name: &str) -> Option<&'static Self> {
         let blockchain = Blockchain::from_str(chain_name).ok()?;
 
@@ -412,9 +416,9 @@ pub mod chains {
     pub static ARBITRUM_NOVA: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::ArbitrumNova, 42170));
     pub static ARBITRUM_SEPOLIA: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::ArbitrumSepolia, 421614));
+        LazyLock::new(|| Chain::new(Blockchain::ArbitrumSepolia, 421_614));
     pub static AURORA: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::Aurora, 1313161554));
+        LazyLock::new(|| Chain::new(Blockchain::Aurora, 1_313_161_554));
     pub static AVALANCHE: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::Avalanche, 43114));
     pub static BASE: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Base, 8453));
@@ -426,15 +430,15 @@ pub mod chains {
         LazyLock::new(|| Chain::new(Blockchain::BerachainBartio, 80085));
     pub static BLAST: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Blast, 81457));
     pub static BLAST_SEPOLIA: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::BlastSepolia, 168587773));
+        LazyLock::new(|| Chain::new(Blockchain::BlastSepolia, 168_587_773));
     pub static BOBA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Boba, 288));
     pub static BSC: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Bsc, 56));
     pub static BSC_TESTNET: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::BscTestnet, 97));
     pub static CELO: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Celo, 42220));
-    pub static CHILIZ: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Chiliz, 8888));
+    pub static CHILIZ: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Chiliz, 88888));
     pub static CITREA_TESTNET: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::CitreaTestnet, 3333));
+        LazyLock::new(|| Chain::new(Blockchain::CitreaTestnet, 5115));
     pub static CURTIS: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Curtis, 33111));
     pub static CYBER: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Cyber, 7560));
     pub static DARWINIA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Darwinia, 46));
@@ -444,7 +448,7 @@ pub mod chains {
     pub static FRAXTAL: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Fraxtal, 252));
     pub static FUJI: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Fuji, 43113));
     pub static GALADRIEL_DEVNET: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::GaladrielDevnet, 696969));
+        LazyLock::new(|| Chain::new(Blockchain::GaladrielDevnet, 696_969));
     pub static GNOSIS: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Gnosis, 100));
     pub static GNOSIS_CHIADO: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::GnosisChiado, 10200));
@@ -456,27 +460,23 @@ pub mod chains {
     pub static GNOSIS_TRACES: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::GnosisTraces, 10300));
     pub static HARMONY_SHARD_0: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::HarmonyShard0, 1666600000));
+        LazyLock::new(|| Chain::new(Blockchain::HarmonyShard0, 1_666_600_000));
     pub static HOLESKY: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Holesky, 17000));
     // The Holesky *token test* network uses a dedicated chain-ID (17001) distinct from the main
     // Holesky devnet (17000). Align this constant with the value returned from `from_chain_id`.
     pub static HOLESKY_TOKEN_TEST: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::HoleskyTokenTest, 17001));
-    // Hyperliquid main & temp test networks live on low numeric identifiers (7979 / 7978).
-    // Using the correct small IDs avoids overflow issues in certain front-ends that assume
-    // EVM-style 32-bit chain IDs.
     pub static HYPERLIQUID: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::Hyperliquid, 7979));
+        LazyLock::new(|| Chain::new(Blockchain::Hyperliquid, 999));
     pub static HYPERLIQUID_TEMP: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::HyperliquidTemp, 7978));
-    // Align with mapping – 222 is the well–known chain-ID for the `Ink` network.
-    pub static INK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Ink, 222));
+    pub static INK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Ink, 57073));
     // Use the `foundry`-style development chain-ID 13337 to match the lookup table above.
     pub static INTERNAL_TEST_CHAIN: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::InternalTestChain, 13337));
     pub static KROMA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Kroma, 255));
     pub static LINEA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Linea, 59144));
-    pub static LISK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Lisk, 501));
+    pub static LISK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Lisk, 1135));
     pub static LUKSO: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Lukso, 42));
     pub static LUKSO_TESTNET: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::LuksoTestnet, 4201));
@@ -485,25 +485,25 @@ pub mod chains {
     pub static MEGAETH_TESTNET: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::MegaethTestnet, 777));
     pub static MERLIN: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Merlin, 4200));
-    pub static METALL2: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Metall2, 90));
+    pub static METALL2: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Metall2, 1750));
     pub static METIS: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Metis, 1088));
     pub static MEV_COMMIT: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::MevCommit, 11));
     pub static MODE: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Mode, 34443));
     pub static MONAD_TESTNET: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::MonadTestnet, 2323));
+        LazyLock::new(|| Chain::new(Blockchain::MonadTestnet, 10143));
     pub static MONAD_TESTNET_BACKUP: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::MonadTestnetBackup, 2358));
     pub static MOONBASE_ALPHA: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::MoonbaseAlpha, 1287));
     pub static MOONBEAM: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Moonbeam, 1284));
-    pub static MORPH: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Morph, 2710));
+    pub static MORPH: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Morph, 2818));
     pub static MORPH_HOLESKY: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::MorphHolesky, 2710111));
+        LazyLock::new(|| Chain::new(Blockchain::MorphHolesky, 2_710_111));
     pub static OPBNB: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Opbnb, 204));
     pub static OPTIMISM: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Optimism, 10));
     pub static OPTIMISM_SEPOLIA: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::OptimismSepolia, 11155420));
+        LazyLock::new(|| Chain::new(Blockchain::OptimismSepolia, 11_155_420));
     pub static PHAROS_DEVNET: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::PharosDevnet, 1337));
     pub static POLYGON: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Polygon, 137));
@@ -513,18 +513,18 @@ pub mod chains {
         LazyLock::new(|| Chain::new(Blockchain::PolygonZkEvm, 1101));
     pub static ROOTSTOCK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Rootstock, 30));
     pub static SAAKURU: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Saakuru, 1204));
-    pub static SCROLL: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Scroll, 534352));
+    pub static SCROLL: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Scroll, 534_352));
     pub static SEPOLIA: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::Sepolia, 11155111));
+        LazyLock::new(|| Chain::new(Blockchain::Sepolia, 11_155_111));
     pub static SHIMMER_EVM: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::ShimmerEvm, 148));
-    pub static SONEIUM: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Soneium, 109));
-    pub static SOPHON: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Sophon, 138));
+    pub static SONEIUM: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Soneium, 1868));
+    pub static SOPHON: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Sophon, 50104));
     pub static SOPHON_TESTNET: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::SophonTestnet, 139));
     pub static SUPERSEDE: LazyLock<Chain> =
-        LazyLock::new(|| Chain::new(Blockchain::Superseed, 10001));
-    pub static UNICHAIN: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Unichain, 9999));
+        LazyLock::new(|| Chain::new(Blockchain::Superseed, 5330));
+    pub static UNICHAIN: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Unichain, 130));
     pub static UNICHAIN_SEPOLIA: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::UnichainSepolia, 9997));
     pub static XDC: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Xdc, 50));
@@ -533,7 +533,7 @@ pub mod chains {
     pub static ZETA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Zeta, 7000));
     pub static ZIRCUIT: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Zircuit, 78600));
     pub static ZKSYNC: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::ZKsync, 324));
-    pub static ZORA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Zora, 7777777));
+    pub static ZORA: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Zora, 7_777_777));
 }
 
 #[cfg(test)]
@@ -552,9 +552,9 @@ mod tests {
 
         // Test native currency
         let currency = eth_chain.native_currency();
-        assert_eq!(currency.code.as_str(), "ETH");
+        assert_eq!(currency.code, "ETH");
         assert_eq!(currency.precision, 18);
-        assert_eq!(currency.name.as_str(), "Ethereum");
+        assert_eq!(currency.name, "Ethereum");
     }
 
     #[rstest]
@@ -570,9 +570,9 @@ mod tests {
 
         // Test native currency (Arbitrum uses ETH)
         let currency = arbitrum_chain.native_currency();
-        assert_eq!(currency.code.as_str(), "ETH");
+        assert_eq!(currency.code, "ETH");
         assert_eq!(currency.precision, 18);
-        assert_eq!(currency.name.as_str(), "Ethereum");
+        assert_eq!(currency.name, "Ethereum");
     }
 
     #[rstest]
@@ -612,9 +612,35 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Blockchain::Chiliz, 88888)]
+    #[case(Blockchain::CitreaTestnet, 5115)]
+    #[case(Blockchain::Hyperliquid, 999)]
+    #[case(Blockchain::Ink, 57073)]
+    #[case(Blockchain::Lisk, 1135)]
+    #[case(Blockchain::Metall2, 1750)]
+    #[case(Blockchain::MonadTestnet, 10143)]
+    #[case(Blockchain::Morph, 2818)]
+    #[case(Blockchain::Soneium, 1868)]
+    #[case(Blockchain::Sophon, 50104)]
+    #[case(Blockchain::Superseed, 5330)]
+    #[case(Blockchain::Unichain, 130)]
+    fn test_chain_ids_match_network_chain_ids(#[case] blockchain: Blockchain, #[case] id: u32) {
+        let chain_by_name = Chain::from_chain_name(&blockchain.to_string()).unwrap();
+        let chain_by_id = Chain::from_chain_id(id).unwrap();
+
+        assert_eq!(chain_by_name.name, blockchain);
+        assert_eq!(chain_by_name.chain_id, id);
+        assert_eq!(
+            chain_by_name.hypersync_url,
+            format!("https://{id}.hypersync.xyz")
+        );
+        assert_eq!(chain_by_id.name, blockchain);
+    }
+
+    #[rstest]
     fn test_chain_from_chain_id_invalid() {
         // Test unknown chain ID
-        assert!(Chain::from_chain_id(999999).is_none());
+        assert!(Chain::from_chain_id(999_999).is_none());
         assert!(Chain::from_chain_id(0).is_none());
     }
 

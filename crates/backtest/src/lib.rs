@@ -26,15 +26,13 @@
 //! - Configuration and state management.
 //! - Integration with live trading systems for direct deployment.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -43,13 +41,20 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `defi`: Enables DeFi replay APIs and data-engine routing.
 //! - `examples`: Enables example strategies and the EMA crossover backtest example.
-//! - `streaming`: Enables `persistence` dependency for streaming configuration.
-//! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision`: Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
+//! - `mimalloc`: Uses [mimalloc](https://crates.io/crates/mimalloc) as the global allocator for
+//!   bundled Rust examples.
+//! - `plugin`: Provides a compatibility flag without enabling additional code.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds the crate as a Python extension module.
+//! - `streaming`: Enables the `nautilus-persistence` dependency for streaming configuration.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -57,11 +62,24 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "backtest engine, node, and Python registration flows exceed the default threshold by design"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod accumulator;
 pub mod config;
 pub mod data_client;
 pub mod data_iterator;
+#[cfg(feature = "defi")]
+pub mod defi;
 pub mod engine;
 pub mod exchange;
 pub mod execution_client;
@@ -74,5 +92,4 @@ pub mod node;
 #[cfg(feature = "python")]
 pub mod python;
 
-#[cfg(feature = "ffi")]
-pub mod ffi;
+mod data_batch;

@@ -15,119 +15,158 @@
 
 //! Python bindings for Deribit configuration.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
-    config::{DeribitDataClientConfig, DeribitExecClientConfig},
+    common::enums::DeribitEnvironment,
+    config::{DeribitDataClientConfig, DeribitExecutionClientConfig},
     http::models::DeribitProductType,
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DeribitDataClientConfig {
+    /// Configuration for the Deribit data client.
     #[new]
     #[pyo3(signature = (
         product_types = None,
-        use_testnet = None,
+        environment = None,
         api_key = None,
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
         heartbeat_interval_secs = None,
+        auth_timeout_secs = None,
         update_instruments_interval_mins = None,
+        auto_load_missing_instruments = None,
+        transport_backend = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         product_types: Option<Vec<DeribitProductType>>,
-        use_testnet: Option<bool>,
+        environment: Option<DeribitEnvironment>,
         api_key: Option<String>,
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         heartbeat_interval_secs: Option<u64>,
+        auth_timeout_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
+        auto_load_missing_instruments: Option<bool>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
-            api_key,
-            api_secret,
+            api_key: api_key.map(SecretString::from),
+            api_secret: api_secret.map(SecretString::from),
             product_types: product_types.unwrap_or(defaults.product_types),
             base_url_http,
             base_url_ws,
-            use_testnet: use_testnet.unwrap_or(defaults.use_testnet),
-            http_timeout_secs: http_timeout_secs.or(defaults.http_timeout_secs),
-            max_retries: max_retries.or(defaults.max_retries),
-            retry_delay_initial_ms: retry_delay_initial_ms.or(defaults.retry_delay_initial_ms),
-            retry_delay_max_ms: retry_delay_max_ms.or(defaults.retry_delay_max_ms),
-            heartbeat_interval_secs: heartbeat_interval_secs.or(defaults.heartbeat_interval_secs),
+            proxy_url: proxy_url.map(SecretString::from),
+            environment: environment.unwrap_or(defaults.environment),
+            http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            max_retries: max_retries.unwrap_or(defaults.max_retries),
+            retry_delay_initial_ms: retry_delay_initial_ms
+                .unwrap_or(defaults.retry_delay_initial_ms),
+            retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
+            heartbeat_interval_secs: heartbeat_interval_secs
+                .unwrap_or(defaults.heartbeat_interval_secs),
+            auth_timeout_secs,
             update_instruments_interval_mins: update_instruments_interval_mins
-                .or(defaults.update_instruments_interval_mins),
+                .unwrap_or(defaults.update_instruments_interval_mins),
+            auto_load_missing_instruments: auto_load_missing_instruments
+                .unwrap_or(defaults.auto_load_missing_instruments),
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeribitDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
-impl DeribitExecClientConfig {
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DeribitExecutionClientConfig {
+    /// Configuration for the Deribit execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         product_types = None,
-        use_testnet = None,
+        environment = None,
         api_key = None,
         api_secret = None,
         base_url_http = None,
         base_url_ws = None,
+        proxy_url = None,
         http_timeout_secs = None,
         max_retries = None,
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
+        auth_timeout_secs = None,
+        transport_backend = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         product_types: Option<Vec<DeribitProductType>>,
-        use_testnet: Option<bool>,
+        environment: Option<DeribitEnvironment>,
         api_key: Option<String>,
         api_secret: Option<String>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
+        proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        auth_timeout_secs: Option<u64>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
-            trader_id,
             account_id,
-            api_key,
-            api_secret,
+            api_key: api_key.map(SecretString::from),
+            api_secret: api_secret.map(SecretString::from),
             product_types: product_types.unwrap_or(defaults.product_types),
             base_url_http,
             base_url_ws,
-            use_testnet: use_testnet.unwrap_or(defaults.use_testnet),
-            http_timeout_secs: http_timeout_secs.or(defaults.http_timeout_secs),
-            max_retries: max_retries.or(defaults.max_retries),
-            retry_delay_initial_ms: retry_delay_initial_ms.or(defaults.retry_delay_initial_ms),
-            retry_delay_max_ms: retry_delay_max_ms.or(defaults.retry_delay_max_ms),
+            proxy_url: proxy_url.map(SecretString::from),
+            environment: environment.unwrap_or(defaults.environment),
+            http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            max_retries: max_retries.unwrap_or(defaults.max_retries),
+            retry_delay_initial_ms: retry_delay_initial_ms
+                .unwrap_or(defaults.retry_delay_initial_ms),
+            retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
+            auth_timeout_secs,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeribitExecutionClientConfig).to_string()
     }
 }

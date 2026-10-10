@@ -17,8 +17,14 @@
 
 use std::fmt::{Debug, Display};
 
-use nautilus_core::correctness::{FAILED, check_string_contains, check_valid_string_ascii};
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_predicate_false, check_string_contains,
+    check_valid_string_ascii,
+};
 use ustr::Ustr;
+
+/// The order ID tag reported for a strategy which has not been assigned one.
+pub const UNASSIGNED_ORDER_ID_TAG: &str = "None";
 
 /// The identifier for all 'external' strategy IDs (not local to this system instance).
 const EXTERNAL_STRATEGY_ID: &str = "EXTERNAL";
@@ -28,7 +34,7 @@ const EXTERNAL_STRATEGY_ID: &str = "EXTERNAL";
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -41,11 +47,11 @@ impl StrategyId {
     ///
     /// Must be correctly formatted with two valid strings either side of a hyphen.
     /// It is expected a strategy ID is the class name of the strategy,
-    /// with an order ID tag number separated by a hyphen.
+    /// with an order ID tag separated by a hyphen.
     ///
     /// Example: "EMACross-001".
     ///
-    /// The reason for the numerical component of the ID is so that order and position IDs
+    /// The reason for the tag component of the ID is so that order and position IDs
     /// do not collide with those from another strategy within the node instance.
     ///
     /// # Errors
@@ -54,21 +60,21 @@ impl StrategyId {
     /// - `value` is not a valid ASCII string.
     /// - `value` is not "EXTERNAL" and does not contain a hyphen '-' separator.
     /// - Either the name or tag part (before/after the hyphen) is empty.
-    pub fn new_checked<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
+    pub fn new_checked<T: AsRef<str>>(value: T) -> CorrectnessResult<Self> {
         let value = value.as_ref();
         check_valid_string_ascii(value, stringify!(value))?;
         if value != EXTERNAL_STRATEGY_ID {
             check_string_contains(value, "-", stringify!(value))?;
 
             if let Some((name, tag)) = value.rsplit_once('-') {
-                anyhow::ensure!(
-                    !name.is_empty(),
-                    "`value` name part (before '-') cannot be empty"
-                );
-                anyhow::ensure!(
-                    !tag.is_empty(),
-                    "`value` tag part (after '-') cannot be empty"
-                );
+                check_predicate_false(
+                    name.is_empty(),
+                    "`value` name part (before '-') cannot be empty",
+                )?;
+                check_predicate_false(
+                    tag.is_empty(),
+                    "`value` tag part (after '-') cannot be empty",
+                )?;
             }
         }
         Ok(Self(Ustr::from(value)))
@@ -80,7 +86,7 @@ impl StrategyId {
     ///
     /// Panics if `value` is not a valid string.
     pub fn new<T: AsRef<str>>(value: T) -> Self {
-        Self::new_checked(value).expect(FAILED)
+        Self::new_checked(value).expect_display(FAILED)
     }
 
     /// Sets the inner identifier value.
@@ -134,11 +140,33 @@ impl Display for StrategyId {
     }
 }
 
+/// Returns a usable order ID tag, filtering unset sentinel values.
+#[must_use]
+pub fn normalize_order_id_tag(order_id_tag: Option<&str>) -> Option<&str> {
+    order_id_tag.filter(|tag| !tag.is_empty() && *tag != UNASSIGNED_ORDER_ID_TAG)
+}
+
+/// Checks the `order_id_tag` survives composition into a strategy ID.
+///
+/// # Errors
+///
+/// Returns an error if `order_id_tag` contains the '-' separator, because
+/// [`StrategyId::get_tag`] splits on the final separator and would report a truncated tag.
+pub fn check_order_id_tag(order_id_tag: &str) -> CorrectnessResult<()> {
+    check_predicate_false(
+        order_id_tag.contains('-'),
+        &format!(
+            "`order_id_tag` cannot contain the '-' strategy ID separator, was '{order_id_tag}'"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use nautilus_core::correctness::CorrectnessError;
     use rstest::rstest;
 
-    use super::StrategyId;
+    use super::{StrategyId, check_order_id_tag, normalize_order_id_tag};
     use crate::identifiers::stubs::*;
 
     #[rstest]
@@ -155,6 +183,7 @@ mod tests {
     #[rstest]
     fn test_is_external() {
         assert!(StrategyId::external().is_external());
+        assert!(!StrategyId::new("EMACross-001").is_external());
     }
 
     #[rstest]
@@ -165,6 +194,56 @@ mod tests {
     #[rstest]
     fn test_get_tag_external() {
         assert_eq!(StrategyId::external().get_tag(), "EXTERNAL");
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some(""), None)]
+    #[case(Some("None"), None)]
+    #[case(Some("001"), Some("001"))]
+    #[case(Some("ABC"), Some("ABC"))]
+    fn test_normalize_order_id_tag(
+        #[case] order_id_tag: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(normalize_order_id_tag(order_id_tag), expected);
+    }
+
+    #[rstest]
+    #[case("001")]
+    #[case("ABC")]
+    #[case("None")]
+    #[case("")]
+    fn test_check_order_id_tag_accepts_tag_without_separator(#[case] order_id_tag: &str) {
+        assert!(check_order_id_tag(order_id_tag).is_ok());
+    }
+
+    #[rstest]
+    #[case("A-B")]
+    #[case("-001")]
+    #[case("001-")]
+    fn test_check_order_id_tag_rejects_tag_with_separator(#[case] order_id_tag: &str) {
+        let error = check_order_id_tag(order_id_tag).unwrap_err();
+
+        match error {
+            CorrectnessError::PredicateViolation { ref message } => {
+                assert_eq!(
+                    message,
+                    &format!(
+                        "`order_id_tag` cannot contain the '-' strategy ID separator, was '{order_id_tag}'"
+                    )
+                );
+            }
+            other => panic!("Expected typed predicate violation, was: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_check_order_id_tag_rejects_tag_that_get_tag_would_truncate() {
+        let strategy_id = StrategyId::new("HyphenTagStrategy-A-B");
+
+        assert_eq!(strategy_id.get_tag(), "B");
+        assert!(check_order_id_tag("A-B").is_err());
     }
 
     #[rstest]
@@ -180,12 +259,61 @@ mod tests {
     }
 
     #[rstest]
-    fn test_new_checked_with_empty_name_returns_error() {
-        assert!(StrategyId::new_checked("-001").is_err());
+    fn test_new_checked_without_separator_returns_typed_error() {
+        let error = StrategyId::new_checked("EMACross001").unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::MissingSubstring {
+                param: "value".to_string(),
+                pattern: "-".to_string(),
+                value: "EMACross001".to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "invalid string for 'value' did not contain '-', was 'EMACross001'"
+        );
     }
 
     #[rstest]
-    fn test_new_checked_with_empty_tag_returns_error() {
-        assert!(StrategyId::new_checked("EMACross-").is_err());
+    #[case("-001", "`value` name part (before '-') cannot be empty")]
+    #[case("EMACross-", "`value` tag part (after '-') cannot be empty")]
+    fn test_new_checked_with_empty_component_returns_typed_error(
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        let error = StrategyId::new_checked(value).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: expected.to_string(),
+            }
+        );
+        assert_eq!(error.to_string(), expected);
+    }
+
+    // Tagged enums force serde to buffer the content and replay it, which
+    // can only feed owned strings to the inner deserializer. The `&str`
+    // impl previously rejected this with "expected a borrowed string".
+    #[rstest]
+    fn test_deserialize_inside_tagged_enum() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type")]
+        enum Wrapper {
+            Strategy { id: StrategyId },
+        }
+
+        let json = r#"{"type":"Strategy","id":"EMACross-001"}"#;
+        let Wrapper::Strategy { id } = serde_json::from_str(json).unwrap();
+        assert_eq!(id.as_str(), "EMACross-001");
+    }
+
+    #[rstest]
+    fn test_deserialize_from_serde_json_value() {
+        let value = serde_json::json!("EMACross-001");
+        let id: StrategyId = serde_json::from_value(value).unwrap();
+        assert_eq!(id.as_str(), "EMACross-001");
     }
 }

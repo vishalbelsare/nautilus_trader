@@ -15,23 +15,21 @@
 
 //! [NautilusTrader](https://nautilustrader.io) adapter for the [Deribit](https://www.deribit.com) cryptocurrency exchange.
 //!
-//! The `nautilus-deribit` crate provides client bindings (HTTP & WebSocket), data
-//! models and helper utilities that wrap the official **Deribit API v2**.
+//! The `nautilus-deribit` crate provides client bindings (HTTP & WebSocket) and data
+//! models for the official **Deribit API v2**.
 //!
 //! Deribit uses JSON-RPC 2.0 over both HTTP and WebSocket transports (not REST).
 //! WebSocket is preferred for subscriptions and real-time data.
 //!
-//! The official Deribit API reference can be found at <https://docs.deribit.com/v2/>.
+//! The official Deribit API reference can be found at <https://docs.deribit.com/>.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -40,10 +38,13 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `arrow`: Enables Apache Arrow data support.
+//! - `examples`: Enables the crate's example binaries.
 //! - `extension-module`: Builds as a Python extension module.
-//!
-//! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
+//! - `high-precision` (default): Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -52,10 +53,14 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod common;
 pub mod config;
 pub mod data;
+pub mod data_types;
 pub mod execution;
 pub mod factories;
 pub mod http;

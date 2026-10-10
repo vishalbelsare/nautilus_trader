@@ -18,48 +18,55 @@
 use std::{
     future::Future,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
     clients::DataClient,
-    live::{get_data_event_sender, get_runtime},
+    live::{get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent,
         data::{
-            BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
+            BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
             SubscribeBookDeltas, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-            SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrumentStatus,
+            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
 use nautilus_core::{
+    AtomicMap, AtomicSet,
     datetime::datetime_to_unix_nanos,
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::{SocketControl, task::TaskGroup};
 use nautilus_model::{
-    data::{Data, OrderBookDeltas, OrderBookDeltas_API, QuoteTick},
+    data::{Data, OrderBookDeltas, QuoteTick},
     enums::BookType,
-    identifiers::{ClientId, InstrumentId, Symbol, Venue},
+    identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
 };
-use tokio::task::JoinHandle;
+use rust_decimal_macros::dec;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::consts::KRAKEN_VENUE,
+    common::{consts::KRAKEN_VENUE, lookup_instrument_in_snapshot},
     config::KrakenDataClientConfig,
-    http::KrakenFuturesHttpClient,
+    http::{
+        KrakenFuturesHttpClient, futures::client::KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND,
+    },
     websocket::futures::{
         client::KrakenFuturesWebSocketClient,
         messages::KrakenFuturesWsMessage,
@@ -84,17 +91,24 @@ pub struct KrakenFuturesDataClient {
     ws: KrakenFuturesWebSocketClient,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
-    instruments: Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-    quote_instruments: Arc<RwLock<AHashSet<InstrumentId>>>,
-    book_instruments: Arc<RwLock<AHashSet<InstrumentId>>>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    session_tasks: TaskGroup,
+    command_tasks: TaskGroup,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    quote_instruments: Arc<AtomicSet<InstrumentId>>,
+    book_instruments: Arc<AtomicSet<InstrumentId>>,
+    data_sender: EventSender<DataEvent>,
 }
 
 impl KrakenFuturesDataClient {
     /// Creates a new [`KrakenFuturesDataClient`] instance.
     pub fn new(client_id: ClientId, config: KrakenDataClientConfig) -> anyhow::Result<Self> {
-        let cancellation_token = CancellationToken::new();
+        let session_tasks = TaskGroup::new();
+        let cancellation_token = session_tasks.cancellation_token();
+        let command_tasks = TaskGroup::new();
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http = KrakenFuturesHttpClient::new(
             config.environment,
@@ -103,14 +117,25 @@ impl KrakenFuturesDataClient {
             None,
             None,
             None,
-            config.http_proxy.clone(),
-            config.max_requests_per_second,
+            proxy_url.clone(),
+            config
+                .max_requests_per_second
+                .unwrap_or(KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND),
         )?;
 
-        let ws = KrakenFuturesWebSocketClient::new(
+        let ws = KrakenFuturesWebSocketClient::with_credentials(
             config.ws_public_url(),
             config.heartbeat_interval_secs,
-        );
+            None,
+            None,
+            config.transport_backend,
+            proxy_url,
+        )
+        .with_socket_control(SocketControl::new(
+            client_id,
+            Some(*KRAKEN_VENUE),
+            "kraken-futures-data-streams",
+        ));
 
         Ok(Self {
             clock: get_atomic_clock_realtime(),
@@ -120,10 +145,11 @@ impl KrakenFuturesDataClient {
             ws,
             is_connected: AtomicBool::new(false),
             cancellation_token,
-            tasks: Vec::new(),
-            instruments: Arc::new(RwLock::new(AHashMap::new())),
-            quote_instruments: Arc::new(RwLock::new(AHashSet::new())),
-            book_instruments: Arc::new(RwLock::new(AHashSet::new())),
+            session_tasks,
+            command_tasks,
+            instruments: Arc::new(AtomicMap::new()),
+            quote_instruments: Arc::new(AtomicSet::new()),
+            book_instruments: Arc::new(AtomicSet::new()),
             data_sender: get_data_event_sender(),
         })
     }
@@ -131,19 +157,13 @@ impl KrakenFuturesDataClient {
     /// Returns the cached instruments.
     #[must_use]
     pub fn instruments(&self) -> Vec<InstrumentAny> {
-        self.instruments
-            .read()
-            .map(|guard| guard.values().cloned().collect())
-            .unwrap_or_default()
+        self.instruments.load().values().cloned().collect()
     }
 
     /// Returns a cached instrument by ID.
     #[must_use]
     pub fn get_instrument(&self, instrument_id: &InstrumentId) -> Option<InstrumentAny> {
-        self.instruments
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(instrument_id).cloned())
+        self.instruments.load().get(instrument_id).cloned()
     }
 
     async fn load_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
@@ -153,15 +173,15 @@ impl KrakenFuturesDataClient {
             .await
             .context("Failed to load futures instruments")?;
 
-        if let Ok(mut guard) = self.instruments.write() {
+        self.instruments.rcu(|m| {
             for instrument in &instruments {
-                guard.insert(instrument.id(), instrument.clone());
+                m.insert(instrument.id(), instrument.clone());
             }
-        }
+        });
 
-        self.http.cache_instruments(instruments.clone());
+        self.http.cache_instruments(&instruments);
 
-        log::info!(
+        log::debug!(
             "Loaded instruments: client_id={}, count={}",
             self.client_id,
             instruments.len()
@@ -174,11 +194,79 @@ impl KrakenFuturesDataClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        get_runtime().spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::error!("{context}: {e:?}");
             }
-        });
+        };
+
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Kraken Futures {context} after shutdown began: {e}");
+        }
+    }
+
+    fn spawn_command<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Kraken Futures data command after shutdown began: {e}");
+        }
+    }
+
+    async fn finish_tasks(&self) -> anyhow::Result<()> {
+        let (session_result, command_result) = tokio::join!(
+            self.session_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+            self.command_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+        );
+        session_result.context("failed to finish Kraken Futures data session tasks")?;
+        command_result.context("failed to finish Kraken Futures data command tasks")?;
+        Ok(())
+    }
+
+    async fn prepare_task_groups(&mut self) -> anyhow::Result<()> {
+        if !self.session_tasks.is_open() || !self.command_tasks.is_open() {
+            self.session_tasks.begin_shutdown();
+            self.command_tasks.begin_shutdown();
+            let _ = self.ws.close().await;
+            self.finish_tasks().await?;
+            self.session_tasks
+                .start_generation()
+                .context("failed to start Kraken Futures data session task generation")?;
+            self.command_tasks
+                .start_generation()
+                .context("failed to start Kraken Futures data command task generation")?;
+            self.cancellation_token = self.session_tasks.cancellation_token();
+            self.ws = KrakenFuturesWebSocketClient::with_credentials(
+                self.config.ws_public_url(),
+                self.config.heartbeat_interval_secs,
+                None,
+                None,
+                self.config.transport_backend,
+                self.config
+                    .proxy_url
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
+            )
+            .with_socket_control(SocketControl::new(
+                self.client_id,
+                Some(*KRAKEN_VENUE),
+                "kraken-futures-data-streams",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        let ws_result = self.ws.close().await;
+        let tasks_result = self.finish_tasks().await;
+        self.is_connected.store(false, Ordering::Release);
+        tasks_result?;
+        Ok(ws_result?)
     }
 
     fn spawn_message_handler(&mut self) -> anyhow::Result<()> {
@@ -194,7 +282,7 @@ impl KrakenFuturesDataClient {
         let cancellation_token = self.cancellation_token.clone();
         let clock = self.clock;
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             let mut order_books: AHashMap<InstrumentId, OrderBook> = AHashMap::new();
             let mut last_quotes: AHashMap<InstrumentId, QuoteTick> = AHashMap::new();
 
@@ -227,30 +315,20 @@ impl KrakenFuturesDataClient {
                     }
                 }
             }
-        });
+        };
 
-        self.tasks.push(handle);
-        Ok(())
+        self.session_tasks
+            .spawn(future)
+            .context("failed to register Kraken Futures message handler")
     }
 
-    fn lookup_instrument(
-        instruments: &Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-        product_id: &str,
-    ) -> Option<InstrumentAny> {
-        let instrument_id = InstrumentId::new(Symbol::new(product_id), *KRAKEN_VENUE);
-        instruments
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(&instrument_id).cloned())
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         msg: KrakenFuturesWsMessage,
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-        instruments: &Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-        quote_instruments: &Arc<RwLock<AHashSet<InstrumentId>>>,
-        book_instruments: &Arc<RwLock<AHashSet<InstrumentId>>>,
+        sender: &EventSender<DataEvent>,
+        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+        quote_instruments: &Arc<AtomicSet<InstrumentId>>,
+        book_instruments: &Arc<AtomicSet<InstrumentId>>,
         order_books: &mut AHashMap<InstrumentId, OrderBook>,
         last_quotes: &mut AHashMap<InstrumentId, QuoteTick>,
         book_sequence: &Arc<AtomicU64>,
@@ -260,39 +338,42 @@ impl KrakenFuturesDataClient {
 
         match msg {
             KrakenFuturesWsMessage::Ticker(ticker) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, ticker.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, ticker.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", ticker.product_id);
                     return;
                 };
 
-                if let Some(mark) = parse_futures_ws_mark_price(&ticker, &instrument, ts_init)
-                    && let Err(e) = sender.send(DataEvent::Data(Data::MarkPriceUpdate(mark)))
+                if let Some(mark) = parse_futures_ws_mark_price(&ticker, instrument, ts_init)
+                    && let Err(e) = sender.send(DataEvent::Data(Data::MarkPrice(mark)))
                 {
                     log::error!("Failed to send mark price: {e}");
                 }
 
-                if let Some(index) = parse_futures_ws_index_price(&ticker, &instrument, ts_init)
-                    && let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(index)))
+                if let Some(index) = parse_futures_ws_index_price(&ticker, instrument, ts_init)
+                    && let Err(e) = sender.send(DataEvent::Data(Data::IndexPrice(index)))
                 {
                     log::error!("Failed to send index price: {e}");
                 }
 
-                if let Some(funding) = parse_futures_ws_funding_rate(&ticker, &instrument, ts_init)
+                if let Some(funding) = parse_futures_ws_funding_rate(&ticker, instrument, ts_init)
                     && let Err(e) = sender.send(DataEvent::FundingRate(funding))
                 {
                     log::error!("Failed to send funding rate: {e}");
                 }
             }
             KrakenFuturesWsMessage::Trade(trade) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, trade.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, trade.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", trade.product_id);
                     return;
                 };
-                match parse_futures_ws_trade_tick(&trade, &instrument, ts_init) {
+
+                match parse_futures_ws_trade_tick(&trade, instrument, ts_init) {
                     Ok(tick) => {
                         if let Err(e) = sender.send(DataEvent::Data(Data::Trade(tick))) {
                             log::error!("Failed to send trade: {e}");
@@ -302,19 +383,18 @@ impl KrakenFuturesDataClient {
                 }
             }
             KrakenFuturesWsMessage::BookSnapshot(snapshot) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, snapshot.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, snapshot.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", snapshot.product_id);
                     return;
                 };
                 let instrument_id = instrument.id();
                 let sequence = book_sequence.load(Ordering::Relaxed);
+
                 match parse_futures_ws_book_snapshot_deltas(
-                    &snapshot,
-                    &instrument,
-                    sequence,
-                    ts_init,
+                    &snapshot, instrument, sequence, ts_init,
                 ) {
                     Ok(delta_vec) => {
                         if delta_vec.is_empty() {
@@ -323,10 +403,7 @@ impl KrakenFuturesDataClient {
                         book_sequence.fetch_add(delta_vec.len() as u64, Ordering::Relaxed);
                         let deltas = OrderBookDeltas::new(instrument_id, delta_vec);
 
-                        let has_quote_sub = quote_instruments
-                            .read()
-                            .map(|guard| guard.contains(&instrument_id))
-                            .unwrap_or(false);
+                        let has_quote_sub = quote_instruments.contains(&instrument_id);
 
                         if has_quote_sub {
                             let book = order_books
@@ -346,38 +423,33 @@ impl KrakenFuturesDataClient {
                             }
                         }
 
-                        let has_book_sub = book_instruments
-                            .read()
-                            .map(|guard| guard.contains(&instrument_id))
-                            .unwrap_or(false);
+                        let has_book_sub = book_instruments.contains(&instrument_id);
 
-                        if has_book_sub {
-                            let api_deltas = OrderBookDeltas_API::new(deltas);
-                            if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(api_deltas))) {
-                                log::error!("Failed to send book snapshot deltas: {e}");
-                            }
+                        if has_book_sub
+                            && let Err(e) =
+                                sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
+                        {
+                            log::error!("Failed to send book snapshot deltas: {e}");
                         }
                     }
                     Err(e) => log::error!("Failed to parse book snapshot: {e}"),
                 }
             }
             KrakenFuturesWsMessage::BookDelta(delta) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, delta.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, delta.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", delta.product_id);
                     return;
                 };
                 let instrument_id = instrument.id();
                 let sequence = book_sequence.fetch_add(1, Ordering::Relaxed);
-                match parse_futures_ws_book_delta(&delta, &instrument, sequence, ts_init) {
+                match parse_futures_ws_book_delta(&delta, instrument, sequence, ts_init) {
                     Ok(book_delta) => {
                         let deltas = OrderBookDeltas::new(instrument_id, vec![book_delta]);
 
-                        let has_quote_sub = quote_instruments
-                            .read()
-                            .map(|guard| guard.contains(&instrument_id))
-                            .unwrap_or(false);
+                        let has_quote_sub = quote_instruments.contains(&instrument_id);
 
                         if has_quote_sub && let Some(book) = order_books.get_mut(&instrument_id) {
                             if let Err(e) = book.apply_deltas(&deltas) {
@@ -393,16 +465,13 @@ impl KrakenFuturesDataClient {
                             }
                         }
 
-                        let has_book_sub = book_instruments
-                            .read()
-                            .map(|guard| guard.contains(&instrument_id))
-                            .unwrap_or(false);
+                        let has_book_sub = book_instruments.contains(&instrument_id);
 
-                        if has_book_sub {
-                            let api_deltas = OrderBookDeltas_API::new(deltas);
-                            if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(api_deltas))) {
-                                log::error!("Failed to send book delta: {e}");
-                            }
+                        if has_book_sub
+                            && let Err(e) =
+                                sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
+                        {
+                            log::error!("Failed to send book delta: {e}");
                         }
                     }
                     Err(e) => log::error!("Failed to parse book delta: {e}"),
@@ -423,7 +492,7 @@ impl KrakenFuturesDataClient {
         instrument_id: InstrumentId,
         last_quotes: &mut AHashMap<InstrumentId, QuoteTick>,
         ts_init: UnixNanos,
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
     ) {
         let (Some(bid_price), Some(ask_price)) = (book.best_bid_price(), book.best_ask_price())
         else {
@@ -433,9 +502,9 @@ impl KrakenFuturesDataClient {
             return;
         };
 
-        let bid = bid_price.as_f64();
-        let ask = ask_price.as_f64();
-        if bid > 0.0 && (ask - bid) / bid > 0.25 {
+        let bid = bid_price.as_decimal();
+        let ask = ask_price.as_decimal();
+        if bid > dec!(0) && (ask - bid) / bid > dec!(0.25) {
             log::debug!("Filtered quote with wide spread: bid={bid}, ask={ask}");
             return;
         }
@@ -483,39 +552,29 @@ impl DataClient for KrakenFuturesDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Futures data client: {}", self.client_id);
-        self.cancellation_token.cancel();
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws.begin_shutdown();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         log::info!("Resetting Futures data client: {}", self.client_id);
-        self.cancellation_token.cancel();
-
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
-
-        let mut ws = self.ws.clone();
-        get_runtime().spawn(async move {
-            let _ = ws.close().await;
-        });
-
-        if let Ok(mut instruments) = self.instruments.write() {
-            instruments.clear();
-        }
-
-        if let Ok(mut quotes) = self.quote_instruments.write() {
-            quotes.clear();
-        }
-
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws.begin_shutdown();
         self.is_connected.store(false, Ordering::Relaxed);
-        self.cancellation_token = CancellationToken::new();
+
+        self.instruments.store(ahash::AHashMap::new());
+
+        self.quote_instruments.store(ahash::AHashSet::new());
+
         Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
-        log::info!("Disposing Futures data client: {}", self.client_id);
+        log::debug!("Disposing Futures data client: {}", self.client_id);
         self.stop()
     }
 
@@ -528,22 +587,38 @@ impl DataClient for KrakenFuturesDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected() && self.session_tasks.is_open() && self.command_tasks.is_open() {
             return Ok(());
         }
 
+        self.prepare_task_groups().await?;
+
         let instruments = self.load_instruments().await?;
 
-        self.ws
-            .connect()
-            .await
-            .context("Failed to connect futures WebSocket")?;
-        self.ws
-            .wait_until_active(10.0)
-            .await
-            .context("Futures WebSocket failed to become active")?;
+        let session_result = async {
+            self.ws
+                .connect()
+                .await
+                .context("Failed to connect futures WebSocket")?;
+            self.ws
+                .wait_until_active(10.0)
+                .await
+                .context("Futures WebSocket failed to become active")?;
 
-        self.spawn_message_handler()?;
+            self.spawn_message_handler()?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(e) = session_result {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Kraken Futures data startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
+        }
 
         for instrument in instruments {
             if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
@@ -560,41 +635,26 @@ impl DataClient for KrakenFuturesDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.is_disconnected() {
-            return Ok(());
-        }
+        self.teardown_partial_connect().await?;
 
-        self.cancellation_token.cancel();
-        let _ = self.ws.close().await;
-
-        for handle in self.tasks.drain(..) {
-            if let Err(e) = handle.await {
-                log::error!("Error joining WebSocket task: {e:?}");
-            }
-        }
-
-        self.cancellation_token = CancellationToken::new();
-
-        if let Ok(mut quotes) = self.quote_instruments.write() {
-            quotes.clear();
-        }
+        self.quote_instruments.store(ahash::AHashSet::new());
         self.is_connected.store(false, Ordering::Relaxed);
 
         log::info!("Disconnected: client_id={}", self.client_id);
         Ok(())
     }
 
-    fn subscribe_instruments(&mut self, _cmd: &SubscribeInstruments) -> anyhow::Result<()> {
+    fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
         log::debug!("subscribe_instruments: Kraken instruments are fetched via HTTP on connect");
         Ok(())
     }
 
-    fn subscribe_instrument(&mut self, _cmd: &SubscribeInstrument) -> anyhow::Result<()> {
+    fn subscribe_instrument(&mut self, _cmd: SubscribeInstrument) -> anyhow::Result<()> {
         log::debug!("subscribe_instrument: Kraken instruments are fetched via HTTP on connect");
         Ok(())
     }
 
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
+    fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let depth = cmd.depth;
 
@@ -606,9 +666,7 @@ impl DataClient for KrakenFuturesDataClient {
             return Ok(());
         }
 
-        if let Ok(mut guard) = self.book_instruments.write() {
-            guard.insert(instrument_id);
-        }
+        self.book_instruments.insert(instrument_id);
 
         let ws = self.ws.clone();
         self.spawn_ws(
@@ -620,17 +678,14 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe book",
         );
 
-        log::info!("Subscribed to book: instrument_id={instrument_id}, depth={depth:?}");
         Ok(())
     }
 
-    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
-        if let Ok(mut guard) = self.quote_instruments.write() {
-            guard.insert(instrument_id);
-        }
+        self.quote_instruments.insert(instrument_id);
 
         self.spawn_ws(
             async move {
@@ -641,11 +696,10 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe quotes",
         );
 
-        log::info!("Subscribed to quotes: instrument_id={instrument_id}");
         Ok(())
     }
 
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -658,11 +712,10 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe trades",
         );
 
-        log::info!("Subscribed to trades: instrument_id={instrument_id}");
         Ok(())
     }
 
-    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> anyhow::Result<()> {
+    fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -675,11 +728,10 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe mark price",
         );
 
-        log::info!("Subscribed to mark price: instrument_id={instrument_id}");
         Ok(())
     }
 
-    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> anyhow::Result<()> {
+    fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -692,19 +744,10 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe index price",
         );
 
-        log::info!("Subscribed to index price: instrument_id={instrument_id}");
         Ok(())
     }
 
-    fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
-        log::warn!(
-            "Cannot subscribe to {} bars: Kraken Futures does not support EXTERNAL bar streaming",
-            cmd.bar_type
-        );
-        Ok(())
-    }
-
-    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> anyhow::Result<()> {
+    fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -717,16 +760,32 @@ impl DataClient for KrakenFuturesDataClient {
             "subscribe funding rate",
         );
 
-        log::info!("Subscribed to funding rate: instrument_id={instrument_id}");
+        Ok(())
+    }
+
+    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        log::warn!(
+            "Cannot subscribe to {} bars: Kraken Futures does not support EXTERNAL bar streaming",
+            cmd.bar_type
+        );
+        Ok(())
+    }
+
+    fn subscribe_instrument_status(
+        &mut self,
+        cmd: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        log::debug!(
+            "subscribe_instrument_status: {} (status changes detected via periodic instrument polling)",
+            cmd.instrument_id,
+        );
         Ok(())
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        if let Ok(mut guard) = self.book_instruments.write() {
-            guard.remove(&instrument_id);
-        }
+        self.book_instruments.remove(&instrument_id);
 
         let ws = self.ws.clone();
         self.spawn_ws(
@@ -738,7 +797,6 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe book",
         );
 
-        log::info!("Unsubscribed from book: instrument_id={instrument_id}");
         Ok(())
     }
 
@@ -746,9 +804,7 @@ impl DataClient for KrakenFuturesDataClient {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
-        if let Ok(mut guard) = self.quote_instruments.write() {
-            guard.remove(&instrument_id);
-        }
+        self.quote_instruments.remove(&instrument_id);
 
         self.spawn_ws(
             async move {
@@ -759,7 +815,6 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe quotes",
         );
 
-        log::info!("Unsubscribed from quotes: instrument_id={instrument_id}");
         Ok(())
     }
 
@@ -776,7 +831,6 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe trades",
         );
 
-        log::info!("Unsubscribed from trades: instrument_id={instrument_id}");
         Ok(())
     }
 
@@ -793,7 +847,6 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe mark price",
         );
 
-        log::info!("Unsubscribed from mark price: instrument_id={instrument_id}");
         Ok(())
     }
 
@@ -810,7 +863,6 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe index price",
         );
 
-        log::info!("Unsubscribed from index price: instrument_id={instrument_id}");
         Ok(())
     }
 
@@ -827,11 +879,17 @@ impl DataClient for KrakenFuturesDataClient {
             "unsubscribe funding rate",
         );
 
-        log::info!("Unsubscribed from funding rate: instrument_id={instrument_id}");
         Ok(())
     }
 
     fn unsubscribe_bars(&mut self, _cmd: &UnsubscribeBars) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        _cmd: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -847,15 +905,15 @@ impl DataClient for KrakenFuturesDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_instruments().await {
                 Ok(instruments) => {
-                    if let Ok(mut guard) = instruments_cache.write() {
+                    instruments_cache.rcu(|m| {
                         for instrument in &instruments {
-                            guard.insert(instrument.id(), instrument.clone());
+                            m.insert(instrument.id(), instrument.clone());
                         }
-                    }
-                    http.cache_instruments(instruments.clone());
+                    });
+                    http.cache_instruments(&instruments);
 
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
                         request_id,
@@ -891,37 +949,15 @@ impl DataClient for KrakenFuturesDataClient {
         let params = request.params;
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
-            {
-                if let Ok(guard) = instruments.read()
-                    && let Some(instrument) = guard.get(&instrument_id)
-                {
-                    let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                        request_id,
-                        client_id,
-                        instrument.id(),
-                        instrument.clone(),
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    )));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send instrument response: {e}");
-                    }
-                    return;
-                }
-            }
-
+        self.spawn_command(async move {
             match http.request_instruments().await {
                 Ok(all_instruments) => {
-                    if let Ok(mut guard) = instruments.write() {
+                    instruments.rcu(|m| {
                         for instrument in &all_instruments {
-                            guard.insert(instrument.id(), instrument.clone());
+                            m.insert(instrument.id(), instrument.clone());
                         }
-                    }
-                    http.cache_instruments(all_instruments.clone());
+                    });
+                    http.cache_instruments(&all_instruments);
 
                     let instrument = all_instruments
                         .into_iter()
@@ -967,7 +1003,7 @@ impl DataClient for KrakenFuturesDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_trades(instrument_id, start, end, limit).await {
                 Ok(trades) => {
                     let response = DataResponse::Trades(TradesResponse::new(
@@ -1006,7 +1042,7 @@ impl DataClient for KrakenFuturesDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http.request_bars(bar_type, start, end, limit).await {
                 Ok(bars) => {
                     let response = DataResponse::Bars(BarsResponse::new(
@@ -1030,16 +1066,95 @@ impl DataClient for KrakenFuturesDataClient {
 
         Ok(())
     }
+
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let http = self.http.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let depth = request.depth.map(|n| n.get() as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+
+        self.spawn_command(async move {
+            match http.request_book_snapshot(instrument_id, depth).await {
+                Ok(book) => {
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Book snapshot request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let http = self.http.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get());
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+        let params = request.params;
+        let clock = self.clock;
+
+        self.spawn_command(async move {
+            match http
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+            {
+                Ok(rates) => {
+                    let response = DataResponse::FundingRates(FundingRatesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        rates,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send funding rates response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Funding rates request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use nautilus_common::{live::runner::set_data_event_sender, messages::DataEvent};
-    use nautilus_model::identifiers::ClientId;
     use rstest::rstest;
 
     use super::*;
-    use crate::{common::enums::KrakenProductType, config::KrakenDataClientConfig};
+    use crate::{
+        common::{consts::KRAKEN_CLIENT_ID, enums::KrakenProductType},
+        config::KrakenDataClientConfig,
+    };
 
     fn setup_test_env() {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -1053,11 +1168,11 @@ mod tests {
             product_type: KrakenProductType::Futures,
             ..Default::default()
         };
-        let client = KrakenFuturesDataClient::new(ClientId::from("KRAKEN"), config);
+        let client = KrakenFuturesDataClient::new(*KRAKEN_CLIENT_ID, config);
         assert!(client.is_ok());
 
         let client = client.unwrap();
-        assert_eq!(client.client_id(), ClientId::from("KRAKEN"));
+        assert_eq!(client.client_id(), *KRAKEN_CLIENT_ID);
         assert_eq!(client.venue(), Some(*KRAKEN_VENUE));
         assert!(!client.is_connected());
         assert!(client.is_disconnected());
@@ -1071,7 +1186,7 @@ mod tests {
             product_type: KrakenProductType::Futures,
             ..Default::default()
         };
-        let mut client = KrakenFuturesDataClient::new(ClientId::from("KRAKEN"), config).unwrap();
+        let mut client = KrakenFuturesDataClient::new(*KRAKEN_CLIENT_ID, config).unwrap();
 
         assert!(client.start().is_ok());
         assert!(client.stop().is_ok());

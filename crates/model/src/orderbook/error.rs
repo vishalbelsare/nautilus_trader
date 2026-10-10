@@ -20,7 +20,7 @@ use nautilus_core::UnixNanos;
 use super::ladder::BookPrice;
 use crate::{
     enums::{BookType, OrderSide},
-    identifiers::InstrumentId,
+    identifiers::{ClientOrderId, InstrumentId},
 };
 
 #[derive(thiserror::Error, Debug, PartialEq)]
@@ -41,6 +41,8 @@ pub enum BookIntegrityError {
     NoOrderSide,
     #[error("Integrity error: order_id={0} not found in book for side resolution")]
     OrderNotFoundForSideResolution(u64),
+    #[error("Integrity error: order_id={0} found on both book sides for side resolution")]
+    AmbiguousOrderSide(u64),
     #[error("Integrity error: orders in cross [{0} {1}]")]
     OrdersCrossed(BookPrice, BookPrice),
     #[error("Integrity error: number of {0} orders at level > 1 for L2_MBP book, was {1}")]
@@ -58,4 +60,22 @@ pub enum BookViewError {
 
     #[error("Opposite own book must have different instrument ID: book={0}, opposite={1}")]
     OppositeInstrumentMatch(InstrumentId, InstrumentId),
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum OwnBookError {
+    #[error("Own book order not found in cache: client_order_id={client_order_id}")]
+    OrderNotFoundInCache { client_order_id: ClientOrderId },
+    #[error("Own book cached level missing: client_order_id={client_order_id}, price={price:?}")]
+    CachedLevelMissing {
+        client_order_id: ClientOrderId,
+        price: BookPrice,
+    },
+    #[error(
+        "Own book order not found at level: client_order_id={client_order_id}, price={price:?}"
+    )]
+    OrderNotFoundAtLevel {
+        client_order_id: ClientOrderId,
+        price: BookPrice,
+    },
 }

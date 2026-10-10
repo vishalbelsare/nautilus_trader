@@ -15,20 +15,26 @@
 
 //! PyO3 registry system for generic trait object extraction.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
 
-use nautilus_core::{MUTEX_POISONED, python::to_pynotimplemented_err};
+use nautilus_common::factories::{
+    ClientConfig, DataClientFactory, ExecutionClientFactory, SimulatedExecutionClientFactory,
+};
+use nautilus_core::python::to_pynotimplemented_err;
+use parking_lot::Mutex;
 use pyo3::prelude::*;
-
-use crate::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 
 /// Function type for extracting a `Py<PyAny>` factory to a boxed `DataClientFactory` trait object.
 pub type FactoryExtractor =
     fn(py: Python<'_>, factory: Py<PyAny>) -> PyResult<Box<dyn DataClientFactory>>;
 
 /// Function type for extracting a `Py<PyAny>` factory to a boxed `ExecutionClientFactory` trait object.
-pub type ExecFactoryExtractor =
+pub type ExecutionFactoryExtractor =
     fn(py: Python<'_>, factory: Py<PyAny>) -> PyResult<Box<dyn ExecutionClientFactory>>;
+
+/// Function type for extracting a `Py<PyAny>` factory to a boxed `SimulatedExecutionClientFactory` trait object.
+pub type SimulatedExecutionFactoryExtractor =
+    fn(py: Python<'_>, factory: Py<PyAny>) -> PyResult<Box<dyn SimulatedExecutionClientFactory>>;
 
 /// Function type for extracting a `Py<PyAny>` config to a boxed `ClientConfig` trait object.
 pub type ConfigExtractor = fn(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn ClientConfig>>;
@@ -41,8 +47,9 @@ pub type ConfigExtractor = fn(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box
 #[derive(Debug)]
 pub struct FactoryRegistry {
     factory_extractors: Mutex<HashMap<String, FactoryExtractor>>,
-    exec_factory_extractors: Mutex<HashMap<String, ExecFactoryExtractor>>,
-    config_extractors: Mutex<HashMap<String, ConfigExtractor>>,
+    exec_factory_extractors: Mutex<HashMap<String, ExecutionFactoryExtractor>>,
+    sim_exec_factory_extractors: Mutex<HashMap<String, SimulatedExecutionFactoryExtractor>>,
+    config_extractors_by_type: Mutex<HashMap<String, ConfigExtractor>>,
 }
 
 impl FactoryRegistry {
@@ -52,7 +59,8 @@ impl FactoryRegistry {
         Self {
             factory_extractors: Mutex::new(HashMap::new()),
             exec_factory_extractors: Mutex::new(HashMap::new()),
-            config_extractors: Mutex::new(HashMap::new()),
+            sim_exec_factory_extractors: Mutex::new(HashMap::new()),
+            config_extractors_by_type: Mutex::new(HashMap::new()),
         }
     }
 
@@ -61,16 +69,12 @@ impl FactoryRegistry {
     /// # Errors
     ///
     /// Returns an error if a factory with the same name is already registered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn register_factory_extractor(
         &self,
         name: String,
         extractor: FactoryExtractor,
     ) -> anyhow::Result<()> {
-        let mut extractors = self.factory_extractors.lock().expect(MUTEX_POISONED);
+        let mut extractors = self.factory_extractors.lock();
 
         if extractors.contains_key(&name) {
             anyhow::bail!("Factory extractor '{name}' is already registered");
@@ -84,16 +88,12 @@ impl FactoryRegistry {
     /// # Errors
     ///
     /// Returns an error if a config with the same type name is already registered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn register_config_extractor(
         &self,
         type_name: String,
         extractor: ConfigExtractor,
     ) -> anyhow::Result<()> {
-        let mut extractors = self.config_extractors.lock().expect(MUTEX_POISONED);
+        let mut extractors = self.config_extractors_by_type.lock();
 
         if extractors.contains_key(&type_name) {
             anyhow::bail!("Config extractor '{type_name}' is already registered");
@@ -108,19 +108,34 @@ impl FactoryRegistry {
     /// # Errors
     ///
     /// Returns an error if a factory with the same name is already registered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn register_exec_factory_extractor(
         &self,
         name: String,
-        extractor: ExecFactoryExtractor,
+        extractor: ExecutionFactoryExtractor,
     ) -> anyhow::Result<()> {
-        let mut extractors = self.exec_factory_extractors.lock().expect(MUTEX_POISONED);
+        let mut extractors = self.exec_factory_extractors.lock();
 
         if extractors.contains_key(&name) {
             anyhow::bail!("Execution factory extractor '{name}' is already registered");
+        }
+        extractors.insert(name, extractor);
+        Ok(())
+    }
+
+    /// Registers a simulated execution factory extractor for a specific factory name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a factory with the same name is already registered.
+    pub fn register_sim_exec_factory_extractor(
+        &self,
+        name: String,
+        extractor: SimulatedExecutionFactoryExtractor,
+    ) -> anyhow::Result<()> {
+        let mut extractors = self.sim_exec_factory_extractors.lock();
+
+        if extractors.contains_key(&name) {
+            anyhow::bail!("Simulated execution factory extractor '{name}' is already registered");
         }
         extractors.insert(name, extractor);
         Ok(())
@@ -131,10 +146,6 @@ impl FactoryRegistry {
     /// # Errors
     ///
     /// Returns an error if no extractor is registered for the factory type or extraction fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn extract_factory(
         &self,
         py: Python<'_>,
@@ -146,7 +157,7 @@ impl FactoryRegistry {
             .call0(py)?
             .extract::<String>(py)?;
 
-        let extractors = self.factory_extractors.lock().expect(MUTEX_POISONED);
+        let extractors = self.factory_extractors.lock();
         if let Some(extractor) = extractors.get(&factory_name) {
             extractor(py, factory)
         } else {
@@ -161,10 +172,6 @@ impl FactoryRegistry {
     /// # Errors
     ///
     /// Returns an error if no extractor is registered for the factory type or extraction fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn extract_exec_factory(
         &self,
         py: Python<'_>,
@@ -175,7 +182,7 @@ impl FactoryRegistry {
             .call0(py)?
             .extract::<String>(py)?;
 
-        let extractors = self.exec_factory_extractors.lock().expect(MUTEX_POISONED);
+        let extractors = self.exec_factory_extractors.lock();
         if let Some(extractor) = extractors.get(&factory_name) {
             extractor(py, factory)
         } else {
@@ -185,15 +192,37 @@ impl FactoryRegistry {
         }
     }
 
+    /// Extracts a `Py<PyAny>` factory to a boxed `SimulatedExecutionClientFactory` trait object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no extractor is registered for the factory type or extraction fails.
+    pub fn extract_sim_exec_factory(
+        &self,
+        py: Python<'_>,
+        factory: Py<PyAny>,
+    ) -> PyResult<Box<dyn SimulatedExecutionClientFactory>> {
+        let factory_name = factory
+            .getattr(py, "name")?
+            .call0(py)?
+            .extract::<String>(py)?;
+
+        let extractors = self.sim_exec_factory_extractors.lock();
+
+        if let Some(extractor) = extractors.get(&factory_name) {
+            extractor(py, factory)
+        } else {
+            Err(to_pynotimplemented_err(format!(
+                "No simulated execution factory extractor registered for '{factory_name}'"
+            )))
+        }
+    }
+
     /// Extracts a `Py<PyAny>` config to a boxed `ClientConfig` trait object.
     ///
     /// # Errors
     ///
     /// Returns an error if no extractor is registered for the config type or extraction fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn extract_config(
         &self,
         py: Python<'_>,
@@ -205,7 +234,7 @@ impl FactoryRegistry {
             .getattr(py, "__name__")?
             .extract::<String>(py)?;
 
-        let extractors = self.config_extractors.lock().expect(MUTEX_POISONED);
+        let extractors = self.config_extractors_by_type.lock();
         if let Some(extractor) = extractors.get(&config_type_name) {
             extractor(py, config)
         } else {

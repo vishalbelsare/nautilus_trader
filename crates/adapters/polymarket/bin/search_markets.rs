@@ -26,8 +26,11 @@
 //! cargo run -p nautilus-polymarket --bin polymarket-search-markets -- "world cup"
 //! ```
 
+use std::sync::Arc;
+
 use nautilus_common::providers::InstrumentProvider;
 use nautilus_model::instruments::{Instrument, InstrumentAny};
+use nautilus_network::retry::RetryConfig;
 use nautilus_polymarket::{
     filters::SearchFilter, http::gamma::PolymarketGammaHttpClient,
     providers::PolymarketInstrumentProvider,
@@ -41,10 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "bitcoin".to_string());
 
-    let http_client = PolymarketGammaHttpClient::new(None, None)?;
+    let http_client = PolymarketGammaHttpClient::new(None, 60, RetryConfig::default())?;
 
     let filter = SearchFilter::from_query(&query);
-    let mut provider = PolymarketInstrumentProvider::with_filter(http_client, Box::new(filter));
+    let mut provider =
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
     provider.load_all(None).await?;
 
     let instruments = provider.store().list_all();
@@ -53,10 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, instrument) in instruments.into_iter().enumerate().take(20) {
         let id = Instrument::id(instrument);
         let expiration = Instrument::expiration_ns(instrument).map_or("N/A".to_string(), |ns| {
-            let secs = (ns.as_u64() / 1_000_000_000) as i64;
-            chrono::DateTime::from_timestamp(secs, 0).map_or("N/A".to_string(), |dt| {
-                dt.format("%Y-%m-%d %H:%M UTC").to_string()
-            })
+            ns.to_datetime_utc()
+                .strftime("%Y-%m-%d %H:%M UTC")
+                .to_string()
         });
 
         if let InstrumentAny::BinaryOption(opt) = instrument {

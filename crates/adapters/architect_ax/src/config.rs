@@ -15,74 +15,101 @@
 
 //! Configuration structures for the AX Exchange adapter.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
+use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
+use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
+use serde::{Deserialize, Serialize};
 
-use crate::common::credential::credential_env_vars;
+use crate::common::{credential::credential_env_vars, enums::AxEnvironment};
 
 /// Configuration for the AX Exchange live data client.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.architect",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.architect_ax", from_py_object)
 )]
-#[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.architect_ax")
+)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 pub struct AxDataClientConfig {
     /// Optional API key for authenticated REST/WebSocket requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret for authenticated REST/WebSocket requests.
-    pub api_secret: Option<String>,
-    /// Use sandbox environment (default: false).
-    pub is_sandbox: bool,
+    pub api_secret: Option<SecretString>,
+    /// Trading environment (Sandbox or Production).
+    #[builder(default)]
+    pub environment: AxEnvironment,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the public WebSocket URL.
     pub base_url_ws_public: Option<String>,
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
-    /// Optional REST timeout in seconds.
-    pub http_timeout_secs: Option<u64>,
-    /// Optional maximum retry attempts for REST requests.
-    pub max_retries: Option<u32>,
-    /// Optional initial retry backoff in milliseconds.
-    pub retry_delay_initial_ms: Option<u64>,
-    /// Optional maximum retry backoff in milliseconds.
-    pub retry_delay_max_ms: Option<u64>,
-    /// Optional heartbeat interval (seconds) for WebSocket clients.
-    pub heartbeat_interval_secs: Option<u64>,
-    /// Optional receive window in milliseconds for signed requests.
-    pub recv_window_ms: Option<u64>,
-    /// Optional interval (minutes) for instrument refresh from REST.
-    pub update_instruments_interval_mins: Option<u64>,
-    /// Optional funding rate poll interval in minutes.
-    pub funding_rate_poll_interval_mins: Option<u64>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
+    /// REST timeout in seconds.
+    #[builder(default = 60)]
+    pub http_timeout_secs: u64,
+    /// Maximum retry attempts for REST requests.
+    #[builder(default = 3)]
+    pub max_retries: u32,
+    /// Initial retry backoff in milliseconds.
+    #[builder(default = 1_000)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum retry backoff in milliseconds.
+    #[builder(default = 10_000)]
+    pub retry_delay_max_ms: u64,
+    /// Heartbeat interval (seconds) for WebSocket clients.
+    #[builder(default = 20)]
+    pub heartbeat_interval_secs: u64,
+    /// Receive window in milliseconds for signed requests.
+    #[builder(default = 5_000)]
+    pub recv_window_ms: u64,
+    /// Interval (minutes) for instrument refresh from REST.
+    #[builder(default = 60)]
+    pub update_instruments_interval_mins: u64,
+    /// Funding rate poll interval in minutes.
+    #[builder(default = 15)]
+    pub funding_rate_poll_interval_mins: u64,
+    /// Maximum time to wait for an initial, post-reconnect, or recovery order book
+    /// snapshot in seconds.
+    ///
+    /// Set to 0 to disable snapshot deadlines.
+    #[builder(default = DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS)]
+    pub book_snapshot_timeout_secs: u64,
+    /// WebSocket transport backend.
+    ///
+    /// Defaults to `Sockudo` when `transport-sockudo` is enabled, otherwise `Tungstenite`.
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxDataClientConfig {
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: u64,
+    funding_rate_poll_interval_mins: u64,
+    book_snapshot_timeout_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for AxDataClientConfig {
     fn default() -> Self {
-        Self {
-            api_key: None,
-            api_secret: None,
-            is_sandbox: false,
-            base_url_http: None,
-            base_url_ws_public: None,
-            base_url_ws_private: None,
-            http_proxy_url: None,
-            ws_proxy_url: None,
-            http_timeout_secs: Some(60),
-            max_retries: Some(3),
-            retry_delay_initial_ms: Some(1_000),
-            retry_delay_max_ms: Some(10_000),
-            heartbeat_interval_secs: Some(20),
-            recv_window_ms: Some(5_000),
-            update_instruments_interval_mins: Some(60),
-            funding_rate_poll_interval_mins: Some(15),
-        }
+        Self::builder().build()
     }
 }
 
@@ -105,108 +132,110 @@ impl AxDataClientConfig {
     /// Returns the REST base URL, considering overrides and environment.
     #[must_use]
     pub fn http_base_url(&self) -> String {
-        self.base_url_http.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "https://gateway.sandbox.architect.exchange/api".to_string()
-            } else {
-                "https://gateway.architect.exchange/api".to_string()
-            }
-        })
+        self.base_url_http
+            .clone()
+            .unwrap_or_else(|| self.environment.http_url().to_string())
     }
 
     /// Returns the public WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_public_url(&self) -> String {
-        self.base_url_ws_public.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "wss://gateway.sandbox.architect.exchange/md/ws".to_string()
-            } else {
-                "wss://gateway.architect.exchange/md/ws".to_string()
-            }
-        })
+        self.base_url_ws_public
+            .clone()
+            .unwrap_or_else(|| self.environment.ws_md_url().to_string())
     }
 
     /// Returns the private WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_private_url(&self) -> String {
-        self.base_url_ws_private.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "wss://gateway.sandbox.architect.exchange/orders/ws".to_string()
-            } else {
-                "wss://gateway.architect.exchange/orders/ws".to_string()
-            }
-        })
+        self.base_url_ws_private
+            .clone()
+            .unwrap_or_else(|| self.environment.ws_orders_url().to_string())
     }
 }
 
 /// Configuration for the AX Exchange live execution client.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.architect",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.architect_ax", from_py_object)
 )]
-#[derive(Clone, Debug)]
-pub struct AxExecClientConfig {
-    /// The trader ID for the client.
-    pub trader_id: TraderId,
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.architect_ax")
+)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct AxExecutionClientConfig {
     /// The account ID for the client.
+    #[builder(default = AccountId::from("AX-001"))]
     pub account_id: AccountId,
     /// API key for authenticated requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// API secret for authenticated requests.
-    pub api_secret: Option<String>,
-    /// Use sandbox environment (default: true).
-    pub is_sandbox: bool,
+    pub api_secret: Option<SecretString>,
+    /// Trading environment (Sandbox or Production).
+    #[builder(default)]
+    pub environment: AxEnvironment,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the orders REST base URL.
     pub base_url_orders: Option<String>,
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
-    /// Optional REST timeout in seconds.
-    pub http_timeout_secs: Option<u64>,
-    /// Optional maximum retry attempts for REST requests.
-    pub max_retries: Option<u32>,
-    /// Optional initial retry backoff in milliseconds.
-    pub retry_delay_initial_ms: Option<u64>,
-    /// Optional maximum retry backoff in milliseconds.
-    pub retry_delay_max_ms: Option<u64>,
-    /// Optional heartbeat interval (seconds) for WebSocket clients.
-    pub heartbeat_interval_secs: Option<u64>,
-    /// Optional receive window in milliseconds for signed requests.
-    pub recv_window_ms: Option<u64>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
+    /// REST timeout in seconds.
+    #[builder(default = 60)]
+    pub http_timeout_secs: u64,
+    /// Maximum retry attempts for REST requests.
+    #[builder(default = 3)]
+    pub max_retries: u32,
+    /// Initial retry backoff in milliseconds.
+    #[builder(default = 1_000)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum retry backoff in milliseconds.
+    #[builder(default = 10_000)]
+    pub retry_delay_max_ms: u64,
+    /// Heartbeat interval (seconds) for WebSocket clients.
+    #[builder(default = 30)]
+    pub heartbeat_interval_secs: u64,
+    /// Receive window in milliseconds for signed requests.
+    #[builder(default = 5_000)]
+    pub recv_window_ms: u64,
+    /// Cancel all open orders when the orders WebSocket disconnects.
+    #[builder(default)]
+    pub cancel_on_disconnect: bool,
+    /// WebSocket transport backend.
+    ///
+    /// Defaults to `Sockudo` when `transport-sockudo` is enabled, otherwise `Tungstenite`.
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
-impl Default for AxExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(AxExecutionClientConfig {
+    account_id: AccountId,
+    environment: AxEnvironment,
+    base_url_http: Option<String>,
+    base_url_orders: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    cancel_on_disconnect: bool,
+    transport_backend: TransportBackend,
+});
+
+impl Default for AxExecutionClientConfig {
     fn default() -> Self {
-        Self {
-            trader_id: TraderId::from("TRADER-001"),
-            account_id: AccountId::from("AX-001"),
-            api_key: None,
-            api_secret: None,
-            is_sandbox: true,
-            base_url_http: None,
-            base_url_orders: None,
-            base_url_ws_private: None,
-            http_proxy_url: None,
-            ws_proxy_url: None,
-            http_timeout_secs: Some(60),
-            max_retries: Some(3),
-            retry_delay_initial_ms: Some(1_000),
-            retry_delay_max_ms: Some(10_000),
-            heartbeat_interval_secs: Some(30),
-            recv_window_ms: Some(5_000),
-        }
+        Self::builder().build()
     }
 }
 
-impl AxExecClientConfig {
+impl AxExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
@@ -225,36 +254,184 @@ impl AxExecClientConfig {
     /// Returns the REST base URL, considering overrides and environment.
     #[must_use]
     pub fn http_base_url(&self) -> String {
-        self.base_url_http.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "https://gateway.sandbox.architect.exchange/api".to_string()
-            } else {
-                "https://gateway.architect.exchange/api".to_string()
-            }
-        })
+        self.base_url_http
+            .clone()
+            .unwrap_or_else(|| self.environment.http_url().to_string())
     }
 
     /// Returns the orders REST base URL, considering overrides and environment.
     #[must_use]
     pub fn orders_base_url(&self) -> String {
-        self.base_url_orders.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "https://gateway.sandbox.architect.exchange/orders".to_string()
-            } else {
-                "https://gateway.architect.exchange/orders".to_string()
-            }
-        })
+        self.base_url_orders
+            .clone()
+            .unwrap_or_else(|| self.environment.orders_url().to_string())
     }
 
     /// Returns the private WebSocket URL, considering overrides and environment.
     #[must_use]
     pub fn ws_private_url(&self) -> String {
-        self.base_url_ws_private.clone().unwrap_or_else(|| {
-            if self.is_sandbox {
-                "wss://gateway.sandbox.architect.exchange/orders/ws".to_string()
-            } else {
-                "wss://gateway.architect.exchange/orders/ws".to_string()
-            }
-        })
+        self.base_url_ws_private
+            .clone()
+            .unwrap_or_else(|| self.environment.ws_orders_url().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::common::consts::{
+        AX_HTTP_SANDBOX_URL, AX_HTTP_URL, AX_ORDERS_SANDBOX_URL, AX_ORDERS_URL, AX_WS_PRIVATE_URL,
+        AX_WS_PUBLIC_URL, AX_WS_SANDBOX_PRIVATE_URL, AX_WS_SANDBOX_PUBLIC_URL,
+    };
+
+    #[rstest]
+    fn test_data_config_sandbox_urls_match_consts() {
+        let config = AxDataClientConfig::builder()
+            .environment(AxEnvironment::Sandbox)
+            .build();
+        assert_eq!(config.http_base_url(), AX_HTTP_SANDBOX_URL);
+        assert_eq!(config.ws_public_url(), AX_WS_SANDBOX_PUBLIC_URL);
+        assert_eq!(config.ws_private_url(), AX_WS_SANDBOX_PRIVATE_URL);
+    }
+
+    #[rstest]
+    fn test_data_config_production_urls_match_consts() {
+        let config = AxDataClientConfig::builder()
+            .environment(AxEnvironment::Production)
+            .build();
+        assert_eq!(config.http_base_url(), AX_HTTP_URL);
+        assert_eq!(config.ws_public_url(), AX_WS_PUBLIC_URL);
+        assert_eq!(config.ws_private_url(), AX_WS_PRIVATE_URL);
+    }
+
+    #[rstest]
+    fn test_data_config_url_overrides() {
+        let config = AxDataClientConfig::builder()
+            .base_url_http("http://custom".to_string())
+            .base_url_ws_public("ws://custom-pub".to_string())
+            .base_url_ws_private("ws://custom-priv".to_string())
+            .build();
+        assert_eq!(config.http_base_url(), "http://custom");
+        assert_eq!(config.ws_public_url(), "ws://custom-pub");
+        assert_eq!(config.ws_private_url(), "ws://custom-priv");
+    }
+
+    #[rstest]
+    fn test_exec_config_sandbox_urls_match_consts() {
+        let config = AxExecutionClientConfig::builder()
+            .environment(AxEnvironment::Sandbox)
+            .build();
+        assert_eq!(config.http_base_url(), AX_HTTP_SANDBOX_URL);
+        assert_eq!(config.orders_base_url(), AX_ORDERS_SANDBOX_URL);
+        assert_eq!(config.ws_private_url(), AX_WS_SANDBOX_PRIVATE_URL);
+    }
+
+    #[rstest]
+    fn test_exec_config_production_urls_match_consts() {
+        let config = AxExecutionClientConfig::builder()
+            .environment(AxEnvironment::Production)
+            .build();
+        assert_eq!(config.http_base_url(), AX_HTTP_URL);
+        assert_eq!(config.orders_base_url(), AX_ORDERS_URL);
+        assert_eq!(config.ws_private_url(), AX_WS_PRIVATE_URL);
+    }
+
+    #[rstest]
+    fn test_exec_config_cancel_on_disconnect_default_false() {
+        let config = AxExecutionClientConfig::default();
+        assert!(!config.cancel_on_disconnect);
+    }
+
+    #[rstest]
+    fn test_exec_config_cancel_on_disconnect_enabled() {
+        let config = AxExecutionClientConfig::builder()
+            .cancel_on_disconnect(true)
+            .build();
+        assert!(config.cancel_on_disconnect);
+    }
+
+    #[rstest]
+    fn test_default_environment_is_sandbox() {
+        let data = AxDataClientConfig::default();
+        assert_eq!(data.environment, AxEnvironment::Sandbox);
+
+        let exec = AxExecutionClientConfig::default();
+        assert_eq!(exec.environment, AxEnvironment::Sandbox);
+    }
+
+    #[rstest]
+    fn test_data_config_toml_minimal() {
+        let config: AxDataClientConfig = toml::from_str(
+            r#"
+environment = "PRODUCTION"
+http_timeout_secs = 30
+heartbeat_interval_secs = 10
+update_instruments_interval_mins = 5
+book_snapshot_timeout_secs = 4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.environment, AxEnvironment::Production);
+        assert_eq!(config.http_timeout_secs, 30);
+        assert_eq!(config.heartbeat_interval_secs, 10);
+        assert_eq!(config.update_instruments_interval_mins, 5);
+        assert_eq!(config.book_snapshot_timeout_secs, 4);
+    }
+
+    #[rstest]
+    fn test_data_config_toml_empty_uses_book_snapshot_timeout_default() {
+        let config: AxDataClientConfig = toml::from_str("").unwrap();
+
+        assert_eq!(config.book_snapshot_timeout_secs, 10);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_empty_uses_defaults() {
+        let config: AxExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = AxExecutionClientConfig::default();
+        assert_eq!(config.account_id, expected.account_id);
+        assert_eq!(config.environment, expected.environment);
+        assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
+        assert_eq!(
+            config.heartbeat_interval_secs,
+            expected.heartbeat_interval_secs,
+        );
+        assert_eq!(config.recv_window_ms, expected.recv_window_ms);
+        assert_eq!(config.cancel_on_disconnect, expected.cancel_on_disconnect);
+        assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let data = AxDataClientConfig {
+            api_key: Some("data-key".into()),
+            api_secret: Some("data-secret".into()),
+            proxy_url: Some("http://user:data-proxy@localhost".into()),
+            ..Default::default()
+        };
+        let execution = AxExecutionClientConfig {
+            api_key: Some("exec-key".into()),
+            api_secret: Some("exec-secret".into()),
+            proxy_url: Some("http://user:exec-proxy@localhost".into()),
+            ..Default::default()
+        };
+
+        let formatted = format!("{data:?} {execution:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 6);
+
+        for secret in [
+            "data-key",
+            "data-secret",
+            "data-proxy",
+            "exec-key",
+            "exec-secret",
+            "exec-proxy",
+        ] {
+            assert!(!formatted.contains(secret));
+        }
     }
 }

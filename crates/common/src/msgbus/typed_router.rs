@@ -46,19 +46,27 @@ pub struct TypedSubscription<T: 'static> {
     /// The pattern for matching topics.
     pub pattern: MStr<Pattern>,
     /// Higher priority handlers receive messages first.
-    pub priority: u8,
+    pub priority: u32,
 }
 
 impl<T: 'static> TypedSubscription<T> {
     /// Creates a new typed subscription.
     #[must_use]
-    pub fn new(pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: Option<u8>) -> Self {
+    pub fn new(pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: Option<u32>) -> Self {
         Self {
             handler_id: handler.id(),
             pattern,
             handler,
             priority: priority.unwrap_or(0),
         }
+    }
+
+    fn delivery_order(&self, other: &Self) -> Ordering {
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| self.pattern.cmp(&other.pattern))
+            .then_with(|| self.handler_id.cmp(&other.handler_id))
     }
 }
 
@@ -89,11 +97,8 @@ impl<T: 'static> PartialOrd for TypedSubscription<T> {
 
 impl<T: 'static> Ord for TypedSubscription<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority first (descending)
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| self.pattern.cmp(&other.pattern))
+        self.pattern
+            .cmp(&other.pattern)
             .then_with(|| self.handler_id.cmp(&other.handler_id))
     }
 }
@@ -169,24 +174,25 @@ impl<T: 'static> TopicRouter<T> {
     ///
     /// Assigning priority is an advanced feature. Higher priority handlers
     /// receive messages before lower priority handlers.
-    pub fn subscribe(&mut self, pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: u8) {
+    pub fn subscribe(&mut self, pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: u32) {
         let sub = TypedSubscription::new(pattern, handler, Some(priority));
 
-        // Check for duplicate
+        // Re-subscribing the same handler is expected (e.g. book deltas + snapshots
+        // share one BookUpdater), so dedup at debug rather than warn.
         if self.subscriptions.iter().any(|s| s == &sub) {
-            log::warn!("{sub:?} already exists");
+            log::debug!("{sub:?} already exists; skipping duplicate subscription");
             return;
         }
 
         log::debug!("Subscribing {sub:?}");
 
-        // Invalidate cache entries that match this pattern
-        self.invalidate_cache_for_pattern(pattern);
-
         self.subscriptions.push(sub);
 
-        // Re-sort by priority (descending)
-        self.subscriptions.sort();
+        // Re-sort by priority descending, pattern ascending, then handler ID ascending.
+        // Clear the index cache since sorting can rearrange all indices.
+        self.subscriptions
+            .sort_by(TypedSubscription::delivery_order);
+        self.topic_cache.clear();
     }
 
     /// Unsubscribes a handler from a topic pattern.
@@ -204,7 +210,10 @@ impl<T: 'static> TopicRouter<T> {
             .position(|s| s.pattern == pattern && s.handler_id == handler_id)
         {
             self.subscriptions.remove(idx);
-            self.invalidate_cache_for_pattern(pattern);
+
+            // Must clear entire cache since remove() shifts indices
+            self.topic_cache.clear();
+
             log::debug!("Handler for pattern '{pattern}' was removed");
         } else {
             log::debug!("No matching handler for pattern '{pattern}' was found");
@@ -239,7 +248,7 @@ impl<T: 'static> TopicRouter<T> {
     #[must_use]
     pub fn has_subscribers(&self, topic: MStr<Topic>) -> bool {
         self.get_matching_indices(topic).map_or_else(
-            || !self.find_matches(topic).is_empty(),
+            || !Self::find_matches(&self.subscriptions, topic).is_empty(),
             |indices| !indices.is_empty(),
         )
     }
@@ -247,8 +256,10 @@ impl<T: 'static> TopicRouter<T> {
     /// Returns the count of subscribers for a topic.
     #[must_use]
     pub fn subscriber_count(&self, topic: MStr<Topic>) -> usize {
-        self.get_matching_indices(topic)
-            .map_or_else(|| self.find_matches(topic).len(), |indices| indices.len())
+        self.get_matching_indices(topic).map_or_else(
+            || Self::find_matches(&self.subscriptions, topic).len(),
+            <[usize]>::len,
+        )
     }
 
     /// Returns the count of subscribers with an exact topic match,
@@ -270,19 +281,9 @@ impl<T: 'static> TopicRouter<T> {
             topic_cache,
         } = self;
 
-        let indices = topic_cache.entry(topic).or_insert_with(|| {
-            subscriptions
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, sub)| {
-                    if is_matching_backtracking(topic, sub.pattern) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
+        let indices = topic_cache
+            .entry(topic)
+            .or_insert_with(|| Self::find_matches(subscriptions, topic));
 
         for &idx in indices.iter() {
             subscriptions[idx].handler.handle(message);
@@ -308,16 +309,20 @@ impl<T: 'static> TopicRouter<T> {
 
     /// Gets cached matching indices for a topic, if available.
     fn get_matching_indices(&self, topic: MStr<Topic>) -> Option<&[usize]> {
-        self.topic_cache.get(&topic).map(|v| v.as_slice())
+        self.topic_cache.get(&topic).map(SmallVec::as_slice)
     }
 
     /// Gets or computes matching subscription indices for a topic.
-    pub(crate) fn get_or_compute_matching_indices(&mut self, topic: MStr<Topic>) -> &[usize] {
-        if !self.topic_cache.contains_key(&topic) {
-            let indices = self.find_matches(topic);
-            self.topic_cache.insert(topic, indices);
-        }
-        self.topic_cache.get(&topic).unwrap()
+    fn get_or_compute_matching_indices(&mut self, topic: MStr<Topic>) -> &[usize] {
+        let Self {
+            subscriptions,
+            topic_cache,
+        } = self;
+
+        topic_cache
+            .entry(topic)
+            .or_insert_with(|| Self::find_matches(subscriptions, topic))
+            .as_slice()
     }
 
     /// Fills a buffer with handlers matching a topic.
@@ -331,19 +336,9 @@ impl<T: 'static> TopicRouter<T> {
             topic_cache,
         } = self;
 
-        let indices = topic_cache.entry(topic).or_insert_with(|| {
-            subscriptions
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, sub)| {
-                    if is_matching_backtracking(topic, sub.pattern) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
+        let indices = topic_cache
+            .entry(topic)
+            .or_insert_with(|| Self::find_matches(subscriptions, topic));
 
         for &idx in indices.iter() {
             buf.push(subscriptions[idx].handler.clone());
@@ -351,25 +346,15 @@ impl<T: 'static> TopicRouter<T> {
     }
 
     /// Finds subscription indices matching a topic (without caching).
-    fn find_matches(&self, topic: MStr<Topic>) -> SmallVec<[usize; 64]> {
-        self.subscriptions
+    fn find_matches(
+        subscriptions: &[TypedSubscription<T>],
+        topic: MStr<Topic>,
+    ) -> SmallVec<[usize; 64]> {
+        subscriptions
             .iter()
             .enumerate()
-            .filter_map(|(idx, sub)| {
-                if is_matching_backtracking(topic, sub.pattern) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(idx, sub)| is_matching_backtracking(topic, sub.pattern).then_some(idx))
             .collect()
-    }
-
-    /// Invalidates cache entries that could be affected by a pattern change.
-    fn invalidate_cache_for_pattern(&mut self, pattern: MStr<Pattern>) {
-        // Remove cached entries where the pattern might match the topic
-        self.topic_cache
-            .retain(|topic, _| !is_matching_backtracking(*topic, pattern));
     }
 
     /// Clears all subscriptions and cache.
@@ -381,11 +366,57 @@ impl<T: 'static> TopicRouter<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        rc::Rc,
+    };
 
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_typed_subscription_ordering_laws() {
+        let handler = TypedHandler::from_with_id("handler-b", |_: &i32| {});
+        let base = TypedSubscription::new("pattern-b".into(), handler.clone(), Some(1));
+        let different_priority = TypedSubscription::new("pattern-b".into(), handler, Some(2));
+        let different_pattern = TypedSubscription::new(
+            "pattern-a".into(),
+            TypedHandler::from_with_id("handler-b", |_: &i32| {}),
+            Some(1),
+        );
+        let different_handler = TypedSubscription::new(
+            "pattern-b".into(),
+            TypedHandler::from_with_id("handler-a", |_: &i32| {}),
+            Some(1),
+        );
+
+        assert_eq!(base, different_priority);
+        assert_eq!(base.cmp(&different_priority), Ordering::Equal);
+
+        let mut base_hasher = DefaultHasher::new();
+        base.hash(&mut base_hasher);
+        let mut different_priority_hasher = DefaultHasher::new();
+        different_priority.hash(&mut different_priority_hasher);
+        assert_eq!(base_hasher.finish(), different_priority_hasher.finish());
+
+        let variants = [
+            base,
+            different_priority,
+            different_pattern,
+            different_handler,
+        ];
+
+        for a in &variants {
+            for b in &variants {
+                assert_eq!(a == b, a.cmp(b).is_eq());
+                assert_eq!(a.partial_cmp(b), Some(a.cmp(b)));
+                assert_eq!(a.cmp(b), b.cmp(a).reverse());
+            }
+        }
+    }
 
     #[rstest]
     fn test_topic_router_subscribe_and_publish() {
@@ -407,29 +438,39 @@ mod tests {
     }
 
     #[rstest]
-    fn test_topic_router_priority_ordering() {
+    fn test_topic_router_publish_orders_by_full_delivery_key() {
         let mut router = TopicRouter::<i32>::new();
         let order = Rc::new(RefCell::new(Vec::new()));
 
-        let order1 = order.clone();
-        let handler1 = TypedHandler::from_with_id("low", move |_: &i32| {
-            order1.borrow_mut().push("low");
+        let low_order = order.clone();
+        let low = TypedHandler::from_with_id("handler-z", move |_: &i32| {
+            low_order.borrow_mut().push("low-z");
+        });
+        let exact_b_order = order.clone();
+        let exact_b = TypedHandler::from_with_id("handler-b", move |_: &i32| {
+            exact_b_order.borrow_mut().push("exact-b");
+        });
+        let exact_a_order = order.clone();
+        let exact_a = TypedHandler::from_with_id("handler-a", move |_: &i32| {
+            exact_a_order.borrow_mut().push("exact-a");
+        });
+        let wildcard_b_order = order.clone();
+        let wildcard_b = TypedHandler::from_with_id("handler-b", move |_: &i32| {
+            wildcard_b_order.borrow_mut().push("wildcard-b");
         });
 
-        let order2 = order.clone();
-        let handler2 = TypedHandler::from_with_id("high", move |_: &i32| {
-            order2.borrow_mut().push("high");
-        });
+        router.subscribe("delivery.*".into(), low, 1);
+        router.subscribe("delivery.topic".into(), exact_b, 10);
+        router.subscribe("delivery.topic".into(), exact_a, 10);
+        router.subscribe("delivery.*".into(), wildcard_b, 10);
 
-        // Subscribe low priority first, high priority second
-        router.subscribe("test.*".into(), handler1, 5);
-        router.subscribe("test.*".into(), handler2, 10);
-
-        let topic: MStr<Topic> = "test.topic".into();
+        let topic: MStr<Topic> = "delivery.topic".into();
         router.publish(topic, &42);
 
-        // High priority should be called first
-        assert_eq!(*order.borrow(), vec!["high", "low"]);
+        assert_eq!(
+            *order.borrow(),
+            vec!["wildcard-b", "exact-a", "exact-b", "low-z"]
+        );
     }
 
     #[rstest]
@@ -537,6 +578,33 @@ mod tests {
         // Publish again - both handlers should receive
         router.publish(topic, &2);
         assert_eq!(*received.borrow(), 12); // 1 + 1 + 10
+    }
+
+    #[rstest]
+    fn test_topic_router_late_distinct_wildcard_receives_cached_topic() {
+        let mut router = TopicRouter::<String>::new();
+        let topic: MStr<Topic> = "data.instrument.POLYMARKET.TEST-SYMBOL".into();
+
+        let early = Rc::new(RefCell::new(Vec::new()));
+        let early_clone = early.clone();
+        let early_handler = TypedHandler::from_with_id("early", move |msg: &String| {
+            early_clone.borrow_mut().push(msg.clone());
+        });
+        router.subscribe("data.*.POLYMARKET.*".into(), early_handler, 0);
+
+        router.publish(topic, &"ONE".to_string());
+
+        let late = Rc::new(RefCell::new(Vec::new()));
+        let late_clone = late.clone();
+        let late_handler = TypedHandler::from_with_id("late", move |msg: &String| {
+            late_clone.borrow_mut().push(msg.clone());
+        });
+        router.subscribe("data.instrument.POLYMARKET.*".into(), late_handler, 0);
+
+        router.publish(topic, &"TWO".to_string());
+
+        assert_eq!(*early.borrow(), vec!["ONE", "TWO"]);
+        assert_eq!(*late.borrow(), vec!["TWO"]);
     }
 
     #[rstest]
@@ -703,7 +771,7 @@ mod tests {
         assert_eq!(*count_a.borrow(), 1);
         assert_eq!(*count_b.borrow(), 1);
 
-        // Remove handler_a — must invalidate ALL cached indices
+        // Remove handler_a - must invalidate ALL cached indices
         router.remove_handler("events.order.S-001".into(), handler_a_id);
 
         // handler_b must still dispatch correctly despite index shift
@@ -746,5 +814,30 @@ mod tests {
         router.publish(topic, &2);
         assert_eq!(*count_own.borrow(), 1);
         assert_eq!(*count_other.borrow(), 2);
+    }
+
+    #[rstest]
+    fn test_unsubscribe_one_pattern_does_not_break_other_patterns() {
+        let mut router = TopicRouter::<i32>::new();
+        let received = Rc::new(RefCell::new(0));
+
+        let alpha = TypedHandler::from_with_id("alpha", |_: &i32| {});
+
+        let received_beta = received.clone();
+        let beta = TypedHandler::from_with_id("beta", move |_: &i32| {
+            *received_beta.borrow_mut() += 1;
+        });
+
+        router.subscribe("alpha.*".into(), alpha.clone(), 0);
+        router.subscribe("beta.*".into(), beta, 0);
+
+        let beta_topic: MStr<Topic> = "beta.topic".into();
+        router.publish(beta_topic, &1);
+        assert_eq!(*received.borrow(), 1);
+
+        router.unsubscribe("alpha.*".into(), &alpha);
+
+        router.publish(beta_topic, &2);
+        assert_eq!(*received.borrow(), 2);
     }
 }

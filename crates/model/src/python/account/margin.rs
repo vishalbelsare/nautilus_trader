@@ -13,23 +13,32 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
+use indexmap::IndexMap;
+use nautilus_core::{
+    UnixNanos,
+    python::{
+        IntoPyObjectNautilusExt, correctness_error_to_pyvalue_err, to_pyruntime_err, to_pyvalue_err,
+    },
+};
 use pyo3::{IntoPyObjectExt, basic::CompareOp, prelude::*, types::PyDict};
 use rust_decimal::Decimal;
 
 use crate::{
-    accounts::MarginAccount,
-    events::AccountState,
+    accounts::{Account, MarginAccount},
+    enums::{AccountType, LiquiditySide, OrderSide},
+    events::{AccountState, OrderFilled},
+    fees::MakerTakerFeeRates,
     identifiers::{AccountId, InstrumentId},
     instruments::InstrumentAny,
-    python::instruments::pyobject_to_instrument_any,
-    types::{Money, Price, Quantity},
+    position::Position,
+    python::{account::resolve_balance_currency, instruments::pyobject_to_instrument_any},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MarginAccount {
-    /// Creates a new `MarginAccount` instance.
+    /// Represents a margin account that can hold leveraged positions.
     #[new]
     fn py_new(event: AccountState, calculate_account_state: bool) -> Self {
         Self::new(event, calculate_account_state)
@@ -49,6 +58,18 @@ impl MarginAccount {
     }
 
     #[getter]
+    #[pyo3(name = "account_type")]
+    fn py_account_type(&self) -> AccountType {
+        self.account_type
+    }
+
+    #[getter]
+    #[pyo3(name = "base_currency")]
+    fn py_base_currency(&self) -> Option<Currency> {
+        self.base_currency
+    }
+
+    #[getter]
     fn default_leverage(&self) -> Decimal {
         self.default_leverage
     }
@@ -57,6 +78,169 @@ impl MarginAccount {
     #[pyo3(name = "calculate_account_state")]
     fn py_calculate_account_state(&self) -> bool {
         self.calculate_account_state
+    }
+
+    #[getter]
+    #[pyo3(name = "last_event")]
+    fn py_last_event(&self) -> Option<AccountState> {
+        Account::last_event(self)
+    }
+
+    #[getter]
+    #[pyo3(name = "event_count")]
+    fn py_event_count(&self) -> usize {
+        Account::event_count(self)
+    }
+
+    #[getter]
+    #[pyo3(name = "events")]
+    fn py_events(&self) -> Vec<AccountState> {
+        Account::events(self)
+    }
+
+    #[pyo3(name = "balance_total")]
+    #[pyo3(signature = (currency=None))]
+    fn py_balance_total(&self, currency: Option<Currency>) -> PyResult<Option<Money>> {
+        let currency = resolve_balance_currency(currency, self.base_currency)?;
+        Ok(Account::balance_total(self, Some(currency)))
+    }
+
+    #[pyo3(name = "balances_total")]
+    fn py_balances_total(&self) -> IndexMap<Currency, Money> {
+        Account::balances_total(self)
+    }
+
+    #[pyo3(name = "balance_free")]
+    #[pyo3(signature = (currency=None))]
+    fn py_balance_free(&self, currency: Option<Currency>) -> PyResult<Option<Money>> {
+        let currency = resolve_balance_currency(currency, self.base_currency)?;
+        Ok(Account::balance_free(self, Some(currency)))
+    }
+
+    #[pyo3(name = "balances_free")]
+    fn py_balances_free(&self) -> IndexMap<Currency, Money> {
+        Account::balances_free(self)
+    }
+
+    #[pyo3(name = "balance_locked")]
+    #[pyo3(signature = (currency=None))]
+    fn py_balance_locked(&self, currency: Option<Currency>) -> PyResult<Option<Money>> {
+        let currency = resolve_balance_currency(currency, self.base_currency)?;
+        Ok(Account::balance_locked(self, Some(currency)))
+    }
+
+    #[pyo3(name = "balances_locked")]
+    fn py_balances_locked(&self) -> IndexMap<Currency, Money> {
+        Account::balances_locked(self)
+    }
+
+    #[pyo3(name = "balance")]
+    #[pyo3(signature = (currency=None))]
+    fn py_balance(&self, currency: Option<Currency>) -> PyResult<Option<AccountBalance>> {
+        let currency = resolve_balance_currency(currency, self.base_currency)?;
+        Ok(Account::balance(self, Some(currency)).copied())
+    }
+
+    #[pyo3(name = "balances")]
+    fn py_balances(&self) -> IndexMap<Currency, AccountBalance> {
+        Account::balances(self)
+    }
+
+    #[pyo3(name = "starting_balances")]
+    fn py_starting_balances(&self) -> IndexMap<Currency, Money> {
+        Account::starting_balances(self)
+    }
+
+    #[pyo3(name = "currencies")]
+    fn py_currencies(&self) -> Vec<Currency> {
+        Account::currencies(self)
+    }
+
+    #[pyo3(name = "is_cash_account")]
+    fn py_is_cash_account(&self) -> bool {
+        Account::is_cash_account(self)
+    }
+
+    #[pyo3(name = "is_margin_account")]
+    fn py_is_margin_account(&self) -> bool {
+        Account::is_margin_account(self)
+    }
+
+    #[pyo3(name = "apply")]
+    fn py_apply(&mut self, event: AccountState) -> PyResult<()> {
+        Account::apply(self, event).map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "purge_account_events")]
+    fn py_purge_account_events(&mut self, ts_now: u64, lookback_secs: u64) {
+        Account::purge_account_events(self, UnixNanos::from(ts_now), lookback_secs);
+    }
+
+    #[pyo3(name = "calculate_balance_locked")]
+    #[pyo3(signature = (instrument, side, quantity, price, use_quote_for_inverse=None))]
+    fn py_calculate_balance_locked(
+        &self,
+        instrument: Py<PyAny>,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        use_quote_for_inverse: Option<bool>,
+        py: Python,
+    ) -> PyResult<Money> {
+        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        Account::calculate_balance_locked(
+            self,
+            &instrument,
+            side,
+            quantity,
+            price,
+            use_quote_for_inverse,
+        )
+        .map_err(to_pyvalue_err)
+    }
+
+    #[pyo3(name = "calculate_commission")]
+    #[pyo3(signature = (instrument, last_qty, last_px, liquidity_side, maker_rate, taker_rate, use_quote_for_inverse=None))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_calculate_commission(
+        &self,
+        instrument: Py<PyAny>,
+        last_qty: Quantity,
+        last_px: Price,
+        liquidity_side: LiquiditySide,
+        maker_rate: Decimal,
+        taker_rate: Decimal,
+        use_quote_for_inverse: Option<bool>,
+        py: Python,
+    ) -> PyResult<Money> {
+        if liquidity_side == LiquiditySide::NoLiquiditySide {
+            return Err(to_pyvalue_err("Invalid liquidity side"));
+        }
+        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        let fee_rates = MakerTakerFeeRates::new(maker_rate, taker_rate);
+        Account::calculate_commission(
+            self,
+            &instrument,
+            last_qty,
+            last_px,
+            liquidity_side,
+            fee_rates,
+            use_quote_for_inverse,
+        )
+        .map_err(to_pyvalue_err)
+    }
+
+    #[pyo3(name = "calculate_pnls")]
+    #[pyo3(signature = (instrument, fill, position=None))]
+    fn py_calculate_pnls(
+        &self,
+        instrument: Py<PyAny>,
+        fill: &OrderFilled,
+        position: Option<Position>,
+        py: Python,
+    ) -> PyResult<Vec<Money>> {
+        let instrument = pyobject_to_instrument_any(py, instrument)?;
+        Account::calculate_pnls(self, &instrument, fill, position).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -74,17 +258,16 @@ impl MarginAccount {
 
     /// Sets the default leverage for the account.
     #[pyo3(name = "set_default_leverage")]
-    fn py_set_default_leverage(&mut self, default_leverage: Decimal) {
-        self.set_default_leverage(default_leverage);
+    fn py_set_default_leverage(&mut self, default_leverage: Decimal) -> PyResult<()> {
+        self.try_set_default_leverage(default_leverage)
+            .map_err(correctness_error_to_pyvalue_err)
     }
 
     #[pyo3(name = "leverages")]
     fn py_leverages(&self, py: Python) -> PyResult<Py<PyAny>> {
         let leverages = PyDict::new(py);
         for (key, &value) in &self.leverages {
-            leverages
-                .set_item(key.into_py_any_unwrap(py), value)
-                .unwrap();
+            leverages.set_item(key.into_py_any(py)?, value)?;
         }
         leverages.into_py_any(py)
     }
@@ -96,8 +279,9 @@ impl MarginAccount {
 
     /// Sets the leverage for a specific instrument.
     #[pyo3(name = "set_leverage")]
-    fn py_set_leverage(&mut self, instrument_id: InstrumentId, leverage: Decimal) {
-        self.set_leverage(instrument_id, leverage);
+    fn py_set_leverage(&mut self, instrument_id: InstrumentId, leverage: Decimal) -> PyResult<()> {
+        self.try_set_leverage(instrument_id, leverage)
+            .map_err(correctness_error_to_pyvalue_err)
     }
 
     #[pyo3(name = "is_unleveraged")]
@@ -105,26 +289,74 @@ impl MarginAccount {
         self.is_unleveraged(instrument_id)
     }
 
+    /// Returns the margin balance for the specified instrument.
+    #[pyo3(name = "margin")]
+    fn py_margin(&self, instrument_id: InstrumentId) -> Option<MarginBalance> {
+        self.margin(&instrument_id)
+    }
+
+    #[pyo3(name = "margins")]
+    fn py_margins(&self) -> IndexMap<InstrumentId, MarginBalance> {
+        self.margins.clone()
+    }
+
     #[pyo3(name = "initial_margins")]
-    fn py_initial_margins(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let initial_margins = PyDict::new(py);
-        for (key, &value) in &self.initial_margins() {
-            initial_margins
-                .set_item(key.into_py_any_unwrap(py), value.into_py_any_unwrap(py))
-                .unwrap();
-        }
-        initial_margins.into_py_any(py)
+    fn py_initial_margins(&self) -> IndexMap<InstrumentId, Money> {
+        self.initial_margins()
     }
 
     #[pyo3(name = "maintenance_margins")]
-    fn py_maintenance_margins(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let maintenance_margins = PyDict::new(py);
-        for (key, &value) in &self.maintenance_margins() {
-            maintenance_margins
-                .set_item(key.into_py_any_unwrap(py), value.into_py_any_unwrap(py))
-                .unwrap();
-        }
-        maintenance_margins.into_py_any(py)
+    fn py_maintenance_margins(&self) -> IndexMap<InstrumentId, Money> {
+        self.maintenance_margins()
+    }
+
+    /// Returns the account-wide margin balance for the specified collateral currency.
+    #[pyo3(name = "account_margin")]
+    fn py_account_margin(&self, currency: Currency) -> Option<MarginBalance> {
+        self.account_margin(&currency)
+    }
+
+    #[pyo3(name = "account_margins")]
+    fn py_account_margins(&self) -> IndexMap<Currency, MarginBalance> {
+        self.account_margins.clone()
+    }
+
+    /// Returns the account-wide initial margin for the specified collateral currency.
+    #[pyo3(name = "account_initial_margin")]
+    fn py_account_initial_margin(&self, currency: Currency) -> Option<Money> {
+        self.account_initial_margin(&currency)
+    }
+
+    /// Returns all account-wide initial margins keyed by currency.
+    #[pyo3(name = "account_initial_margins")]
+    fn py_account_initial_margins(&self) -> IndexMap<Currency, Money> {
+        self.account_initial_margins()
+    }
+
+    /// Returns the account-wide maintenance margin for the specified collateral currency.
+    #[pyo3(name = "account_maintenance_margin")]
+    fn py_account_maintenance_margin(&self, currency: Currency) -> Option<Money> {
+        self.account_maintenance_margin(&currency)
+    }
+
+    /// Returns all account-wide maintenance margins keyed by currency.
+    #[pyo3(name = "account_maintenance_margins")]
+    fn py_account_maintenance_margins(&self) -> IndexMap<Currency, Money> {
+        self.account_maintenance_margins()
+    }
+
+    /// Returns the total initial margin reserved in the specified currency,
+    /// summing per-instrument and account-wide entries.
+    #[pyo3(name = "total_initial_margin")]
+    fn py_total_initial_margin(&self, currency: Currency) -> Money {
+        self.total_initial_margin(currency)
+    }
+
+    /// Returns the total maintenance margin reserved in the specified currency,
+    /// summing per-instrument and account-wide entries.
+    #[pyo3(name = "total_maintenance_margin")]
+    fn py_total_maintenance_margin(&self, currency: Currency) -> Money {
+        self.total_maintenance_margin(currency)
     }
 
     /// Updates the initial margin for the specified instrument.
@@ -135,8 +367,8 @@ impl MarginAccount {
 
     /// Returns the initial margin amount for the specified instrument.
     #[pyo3(name = "initial_margin")]
-    fn py_initial_margin(&self, instrument_id: InstrumentId) -> Money {
-        self.initial_margin(instrument_id)
+    fn py_initial_margin(&self, instrument_id: InstrumentId) -> Option<Money> {
+        self.margin(&instrument_id).map(|margin| margin.initial)
     }
 
     /// Updates the maintenance margin for the specified instrument.
@@ -151,8 +383,8 @@ impl MarginAccount {
 
     /// Returns the maintenance margin amount for the specified instrument.
     #[pyo3(name = "maintenance_margin")]
-    fn py_maintenance_margin(&self, instrument_id: InstrumentId) -> Money {
-        self.maintenance_margin(instrument_id)
+    fn py_maintenance_margin(&self, instrument_id: InstrumentId) -> Option<Money> {
+        self.margin(&instrument_id).map(|margin| margin.maintenance)
     }
 
     #[pyo3(name = "calculate_initial_margin")]
@@ -166,7 +398,7 @@ impl MarginAccount {
     /// Returns an error if leverage is not positive, or if the result cannot be represented
     /// as `Money`.
     pub fn py_calculate_initial_margin(
-        &mut self,
+        &self,
         instrument: Py<PyAny>,
         quantity: Quantity,
         price: Price,
@@ -190,7 +422,13 @@ impl MarginAccount {
             InstrumentAny::CryptoFuture(inst) => self
                 .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
+            InstrumentAny::CryptoFuturesSpread(inst) => self
+                .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
             InstrumentAny::CryptoOption(inst) => self
+                .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
+            InstrumentAny::CryptoOptionSpread(inst) => self
                 .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
             InstrumentAny::CryptoPerpetual(inst) => self
@@ -218,6 +456,9 @@ impl MarginAccount {
                 .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
             InstrumentAny::PerpetualContract(inst) => self
+                .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
+            InstrumentAny::TokenizedAsset(inst) => self
                 .calculate_initial_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
         }
@@ -233,7 +474,7 @@ impl MarginAccount {
     #[pyo3(name = "calculate_maintenance_margin")]
     #[pyo3(signature = (instrument, quantity, price, use_quote_for_inverse=None))]
     pub fn py_calculate_maintenance_margin(
-        &mut self,
+        &self,
         instrument: Py<PyAny>,
         quantity: Quantity,
         price: Price,
@@ -257,7 +498,13 @@ impl MarginAccount {
             InstrumentAny::CryptoFuture(inst) => self
                 .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
+            InstrumentAny::CryptoFuturesSpread(inst) => self
+                .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
             InstrumentAny::CryptoOption(inst) => self
+                .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
+            InstrumentAny::CryptoOptionSpread(inst) => self
                 .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
             InstrumentAny::CryptoPerpetual(inst) => self
@@ -287,6 +534,9 @@ impl MarginAccount {
             InstrumentAny::PerpetualContract(inst) => self
                 .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
                 .map_err(to_pyvalue_err),
+            InstrumentAny::TokenizedAsset(inst) => self
+                .calculate_maintenance_margin(&inst, quantity, price, use_quote_for_inverse)
+                .map_err(to_pyvalue_err),
         }
     }
 
@@ -296,7 +546,7 @@ impl MarginAccount {
         dict.set_item("calculate_account_state", self.calculate_account_state)?;
         let events_list: PyResult<Vec<Py<PyAny>>> =
             self.events.iter().map(|item| item.py_to_dict(py)).collect();
-        dict.set_item("events", events_list.unwrap())?;
+        dict.set_item("events", events_list?)?;
         Ok(dict.into())
     }
 }

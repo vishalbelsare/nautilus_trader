@@ -21,10 +21,19 @@ use nautilus_model::{
     enums::BookType,
     identifiers::{ClientId, InstrumentId, OptionSeriesId, Venue},
 };
+use serde::{Deserialize, Serialize};
 
 use super::check_client_id_or_venue;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeCustomData {
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
@@ -37,7 +46,6 @@ pub struct SubscribeCustomData {
 
 impl SubscribeCustomData {
     /// Creates a new [`SubscribeCustomData`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_id: Option<ClientId>,
         venue: Option<Venue>,
@@ -60,7 +68,15 @@ impl SubscribeCustomData {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeInstrument {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -73,7 +89,6 @@ pub struct SubscribeInstrument {
 
 impl SubscribeInstrument {
     /// Creates a new [`SubscribeInstrument`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -96,7 +111,15 @@ impl SubscribeInstrument {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeInstruments {
     pub client_id: Option<ClientId>,
     pub venue: Venue,
@@ -127,7 +150,15 @@ impl SubscribeInstruments {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeBookDeltas {
     pub instrument_id: InstrumentId,
     pub book_type: BookType,
@@ -143,7 +174,7 @@ pub struct SubscribeBookDeltas {
 
 impl SubscribeBookDeltas {
     /// Creates a new [`SubscribeBookDeltas`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         book_type: BookType,
@@ -172,8 +203,16 @@ impl SubscribeBookDeltas {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct SubscribeBookDepth10 {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+pub struct SubscribeBookDepth {
     pub instrument_id: InstrumentId,
     pub book_type: BookType,
     pub client_id: Option<ClientId>,
@@ -186,9 +225,9 @@ pub struct SubscribeBookDepth10 {
     pub params: Option<Params>,
 }
 
-impl SubscribeBookDepth10 {
-    /// Creates a new [`SubscribeBookDepth10`] instance.
-    #[allow(clippy::too_many_arguments)]
+impl SubscribeBookDepth {
+    /// Creates a new [`SubscribeBookDepth`] instance.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         book_type: BookType,
@@ -217,7 +256,7 @@ impl SubscribeBookDepth10 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubscribeBookSnapshots {
     pub instrument_id: InstrumentId,
     pub book_type: BookType,
@@ -233,7 +272,7 @@ pub struct SubscribeBookSnapshots {
 
 impl SubscribeBookSnapshots {
     /// Creates a new [`SubscribeBookSnapshots`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         book_type: BookType,
@@ -262,7 +301,15 @@ impl SubscribeBookSnapshots {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeQuotes {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -275,7 +322,6 @@ pub struct SubscribeQuotes {
 
 impl SubscribeQuotes {
     /// Creates a new [`SubscribeQuotes`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -298,7 +344,15 @@ impl SubscribeQuotes {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeTrades {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -311,7 +365,6 @@ pub struct SubscribeTrades {
 
 impl SubscribeTrades {
     /// Creates a new [`SubscribeTrades`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -334,7 +387,15 @@ impl SubscribeTrades {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeBars {
     pub bar_type: BarType,
     pub client_id: Option<ClientId>,
@@ -347,7 +408,6 @@ pub struct SubscribeBars {
 
 impl SubscribeBars {
     /// Creates a new [`SubscribeBars`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bar_type: BarType,
         client_id: Option<ClientId>,
@@ -370,7 +430,15 @@ impl SubscribeBars {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeMarkPrices {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -383,7 +451,6 @@ pub struct SubscribeMarkPrices {
 
 impl SubscribeMarkPrices {
     /// Creates a new [`SubscribeMarkPrices`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -406,7 +473,15 @@ impl SubscribeMarkPrices {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeIndexPrices {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -419,7 +494,6 @@ pub struct SubscribeIndexPrices {
 
 impl SubscribeIndexPrices {
     /// Creates a new [`SubscribeIndexPrices`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -442,7 +516,15 @@ impl SubscribeIndexPrices {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeFundingRates {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -455,7 +537,6 @@ pub struct SubscribeFundingRates {
 
 impl SubscribeFundingRates {
     /// Creates a new [`SubscribeFundingRates`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -478,7 +559,15 @@ impl SubscribeFundingRates {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeInstrumentStatus {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -491,7 +580,6 @@ pub struct SubscribeInstrumentStatus {
 
 impl SubscribeInstrumentStatus {
     /// Creates a new [`SubscribeInstrumentStatus`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -514,7 +602,15 @@ impl SubscribeInstrumentStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeOptionGreeks {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -527,7 +623,6 @@ pub struct SubscribeOptionGreeks {
 
 impl SubscribeOptionGreeks {
     /// Creates a new [`SubscribeOptionGreeks`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -550,7 +645,15 @@ impl SubscribeOptionGreeks {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct SubscribeInstrumentClose {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
@@ -563,7 +666,6 @@ pub struct SubscribeInstrumentClose {
 
 impl SubscribeInstrumentClose {
     /// Creates a new [`SubscribeInstrumentClose`] instance.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -586,7 +688,7 @@ impl SubscribeInstrumentClose {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubscribeOptionChain {
     pub series_id: OptionSeriesId,
     pub strike_range: StrikeRange,
@@ -595,11 +697,17 @@ pub struct SubscribeOptionChain {
     pub ts_init: UnixNanos,
     pub client_id: Option<ClientId>,
     pub venue: Option<Venue>,
+    #[serde(default)]
+    pub correlation_id: Option<UUID4>,
+    pub params: Option<Params>,
 }
 
 impl SubscribeOptionChain {
     /// Creates a new [`SubscribeOptionChain`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor exposes the option chain subscription fields"
+    )]
     pub fn new(
         series_id: OptionSeriesId,
         strike_range: StrikeRange,
@@ -608,6 +716,7 @@ impl SubscribeOptionChain {
         ts_init: UnixNanos,
         client_id: Option<ClientId>,
         venue: Option<Venue>,
+        params: Option<Params>,
     ) -> Self {
         check_client_id_or_venue(&client_id, &venue);
         Self {
@@ -618,6 +727,8 @@ impl SubscribeOptionChain {
             ts_init,
             client_id,
             venue,
+            correlation_id: None,
+            params,
         }
     }
 }

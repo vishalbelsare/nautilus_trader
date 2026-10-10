@@ -1,597 +1,583 @@
 # Live Trading
 
-NautilusTrader deploys backtested strategies to live markets with no code changes.
+The same strategy and execution-algorithm code can run across backtest and live environments. Live
+execution also introduces venue, transport, timing, persistence, external-activity, and
+reconciliation behavior that a simulation may not reproduce.
 
-**Live trading involves real financial risk. Before deploying to production, understand
+:::warning
+**Live trading involves real financial risk.** Before deploying to production, understand
 system configuration, node operations, execution reconciliation, and the differences
-between backtesting and live trading.**
-
-:::danger[Jupyter notebooks not recommended for live trading]
-Do not run live trading nodes in Jupyter notebooks. Event loop conflicts and
-operational risks make them unsuitable:
-
-- Jupyter runs its own asyncio event loop, which conflicts with `TradingNode`'s event loop.
-- Workarounds like `nest_asyncio` are not production-grade.
-- Cells can run out of order, kernels can crash, and state can disappear.
-- Notebooks lack the logging, monitoring, and graceful shutdown needed for production trading.
-
-Use Jupyter for backtesting, analysis, and experimentation. For live trading, run nodes
-as standalone Python scripts or services.
+between backtesting and live trading.
 :::
 
-:::warning[One TradingNode per process]
-Running multiple `TradingNode` instances concurrently in the same process is not supported due to global singleton state.
-Add multiple strategies to a single node, or run additional nodes in separate processes for parallel execution.
+## Backtest and live differences
 
-See [Processes and threads](architecture.md#processes-and-threads) for details.
+Backtests advance a controlled clock from historical data and execute orders on simulated venues.
+A live node shares strategy and execution-algorithm code with a backtest, but coordinates with
+systems outside the process boundary.
+
+- **Venue**: Venue rules and adapter capabilities determine which order types, instructions, and
+  events are available. See [Adapters](adapters.md).
+- **Transport**: A network failure can leave an order command outcome unknown. See
+  [Command outcomes](execution/policies.md#command-outcomes).
+- **Timing**: Independent inputs can interleave, and the runner does not define one global FIFO
+  order. See [Dispatch priority](#dispatch-priority-and-overload-behavior).
+- **Persistence**: Built-in cache backends process writes independently of venue transport, and
+  event-store capture does not gate dispatch on durable commit. See
+  [Persistence before transport](execution/policies.md#persistence-before-transport).
+- **External activity**: Venue reports can include orders created outside the node. See
+  [External order creation](execution/reconciliation.md#external-order-creation).
+- **Reconciliation**: Startup and runtime checks align retained local state with venue reports. See
+  [Execution reconciliation](execution/reconciliation.md).
+
+## Execution client routing
+
+A live node can register independently named execution clients for the same venue. A command's
+`client_id` selects a registered client directly. Venue and default routes select a client when
+neither the command's `client_id` nor account-based routing resolves one.
+
+:::warning[Account isolation]
+Registering multiple clients for a venue does not provide end-to-end account isolation for
+positions and order management across same-venue accounts. Pre-trade risk checks use the account of
+the client that will run each command; see
+[Account selection](execution/index.md#account-selection).
 :::
 
-:::warning[Do not block the event loop]
-User code on the event loop thread (strategy callbacks, actor handlers, `on_event` methods)
-must return quickly. This applies to both Python and Rust. Blocking operations like model
-inference, heavy calculations, or synchronous I/O cause missed fills, stale data, and
-delayed order submissions. Offload long-running work to an executor or a separate thread/process.
-:::
+### Order routing
 
-:::info[Platform differences]
-Windows signal handling differs from Unix-like systems. If you are running on Windows, please read
-the note on [Windows signal handling](#windows-signal-handling) for guidance on graceful shutdown
-behavior and Ctrl+C (SIGINT) support.
-:::
+Configure venue and default routes through each client's `RoutingConfig`:
 
-## Configuration
+- `venues` assigns the listed venues to that client. These explicit routes take precedence over
+  automatic venue routes and the default client.
+- `default=True` selects the fallback client when no venue route applies.
 
-### `TradingNodeConfig`
+The only client registered for a venue automatically routes that venue unless another client
+explicitly routes it. Multiple clients for the same venue require an explicit venue route or a
+default client, even when strategies supply a `client_id` for each command. Duplicate client IDs,
+conflicting venue routes, and multiple defaults fail during node construction.
 
-`TradingNodeConfig` inherits from `NautilusKernelConfig` and adds live-specific options:
+### Instrument updates
 
-```python
-from nautilus_trader.config import TradingNodeConfig
+Instrument updates reach every client whose own venue matches, plus the client routed to that
+venue, if any. Each matching client receives the update once. Receiving an instrument update does
+not select that client as the recipient of order commands.
 
-config = TradingNodeConfig(
-    trader_id="MyTrader-001",
+### Direct Rust callers
 
-    # Component configurations
-    cache=CacheConfig(),
-    message_bus=MessageBusConfig(),
-    data_engine=LiveDataEngineConfig(),
-    risk_engine=LiveRiskEngineConfig(),
-    exec_engine=LiveExecEngineConfig(),
-    portfolio=PortfolioConfig(),
+`ExecutionEngine::register_client` registers a client without assigning routing. Call
+`register_venue_routing` or `set_default_client` afterward to configure venue or fallback routing.
+Alternatively, `register_default_client` registers a client and makes it the default.
 
-    # Client configurations
-    data_clients={
-        "BINANCE": BinanceDataClientConfig(),
-    },
-    exec_clients={
-        "BINANCE": BinanceExecClientConfig(),
-    },
-)
-```
+## Live node lifecycle
 
-#### Core configuration parameters
-
-| Setting                  | Default      | Description                                 |
-|--------------------------|--------------|---------------------------------------------|
-| `trader_id`              | "TRADER-001" | Unique trader identifier (name-tag format). |
-| `instance_id`            | `None`       | Optional unique instance identifier.        |
-| `timeout_connection`     | 30.0         | Connection timeout in seconds.              |
-| `timeout_reconciliation` | 10.0         | Reconciliation timeout in seconds.          |
-| `timeout_portfolio`      | 10.0         | Portfolio initialization timeout.           |
-| `timeout_disconnection`  | 10.0         | Disconnection timeout.                      |
-| `timeout_post_stop`      | 5.0          | Post-stop cleanup timeout.                  |
-
-#### Cache database configuration
-
-```python
-from nautilus_trader.config import CacheConfig
-from nautilus_trader.config import DatabaseConfig
-
-cache_config = CacheConfig(
-    database=DatabaseConfig(
-        host="localhost",
-        port=6379,
-        username="nautilus",
-        password="pass",
-        timeout=2.0,
-    ),
-    encoding="msgpack",  # or "json"
-    timestamps_as_iso8601=True,
-    buffer_interval_ms=100,
-    flush_on_start=False,
-)
-```
-
-#### MessageBus configuration
-
-```python
-from nautilus_trader.config import MessageBusConfig
-from nautilus_trader.config import DatabaseConfig
-
-message_bus_config = MessageBusConfig(
-    database=DatabaseConfig(timeout=2),
-    timestamps_as_iso8601=True,
-    use_instance_id=False,
-    types_filter=[QuoteTick, TradeTick],  # Filter specific message types
-    stream_per_topic=False,
-    autotrim_mins=30,  # Automatic message trimming
-    heartbeat_interval_secs=1,
-)
-```
-
-### Multi-venue configuration
-
-A node can connect to multiple venues. This example configures both
-spot and futures markets for Binance:
-
-```python
-config = TradingNodeConfig(
-    trader_id="MultiVenue-001",
-
-    # Multiple data clients for different market types
-    data_clients={
-        "BINANCE_SPOT": BinanceDataClientConfig(
-            account_type=BinanceAccountType.SPOT,
-            testnet=False,
-        ),
-        "BINANCE_FUTURES": BinanceDataClientConfig(
-            account_type=BinanceAccountType.USDT_FUTURES,
-            testnet=False,
-        ),
-    },
-
-    # Corresponding execution clients
-    exec_clients={
-        "BINANCE_SPOT": BinanceExecClientConfig(
-            account_type=BinanceAccountType.SPOT,
-            testnet=False,
-        ),
-        "BINANCE_FUTURES": BinanceExecClientConfig(
-            account_type=BinanceAccountType.USDT_FUTURES,
-            testnet=False,
-        ),
-    },
-)
-```
-
-### ExecutionEngine configuration
-
-`LiveExecEngineConfig` controls order processing, execution events, and
-venue reconciliation. For full details see the
-[API Reference](/docs/python-api-latest/config.html#nautilus_trader.live.config.LiveExecEngineConfig).
-
-#### Reconciliation
-
-Recovers missed order and position events to keep system state consistent with the venue.
-
-| Setting                         | Default | Description                                                                     |
-|---------------------------------|---------|---------------------------------------------------------------------------------|
-| `reconciliation`                | True    | Activate reconciliation at startup to align internal state with the venue.      |
-| `reconciliation_lookback_mins`  | None    | How far back (minutes) to request past events for reconciling uncached state.   |
-| `reconciliation_instrument_ids` | None    | Include list of instrument IDs to reconcile.                                    |
-| `filtered_client_order_ids`     | None    | Client order IDs to skip during reconciliation (for venue-side duplicates).     |
-
-See [Execution reconciliation](#execution-reconciliation) for details.
-
-#### Order filtering
-
-Controls which order events and reports the system processes, preventing conflicts
-across trading nodes.
-
-| Setting                            | Default | Description                                                                   |
-|------------------------------------|---------|-------------------------------------------------------------------------------|
-| `filter_unclaimed_external_orders` | False   | Drop unclaimed external orders so they do not affect the strategy.            |
-| `filter_position_reports`          | False   | Drop position status reports. Useful when multiple nodes trade one account.   |
-
-:::note[Order tagging behavior]
-Reconciliation tags orders by origin:
-
-- **`VENUE` tag**: external orders discovered at the venue (placed outside this system).
-- **`RECONCILIATION` tag**: synthetic orders generated to align position discrepancies.
-
-When `filter_unclaimed_external_orders` is enabled, only `VENUE`-tagged orders are filtered.
-`RECONCILIATION`-tagged orders are never filtered, so position alignment always succeeds.
-:::
-
-#### Continuous reconciliation
-
-A background loop starts after startup reconciliation completes. It:
-
-- Monitors in-flight orders for delays exceeding a configured threshold.
-- Reconciles open orders with the venue at configurable intervals.
-- Audits internal *own* order books against the venue's public books.
-
-The loop waits for startup reconciliation to finish before starting periodic checks.
-The `reconciliation_startup_delay_secs` parameter adds a further delay *after* startup
-reconciliation completes, giving the system time to stabilize.
-
-When retries are exhausted, the engine resolves the order as follows:
-
-**In-flight order timeout resolution** (venue does not respond after max retries):
-
-| Current status   | Resolved to | Rationale                                  |
-|------------------|-------------|--------------------------------------------|
-| `SUBMITTED`      | `REJECTED`  | No confirmation received from venue.       |
-| `PENDING_UPDATE` | `CANCELED`  | Modification remains unacknowledged.       |
-| `PENDING_CANCEL` | `CANCELED`  | Venue never confirmed the cancellation.    |
-
-**Order consistency checks** (when cache state differs from venue state):
-
-| Cache status       | Venue status | Resolution  | Rationale                                                           |
-|--------------------|--------------|-------------|---------------------------------------------------------------------|
-| `SUBMITTED`        | Not found    | `REJECTED`  | Order never confirmed by venue (e.g., lost during network error).   |
-| `ACCEPTED`         | Not found    | `REJECTED`  | Order doesn't exist at venue, likely was never successfully placed. |
-| `ACCEPTED`         | `CANCELED`   | `CANCELED`  | Venue canceled the order (user action or venue-initiated).          |
-| `ACCEPTED`         | `EXPIRED`    | `EXPIRED`   | Order reached GTD expiration at venue.                              |
-| `ACCEPTED`         | `REJECTED`   | `REJECTED`  | Venue rejected after initial acceptance (rare but possible).        |
-| `PARTIALLY_FILLED` | `CANCELED`   | `CANCELED`  | Order canceled at venue with fills preserved.                       |
-| `PARTIALLY_FILLED` | Not found    | `CANCELED`  | Order doesn't exist but had fills (reconciles fill history).        |
-
-:::note
-**Reconciliation caveats:**
-
-- **"Not found" resolutions** only apply in full-history mode (`open_check_open_only=False`).
-  Open-only mode (the default) skips these checks because venue "open orders" endpoints
-  exclude closed orders by design, making it impossible to distinguish missing orders from
-  recently closed ones.
-- **Recent order protection**: the engine skips reconciliation for orders whose last event
-  falls within the `open_check_threshold_ms` window (default 5s). This prevents false
-  positives from race conditions where the venue is still processing.
-- **Targeted query safeguard**: before marking an order `REJECTED` or `CANCELED` when
-  "not found", the engine issues a single-order query to the venue.
-  This catches false negatives from bulk query limitations or timing delays.
-- **`FILLED` orders** that are "not found" at the venue are silently ignored. Venues
-  commonly drop completed orders from their query results.
-
-:::
-
-#### Retry coordination and lookback behavior
-
-The inflight loop and open-order loop share a single retry counter
-(`_recon_check_retries`), bounded by `inflight_check_retries` and
-`open_check_missing_retries` respectively. The stricter limit wins,
-and avoids duplicate venue queries for the same order state.
-
-When the open-order loop exhausts retries, the engine issues one targeted
-`GenerateOrderStatusReport` probe before applying a terminal state. If the
-venue returns the order, reconciliation proceeds and the retry counter resets.
-
-**Single-order query protection**: the engine caps single-order queries per
-cycle via `max_single_order_queries_per_cycle` (default: 10). Remaining
-orders are deferred to the next cycle. A configurable delay
-(`single_order_query_delay_ms`, default: 100ms) spaces out consecutive
-queries to avoid rate limits. This handles bulk query failures across hundreds of orders
-without overwhelming the venue API.
-
-Orders older than `open_check_lookback_mins` rely on this targeted probe.
-Keep the lookback generous for venues with short history windows. Increase
-`open_check_threshold_ms` if venue timestamps lag the local clock, so
-recently updated orders are not marked missing prematurely.
-
-| Setting                              | Default        | Description                                                                                      |
-|--------------------------------------|----------------|--------------------------------------------------------------------------------------------------|
-| `inflight_check_interval_ms`         | 2,000&nbsp;ms  | How often to check in-flight order status. Set to 0 to disable.                                  |
-| `inflight_check_threshold_ms`        | 5,000&nbsp;ms  | Time before an in-flight order triggers a venue status check. Lower if colocated.                |
-| `inflight_check_retries`             | 5&nbsp;retries | Retry attempts to verify an in-flight order with the venue.                                      |
-| `open_check_interval_secs`           | None           | How often (seconds) to check open orders at the venue. None or 0.0 disables. Recommended: 5-10s.|
-| `open_check_open_only`               | True           | When true, query only open orders; when false, fetch full history (resource-intensive).          |
-| `open_check_lookback_mins`           | 60&nbsp;min    | Lookback window (minutes) for order status polling. Only orders modified within this window.     |
-| `open_check_threshold_ms`            | 5,000&nbsp;ms  | Minimum time since last cached event before acting on venue discrepancies.                       |
-| `open_check_missing_retries`         | 5&nbsp;retries | Max retries before resolving an order open in cache but not found at venue.                      |
-| `max_single_order_queries_per_cycle` | 10             | Cap on single-order queries per cycle. Prevents rate-limit exhaustion.                           |
-| `single_order_query_delay_ms`        | 100&nbsp;ms    | Delay (ms) between single-order queries to avoid rate limits.                                    |
-| `reconciliation_startup_delay_secs`  | 10.0&nbsp;s    | Delay (seconds) *after* startup reconciliation before continuous checks begin.                   |
-| `own_books_audit_interval_secs`      | None           | Interval (seconds) between auditing own order books against public books.                        |
-| `position_check_interval_secs`       | None           | Interval (seconds) between position consistency checks. On discrepancy, queries for missing fills. None disables. Recommended: 30-60s. |
-| `position_check_lookback_mins`       | 60&nbsp;min    | Lookback window (minutes) for querying fill reports on position discrepancy.                     |
-| `position_check_threshold_ms`        | 5,000&nbsp;ms  | Minimum time since last local activity before acting on position discrepancies.                  |
-| `position_check_retries`             | 3&nbsp;retries | Max attempts per instrument before the engine stops retrying that discrepancy. Once exceeded, an error is logged and the discrepancy is no longer actively reconciled until it clears. |
-
-:::warning
-
-- **`open_check_lookback_mins`**: do not reduce below 60 minutes. A short window
-  triggers false "missing order" resolutions because orders fall outside the query range.
-- **`reconciliation_startup_delay_secs`**: do not reduce below 10 seconds in production.
-  The delay lets the system stabilize after startup reconciliation before continuous
-  checks begin.
-
-:::
-
-#### Additional options
-
-| Setting                            | Default | Description                                                                                     |
-|------------------------------------|---------|-------------------------------------------------------------------------------------------------|
-| `allow_overfills`                  | False   | Allow fills exceeding order quantity (logs warning). Useful when reconciliation races fills.     |
-| `generate_missing_orders`          | True    | Generate LIMIT orders during reconciliation to align position discrepancies (strategy `EXTERNAL`, tag `RECONCILIATION`). |
-| `snapshot_orders`                  | False   | Take order snapshots on order events.                                                           |
-| `snapshot_positions`               | False   | Take position snapshots on position events.                                                     |
-| `snapshot_positions_interval_secs` | None    | Interval (seconds) between position snapshots.                                                  |
-| `debug`                            | False   | Enable debug logging for execution.                                                             |
-
-#### Memory management
-
-Periodically purges closed orders, closed positions, and account events from the
-in-memory cache, keeping memory bounded during long-running or HFT sessions.
-
-| Setting                                | Default | Description                                                                        |
-|----------------------------------------|---------|------------------------------------------------------------------------------------|
-| `purge_closed_orders_interval_mins`    | None    | How often (minutes) to purge closed orders from memory. Recommended: 10-15 min.    |
-| `purge_closed_orders_buffer_mins`      | None    | How long (minutes) an order must be closed before purging. Recommended: 60 min.    |
-| `purge_closed_positions_interval_mins` | None    | How often (minutes) to purge closed positions from memory. Recommended: 10-15 min. |
-| `purge_closed_positions_buffer_mins`   | None    | How long (minutes) a position must be closed before purging. Recommended: 60 min.  |
-| `purge_account_events_interval_mins`   | None    | How often (minutes) to purge account events from memory. Recommended: 10-15 min.   |
-| `purge_account_events_lookback_mins`   | None    | How old (minutes) an account event must be before purging. Recommended: 60 min.    |
-| `purge_from_database`                  | False   | Also delete from the backing database (Redis/PostgreSQL). **Use with caution**.    |
-
-Setting an interval enables the purge loop; leaving it unset disables scheduling and
-deletion. Database records are unaffected unless `purge_from_database` is true. Each
-loop delegates to the cache APIs described in
-[Purging cached state](cache.md#purging-cached-state).
-
-#### Queue management
-
-| Setting                          | Default | Description                                                                     |
-|----------------------------------|---------|---------------------------------------------------------------------------------|
-| `qsize`                          | 100,000 | Size of internal queue buffers.                                                 |
-| `graceful_shutdown_on_exception` | False   | Gracefully shut down on unexpected queue processing exceptions (not user code). |
-
-### Strategy configuration
-
-For a complete parameter list see the `StrategyConfig`
-[API Reference](/docs/python-api-latest/config.html#nautilus_trader.trading.config.StrategyConfig).
-
-#### Identification
-
-| Setting        | Default | Description                                                   |
-|----------------|---------|---------------------------------------------------------------|
-| `strategy_id`  | None    | Unique strategy identifier.                                   |
-| `order_id_tag` | None    | Unique tag appended to this strategy's order IDs.             |
-
-#### Order management
-
-| Setting                     | Default | Description                                                                                |
-|-----------------------------|---------|--------------------------------------------------------------------------------------------|
-| `oms_type`                  | None    | [OMS type](../concepts/execution#oms-configuration) for position ID and order processing.  |
-| `use_uuid_client_order_ids` | False   | Use UUID4 values for client order IDs.                                                     |
-| `external_order_claims`     | None    | Instrument IDs whose external orders this strategy claims.                                 |
-| `manage_contingent_orders`  | False   | Automatically manage OTO, OCO, and OUO contingent orders.                                  |
-| `manage_gtd_expiry`         | False   | Manage GTD expirations for orders.                                                         |
-
-### Windows signal handling
-
-:::warning
-Windows: asyncio event loops do not implement `loop.add_signal_handler`. As a result, the legacy
-`TradingNode` does not receive OS signals via asyncio on Windows. Use Ctrl+C (SIGINT) handling or
-programmatic shutdown; SIGTERM parity is not expected on Windows.
-:::
-
-On Windows, asyncio event loops do not implement `loop.add_signal_handler`, so Unix-style
-signal integration is unavailable. `TradingNode` does not receive OS signals via asyncio
-on Windows and will not stop gracefully unless you intervene.
-
-Recommended approaches:
-
-- Wrap `run` with `try/except KeyboardInterrupt` and call `node.stop()` then `node.dispose()`.
-  Ctrl+C raises `KeyboardInterrupt` in the main thread, giving you a clean teardown path.
-- Publish a `ShutdownSystem` command programmatically (or call `shutdown_system(...)` from
-  an actor/component) to trigger the same shutdown path.
-
-The “inflight check loop task still pending” message appears because the normal graceful
-shutdown path is not triggered. This is tracked as
-[#2785](https://github.com/nautechsystems/nautilus_trader/issues/2785).
-
-The v2 `LiveNode` already handles Ctrl+C via `tokio::signal::ctrl_c()` and a Python SIGINT
-bridge, so runner and tasks shut down cleanly.
-
-Example pattern for Windows:
-
-```python
-try:
-    node.run()
-except KeyboardInterrupt:
-    pass
-finally:
-    try:
-        node.stop()
-    finally:
-        node.dispose()
-```
-
-## Execution reconciliation
-
-Execution reconciliation aligns the venue's actual order and position state with the
-system's internal state built from events. Only the `LiveExecutionEngine` performs
-reconciliation, since backtesting controls both sides.
-
-:::note[Terminology]
-An **in-flight order** is one awaiting venue acknowledgement:
-
-- `SUBMITTED` - initial submission, awaiting accept/reject.
-- `PENDING_UPDATE` - modification requested, awaiting confirmation.
-- `PENDING_CANCEL` - cancellation requested, awaiting confirmation.
-
-These orders are monitored by the continuous reconciliation loop to detect stale or lost messages.
-:::
-
-Two scenarios:
-
-- **Cached state exists**: report data generates missing events to align the state.
-- **No cached state**: all orders and positions at the venue are generated from scratch.
-
-:::tip
-Persist all execution events to the cache database. This reduces reliance on venue history
-and allows full recovery even with short lookback windows.
-:::
-
-### Reconciliation configuration
-
-Unless `reconciliation` is set to false, the execution engine reconciles state for each
-venue at startup. The `reconciliation_lookback_mins` parameter controls how far back the
-engine requests history.
-
-:::tip
-Leave `reconciliation_lookback_mins` unset. This lets the engine request the maximum
-execution history the venue provides.
-:::
-
-:::warning
-Executions before the lookback window still generate alignment events, but with some
-information loss that a longer window would avoid. Some venues also filter or drop
-older execution data. Persisting all events to the cache database prevents both issues.
-:::
-
-Each strategy can claim external orders for an instrument ID generated during reconciliation
-via the `external_order_claims` config parameter. This lets a strategy resume managing open
-orders when no cached state exists.
-
-Orders generated with strategy ID `EXTERNAL` and tag `RECONCILIATION` during position
-reconciliation are internal to the engine. They cannot be claimed via `external_order_claims`
-and should not be managed by user strategies.
-
-:::tip
-To detect external orders in your strategy, check `order.strategy_id.value == "EXTERNAL"`. These orders participate in portfolio calculations and position tracking like any other order.
-:::
-
-For all live trading options, see the `LiveExecEngineConfig` [API Reference](/docs/python-api-latest/config.html#nautilus_trader.live.config.LiveExecEngineConfig).
-
-### Reconciliation procedure
-
-All adapter execution clients follow the same reconciliation procedure, calling three methods
-to produce an execution mass status:
-
-- `generate_order_status_reports`
-- `generate_fill_reports`
-- `generate_position_status_reports`
+Rust `LiveNode::run()` prepares cached and venue state before starting trader components, then owns
+the event loop and coordinated shutdown.
 
 ```mermaid
 flowchart TD
-    Start[Startup Reconciliation] --> Fetch[Fetch venue reports<br/>orders, fills, positions]
-    Fetch --> Dedup[Deduplicate reports<br/>log warnings for duplicates]
-    Dedup --> Orders[Order Reconciliation<br/>align order states, generate missing events]
-    Orders --> Fills[Fill Reconciliation<br/>verify fills, generate missing OrderFilled events]
-    Fills --> Pos[Position Reconciliation<br/>compare net positions per instrument]
-    Pos --> Match{Positions<br/>match venue?}
-    Match -->|Yes| Done[Reconciliation complete<br/>system ready for trading]
-    Match -->|No| Gen[Generate missing orders<br/>strategy: EXTERNAL, tag: RECONCILIATION]
-    Gen --> Done
+    Build[Configure and build LiveNode] --> Cache[Restore cached state when configured]
+    Cache --> Data[Connect data clients and cache instruments]
+    Data --> Exec[Connect execution clients]
+    Exec --> Recon{Startup reconciliation enabled?}
+    Recon -->|Yes| Align[Fetch venue reports and align state]
+    Recon -->|No| Trader[Start trader components]
+    Align --> Trader
+    Trader --> Run[Run event loop and periodic checks]
+    Run -->|Stop or shutdown request| Stop[Stop trader and process residual events]
+    Stop --> Final[Disconnect clients and finalize]
 ```
 
-The system reconciles its state against these reports, which represent external reality:
+Live node lifecycle: instruments and execution state are prepared before strategies start trading.
 
-- **Duplicate check**:
-  - Deduplicates order reports within the batch and logs warnings.
-  - Logs duplicate trade IDs as warnings for investigation.
-- **Order reconciliation**:
-  - Generates and applies events to move orders from cached state to current state.
-  - Infers `OrderFilled` events for missing trade reports.
-  - Generates external order events for unrecognized client order IDs or reports missing a client order ID.
-  - Verifies fill report data consistency with tolerance-based price and commission comparisons.
-- **Position reconciliation**:
-  - Matches the net position per instrument against venue position reports using instrument precision.
-  - Generates external order events when order reconciliation leaves a position that differs from the venue.
-  - When `generate_missing_orders` is enabled (default: True), generates orders with strategy ID `EXTERNAL` and tag `RECONCILIATION` to align discrepancies.
-  - Falls through a price hierarchy when generating reconciliation orders:
-    1. **Calculated reconciliation price** (preferred): targets the correct average position.
-    2. **Market mid-price**: uses the current bid-ask midpoint.
-    3. **Current position average**: uses the existing position's average price.
-    4. **MARKET order** (last resort): used only when no price data exists (no positions, no market data).
-  - Uses LIMIT orders when a price can be determined (cases 1-3) to preserve PnL accuracy.
-  - Skips zero quantity differences after precision rounding.
-- **Partial window adjustment**:
-  - When `reconciliation_lookback_mins` is set, the window may miss opening fills.
-  - The system adjusts fills using lifecycle analysis to reconstruct positions accurately:
-    - Detects zero-crossings (position qty crosses through FLAT) to identify separate lifecycles.
-    - Adds synthetic opening fills when the earliest lifecycle is incomplete.
-    - Filters out closed lifecycles when the current lifecycle matches the venue position.
-    - Replaces a mismatched current lifecycle with a synthetic fill reflecting the venue position.
-  - Synthetic fills use calculated reconciliation prices to target correct average positions.
-  - See [Partial window adjustment scenarios](#partial-window-adjustment-scenarios) for details.
-- **Exception handling**:
-  - Individual adapter failures do not abort the entire reconciliation process.
-  - Fill reports arriving before order status reports are deferred until order state is available.
+Cache restoration runs when a backing database is attached and cache loading is enabled. Connection,
+reconciliation, or trader startup failures abort startup and follow the coordinated cleanup path.
 
-If reconciliation fails, the system logs an error and does not start.
+### Submission recovery at shutdown
 
-### Common reconciliation scenarios
+Rust `LiveNode::stop`, `run`, and `run_with_mode`, and Python `run_async()` use the same submission
+recovery boundary. During `delay_post_stop`, the node continues processing venue evidence and native
+managed-exit timers without starting new reconciliation queries. At the end of that window, any
+retained submission without a native outcome or venue confirmation makes shutdown return an error
+listing the unresolved client order IDs. Clients disconnect and the kernel stops even when recovery
+is incomplete. Evidence drained after this boundary cannot change the recorded shutdown result.
 
-The tables below cover startup reconciliation (mass status) and runtime checks (in-flight order checks, open-order polls, own-books audits).
+This applies to `RetainUnresolved` and to clients which require submission retention, including
+submissions whose recovery budget has not yet exhausted. Polymarket requires retention automatically,
+so its callers can receive this error without selecting an opt-in policy. The default `ResolveLocally`
+policy remains unchanged for clients which do not require retention.
 
-#### Startup reconciliation
+Submission acknowledgement ends submission recovery; it does not prove that an accepted order's
+cancel or update completed, or that positions are flat. Managed exit keeps its existing attempt
+budget, and this result does not extend cleanup beyond `delay_post_stop` or implement recovery
+across restarts. See [submission recovery](execution/reconciliation.md#submission-recovery)
+for identity and query-budget rules.
 
-| Scenario                               | Description                                                                              | System behavior                                                                 |
-|----------------------------------------|------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
-| **Order state discrepancy**            | Local state differs from venue (e.g., local `SUBMITTED`, venue `REJECTED`).              | Updates local order to match venue state, emits missing events.                 |
-| **Missed fills**                       | Venue filled an order but the engine missed the event.                                   | Generates missing `OrderFilled` events.                                         |
-| **Multiple fills**                     | Order has partial fills, some missed by the engine.                                      | Reconstructs complete fill history from venue reports.                          |
-| **External orders**                    | Orders exist on venue but not in local cache.                                            | Creates orders with strategy ID `EXTERNAL` and tag `VENUE`.                     |
-| **Partially filled then canceled**     | Order partially filled then canceled by venue.                                           | Updates state to `CANCELED`, preserves fill history.                            |
-| **Different fill data**                | Venue reports different fill price/commission than cached.                               | Preserves cached data, logs discrepancies.                                      |
-| **Filtered orders**                    | Orders marked for filtering via config.                                                  | Skips based on `filtered_client_order_ids` or instrument filters.               |
-| **Duplicate order reports**            | Multiple orders share the same identifier.                                               | Deduplicates with warning logged.                                               |
-| **Position quantity mismatch (long)**  | Internal long position differs from venue (e.g., 100 vs 150).                            | Generates BUY LIMIT with calculated price when `generate_missing_orders=True`.  |
-| **Position quantity mismatch (short)** | Internal short position differs from venue (e.g., -100 vs -150).                         | Generates SELL LIMIT with calculated price when `generate_missing_orders=True`. |
-| **Position reduction**                 | Venue position smaller than internal (e.g., internal 150 long, venue 100 long).          | Generates opposite-side LIMIT order with calculated price.                      |
-| **Position side flip**                 | Internal position opposite of venue (e.g., internal 100 long, venue 50 short).           | Generates LIMIT order to close internal and open external position.             |
-| **Internal reconciliation orders**     | Orders with strategy ID `EXTERNAL` and tag `RECONCILIATION`.                             | Never filtered, regardless of `filter_unclaimed_external_orders`.               |
+## Hosted event loops
 
-#### Runtime checks
+Use `run_async()` from Python to run a node on an event loop you already own, such as an ASGI server
+serving a dashboard beside the node. Use `run()` when the node should own the calling thread and
+signal handling.
 
-| Scenario                          | Description                                             | System behavior                                                        |
-|-----------------------------------|---------------------------------------------------------|------------------------------------------------------------------------|
-| **In-flight order timeout**       | Order remains unconfirmed beyond threshold.             | After `inflight_check_retries`, resolves to `REJECTED`.                |
-| **Open orders check discrepancy** | Periodic poll detects a venue state change.             | Confirms status at `open_check_interval_secs` and applies transitions. |
-| **Own books audit mismatch**      | Own order books diverge from venue public books.        | Audits at `own_books_audit_interval_secs`, logs inconsistencies.       |
+This lifecycle sketch leaves node configuration and request serving to the application:
 
-### Common reconciliation issues
+```python
+import asyncio
 
-- **Missing trade reports**: Some venues filter out older trades. Increase `reconciliation_lookback_mins` or cache all events locally.
-- **Position mismatches**: External orders that predate the lookback window cause position drift. Flatten the account before restarting to reset state.
-- **Duplicate order IDs**: Deduplicated with warnings logged. Frequent duplicates may indicate venue data integrity issues.
-- **Precision differences**: Small decimal differences are handled using instrument precision. Large discrepancies may indicate missing orders.
-- **Out-of-order reports**: Fill reports arriving before order status reports are deferred until order state is available.
+from nautilus_trader.live import LiveNode
+from nautilus_trader.live import LiveNodeHandle
 
-:::tip
-For persistent issues, drop cached state or flatten accounts before restarting.
+
+async def wait_until_running(
+    handle: LiveNodeHandle,
+    task: asyncio.Task[None],
+) -> None:
+    while not handle.is_running:
+        if task.done():
+            await task
+            raise RuntimeError("LiveNode stopped during startup")
+        await asyncio.sleep(0.01)
+
+
+async def serve_with_node(node: LiveNode) -> None:
+    cache, portfolio, handle = node.cache, node.portfolio, node.handle()
+    run_task: asyncio.Task[None] | None = None
+    service_task: asyncio.Task[None] | None = None
+    try:
+        run_task = asyncio.create_task(node.run_async())
+        await wait_until_running(handle, run_task)
+
+        service_task = asyncio.create_task(serve_requests(cache, portfolio, handle))
+        done, _ = await asyncio.wait(
+            (run_task, service_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if run_task in done:
+            await run_task
+            raise RuntimeError("LiveNode stopped while the service was running")
+        await service_task
+    finally:
+        if service_task is not None and not service_task.done():
+            service_task.cancel()
+            await asyncio.gather(service_task, return_exceptions=True)
+        try:
+            if run_task is not None:
+                handle.stop()
+                await run_task
+        finally:
+            node.dispose()
+```
+
+Both entry points run the same lifecycle, so a hosted node performs the same startup ordering,
+maintenance, reconciliation, and shutdown as an owned one. The mode decides only who owns signal
+handling: a hosted node installs no handlers, leaving `SIGINT` and `SIGTERM` to the host.
+
+### Access and shutdown
+
+`run_async()` returns a coroutine and lends the node to it for the run's duration:
+
+- Capture `cache`, `portfolio`, and `handle()` **before starting**. Each stays usable while the node
+  runs, whereas reading state through the node itself raises until the run returns it.
+- `handle()` works throughout, since it is how a host stops the node. `is_running` also answers
+  throughout because it reads the same handle.
+- Call `dispose()` **after the run task finishes** to release the node's resources. Calling it during
+  the run returns without doing anything; it does not defer disposal.
+
+`LiveNodeHandle` is safe to call from any thread, including a signal handler. `stop()` requests a
+graceful shutdown and returns immediately, so the awaiting task resolves only once shutdown
+finishes. Cancelling that task requests the same shutdown, waits for it, then re-raises the
+cancellation, which keeps `asyncio.timeout` and task groups behaving as their callers expect.
+
+The shared [submission recovery shutdown contract](#submission-recovery-at-shutdown) applies to
+hosted nodes. If an awaiting Python task is cancelled, cancellation still propagates after teardown,
+with any shutdown error preserved as the cancellation exception's cause.
+
+### Host integration and limits
+
+Compatibility is tested with the default asyncio loop and uvloop. An ASGI lifespan managed by
+Uvicorn can apply the same ownership pattern without transferring signal handling to the node.
+Before an ASGI lifespan reports startup complete, wait until the handle reports `Running` while
+checking whether the run task has failed. Keep supervising the task after startup, and treat
+unexpected completion as a service failure.
+
+While the node is running, it yields to the host loop periodically, so a burst of events cannot
+starve the host's own callbacks. Startup and shutdown drain their queues without yielding, so a
+large instrument load or a shutdown backlog can hold the loop for the length of that drain.
+
+:::warning[One LiveNode per process]
+Run one concurrent `LiveNode` per process. The runner binds its channel senders and message bus into
+thread-local storage, and other runtime state is process-wide. `run_async()` also rejects a second
+hosted node on the same event loop. Run additional nodes in separate processes.
+
+Building another `LiveNode` on the same thread raises an error while the first node exists or is
+being built. In Python, `node.build(...)` is a static constructor and attempts to create another node.
+Drop the existing node, or release all references to it in Python, before building its replacement.
+With a single Python reference, call `del node` first: `node = LiveNode.build(...)` attempts construction
+while the old node still exists. Calling `dispose()` alone does not release this construction guard.
+Exceptions and unfinished coroutines can retain the node; release those references too. If an
+unreachable reference cycle retains it, run `gc.collect()` before rebuilding.
+
+When an ASGI application lifespan constructs the node, run that application with one worker. Do not
+use hot reload for live trading because it restarts the worker and its node. Scale HTTP request
+handling with processes that do not construct a trading node.
 :::
 
-### Reconciliation invariants
+A node configured with a cache database backing is rejected on a host loop. Those backings wait for
+their worker task by blocking the calling thread, which stalls the host loop rather than slowing it.
+Native-only nodes can use `run()` for database backing. Custom Python clients drive asyncio in
+both launch modes, so neither supports cache database backing.
 
-The reconciliation system maintains three invariants:
+## Configuration
 
-1. **Position quantity**: the final quantity matches the venue within instrument precision.
-2. **Average entry price**: the position's average entry price matches the venue's reported price within tolerance (default 0.01%).
-3. **PnL integrity**: all generated fills, including synthetic fills, use calculated prices that preserve correct unrealized PnL.
+For how config structs handle defaults, `T` vs `Option<T>` semantics, and
+builder patterns, see the [Configuration](configuration.md) concept guide.
 
-These hold even when:
+For node and execution engine settings, strategy configuration, cache backing, and multi-venue
+wiring, see the
+[Configure a live trading node](../how_to/configure_live_trading.md) how-to guide.
 
-- The reconciliation window misses complete fill history.
-- Fills are missing from venue reports.
-- Position lifecycles span beyond the lookback window.
-- Multiple zero-crossings have occurred.
+## Execution reconciliation
 
-### Partial window adjustment scenarios
+For how submit, modify, and cancel commands resolve, see
+[Command outcomes](execution/policies.md#command-outcomes).
 
-When `reconciliation_lookback_mins` limits the window, the system analyzes position lifecycles
-from fills and adjusts to reconstruct positions accurately.
+At startup, reconciliation aligns cached order and position state with venue reports before trader
+components start. Continuous checks can then monitor in-flight orders, open orders, positions, and
+own order books while the node runs.
 
-| Scenario                                   | Description                                                                  | System behavior                                                             |
-|--------------------------------------------|------------------------------------------------------------------------------|-----------------------------------------------------------------------------|
-| **Complete lifecycle**                     | All fills from opening to current state are captured.                        | No adjustment.                                                              |
-| **Incomplete single lifecycle**            | Window misses opening fills, no zero-crossings.                              | Adds synthetic opening fill with calculated price.                          |
-| **Multiple lifecycles, current matches**   | Zero-crossings detected, current lifecycle matches venue.                    | Filters out old lifecycles, returns current only.                           |
-| **Multiple lifecycles, current mismatch**  | Zero-crossings detected, current lifecycle differs from venue.               | Replaces current lifecycle with a single synthetic fill.                    |
-| **Flat position**                          | Venue reports FLAT regardless of fill history.                               | No adjustment.                                                              |
-| **No fills**                               | Window contains no fill reports.                                             | No adjustment, empty result.                                                |
+When an adapter declares bounded historical reports, startup reconciliation applies their fill
+economics only when the report set and retained state prove a coherent position transition.
+Incomplete or ambiguous history can still recover exact order state without changing positions or
+portfolio economics.
 
-**Key concepts:**
+See [Execution reconciliation](execution/reconciliation.md) for configuration, recovery procedures,
+runtime checks, scenarios, and invariants.
+For runtime protection against stale snapshots and the distinction from genuine corrections and explicit fill-void events,
+see [Snapshot freshness and fill corrections](execution/reconciliation.md#snapshot-freshness-and-fill-corrections).
 
-- **Zero-crossing**: position quantity crosses through zero (FLAT), marking a lifecycle boundary.
-- **Lifecycle**: a sequence of fills between zero-crossings representing one open-close cycle.
-- **Synthetic fill**: a calculated fill report representing missing activity, priced to achieve the correct average position.
-- **Tolerance**: position matching uses configurable price tolerance (default 0.0001 = 0.01%) to absorb minor calculation differences.
+## Rust live runner metrics
+
+Rust `LiveNode` exposes primitive runner metrics through `LiveNodeHandle::metrics_snapshot()`.
+Get the handle from the node before calling `run()`, then poll snapshots from another task and
+derive rates or utilization from deltas.
+
+```rust
+use std::time::Duration;
+
+use nautilus_common::enums::Environment;
+use nautilus_live::node::{LiveNode, RunnerMetricsDelta};
+
+let mut node = LiveNode::builder(trader_id, Environment::Live)?
+    // Add clients, actors, and strategies here.
+    .build()?;
+
+let metrics_handle = node.handle();
+
+tokio::spawn(async move {
+    let mut prev = metrics_handle.metrics_snapshot();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+
+        let next = metrics_handle.metrics_snapshot();
+        let delta = RunnerMetricsDelta::from_snapshots(prev, next);
+        if delta.elapsed_ns == 0 {
+            prev = next;
+            continue;
+        }
+
+        let elapsed_s = delta.elapsed_ns as f64 / 1_000_000_000.0;
+        let data_event_rate = delta.data_events as f64 / elapsed_s;
+        let data_event_staleness_ns = if next.data_events.last_dispatch_at_ns == 0 {
+            0
+        } else {
+            next.elapsed_ns
+                .saturating_sub(next.data_events.last_dispatch_at_ns)
+        };
+
+        log::info!(
+            "Runner metrics: data_event_rate={data_event_rate:.0} \
+             data_event_staleness_ns={data_event_staleness_ns} \
+             dispatch_utilization={:.6} loop_utilization={:.6} \
+             mean_dispatch_ns={} data_queue_depth={}",
+            delta.dispatch_utilization(),
+            delta.loop_utilization(),
+            delta.mean_dispatch_ns(),
+            next.data_events.queue_depth,
+        );
+
+        prev = next;
+    }
+});
+
+node.run().await?;
+```
+
+### Snapshot scope and interpretation
+
+The snapshot covers `LiveNode::run` channel dispatch after startup, including residual dispatch
+during the shutdown grace period. It does **not** include startup buffering, startup flushes, or the
+final post-loop drain.
+
+- `dispatch_busy_ns` covers the five dispatch branches. `maintenance_busy_ns` and
+  `external_msgbus_busy_ns` cover non-dispatch loop work.
+- Queue depths are point samples from the maintenance tick while the node is running, and can be
+  stale during shutdown grace.
+- Snapshots are lock-free and may not be a consistent cross-field view. Derive rates from successive
+  snapshots with **saturating deltas**.
+- Counters reset when `LiveNode::run` enters steady state.
+
+## Dispatch priority and overload behavior
+
+The live runner's seven internal message channels are separate and unbounded. When several message
+channels are ready together, the runner polls in this order:
+
+1. Time and system work.
+1. Execution events.
+1. Execution commands.
+1. External message-bus ingress.
+1. Data events.
+1. Data commands.
+
+Events precede commands within the execution and data channel pairs.
+
+This polling order keeps a market-data backlog from taking priority over ready execution traffic.
+It does not define **one global FIFO order** across channels, adapters, or venues. Each selected branch
+runs to completion before the runner polls again, so a slow handler delays every channel. The runner
+yields to the host event loop periodically, but yielding does not change channel priority or shorten
+a slow handler.
+
+:::warning[Unbounded queues]
+Runner channels do not apply producer backpressure, coalesce messages, shed market data, or impose a
+maximum queue depth. Sustained input above dispatch capacity therefore increases queue depth,
+latency, and memory use. The runner does not automatically throttle a feed, halt trading, or shut
+down when a threshold is crossed.
+:::
+
+Use runner metrics and queue-state events to detect this pressure. The thresholds are operational
+signals, not service-time guarantees. The application must decide how to alert, reduce input, halt
+new exposure, or stop the node when pressure persists.
+
+## Queue pressure monitoring
+
+`LiveNode` converts runner queue samples into typed state transitions when
+`LiveNodeConfig.queue_monitor` is set. The monitor is **disabled by default** and publishes no
+queue-state events while the field is unset.
+
+### Configure thresholds
+
+The following example sets the thresholds applied to every monitored runner channel:
+
+```rust tab="Rust"
+use nautilus_live::config::{LiveNodeConfig, QueueMonitorConfig};
+
+let config = LiveNodeConfig {
+    queue_monitor: Some(
+        QueueMonitorConfig::builder()
+            .queue_depth_trigger(1_000)
+            .queue_depth_clear(500)
+            .mean_dispatch_ns_trigger(250_000)
+            .mean_dispatch_ns_clear(150_000)
+            .build(),
+    ),
+    ..Default::default()
+};
+```
+
+```python tab="Python"
+from nautilus_trader.live import LiveNodeConfig
+from nautilus_trader.live import QueueMonitorConfig
+
+config = LiveNodeConfig(
+    queue_monitor=QueueMonitorConfig(
+        queue_depth_trigger=1_000,
+        queue_depth_clear=500,
+        mean_dispatch_ns_trigger=250_000,
+        mean_dispatch_ns_clear=150_000,
+    ),
+)
+```
+
+The four values apply to each monitored runner channel:
+
+- `time_events`
+- `exec_events`
+- `exec_commands`
+- `data_events`
+- `data_commands`
+
+Each clear threshold must be **lower than its trigger threshold**. Configuration validation rejects
+equal or inverted thresholds.
+
+### State transitions
+
+The live runner evaluates the monitor on its 100 ms maintenance tick, after sampling current queue
+depths. Queue depth is a point-in-time value. Mean dispatch time uses the messages and dispatch busy
+time accumulated since the previous metrics snapshot.
+
+| Condition    | Measure                                               | `Triggered`                                    | `Cleared`                                    |
+| ------------ | ----------------------------------------------------- | ---------------------------------------------- | -------------------------------------------- |
+| `Backlogged` | Point-in-time queue depth.                            | `queue_depth >= queue_depth_trigger`           | `queue_depth <= queue_depth_clear`           |
+| `Slow`       | Per-channel mean dispatch time for the sample window. | `mean_dispatch_ns >= mean_dispatch_ns_trigger` | `mean_dispatch_ns <= mean_dispatch_ns_clear` |
+
+Each channel tracks `Backlogged` and `Slow` independently:
+
+- A value between the clear and trigger thresholds retains the prior state, so it does not publish
+  another event.
+- If both conditions cross on one tick, the node publishes two events. Each condition clears
+  independently.
+- A sample window with no dispatches does not evaluate `Slow`. The condition retains its prior state
+  until a window contains a dispatch.
+
+### Typed delivery
+
+Each transition publishes a fresh `QueueStateChanged` value on
+`events.system.QueueStateChanged.<channel>`, where `<channel>` is the Rust variant name, such as
+`DataEvents` for Python `SystemChannel.DATA_EVENTS`. The event identifies the configured trader,
+runner channel, condition, and transition state. It also records the queue depth and mean dispatch
+time at the crossing, a fresh event ID, and event timestamps.
+
+Actors subscribe with `subscribe_queue_state(...)` and receive events through
+`on_queue_state(...)`. The Python API exposes `SystemChannel`, `QueueCondition`, `QueueState`, and
+`QueueStateChanged` from `nautilus_trader.common`. Publication stays on the in-process typed message
+bus, and the event has no wire representation for external message-bus streaming. See
+[Queue pressure state](actors.md#queue-pressure-state) for actor examples.
+
+## Socket transport state
+
+### Publication and routing
+
+Actors can observe transport availability for adapters that opt into socket state reporting.
+`LiveNode` publishes `SocketStateChanged` on
+`events.system.SocketStateChanged.<client_id>.<endpoint>` with the trader ID, client ID, optional venue,
+stable endpoint label, state, fresh event ID, and event timestamps. The endpoint label identifies one
+logical adapter transport without exposing its URL. `LiveNode` sets
+both timestamps from the kernel clock when it handles the transport's neutral state notification.
+Adapters send the notification through the runner's system-event channel, separately from market
+data. The internal channel is not part of queue-pressure monitoring.
+
+The client ID and endpoint components percent-encode bytes other than ASCII letters, digits, `-`,
+and `_`, so dots and wildcard characters in labels cannot change topic matching. Use
+`subscribe_socket_state` filters to select a client, endpoint, or both without constructing topic names.
+
+### State semantics
+
+| Transport event or condition        | Publication                                            |
+| ----------------------------------- | ------------------------------------------------------ |
+| TCP or WebSocket becomes available. | `Connected`.                                           |
+| Active transport is lost.           | `Disconnected`.                                        |
+| Connection or retry attempt fails.  | No event.                                              |
+| Deliberate shutdown.                | No disconnect event.                                   |
+| Reconnect attempts are exhausted.   | No additional event after the reported transport loss. |
+
+`Connected` reports **transport availability**. It does not mean that authentication, subscription
+replay, or adapter recovery has completed.
+
+:::warning
+Socket state is operational evidence, not an execution-command outcome. A disconnect by itself does
+not reject, cancel, or resolve an in-flight command; stream updates, queries, or reconciliation
+provide that evidence under the
+[command outcome policy](execution/policies.md#command-outcomes).
+:::
+
+### Dead-peer detection
+
+A connection can stop delivering without closing: a NAT or load balancer drops it with no `FIN` and
+no `RST`, so writes keep succeeding into the send buffer and nothing surfaces the loss.
+
+#### Heartbeat timeout
+
+Handler-mode WebSocket and raw TCP clients reconnect on heartbeat timeout. With a configured
+heartbeat, the default timeout is **three heartbeat intervals**. An explicit `heartbeat_timeout_secs`
+overrides that window. WebSocket clients reset it on any inbound frame; raw TCP clients reset it
+when bytes arrive. The client expects the peer to answer heartbeats, so a transport with no heartbeat
+gets no default window. An explicit timeout can still enable detection without a heartbeat.
+
+For WebSocket clients, that window counts all frames, so a keepalive reply refreshes it and a quiet
+market does not trip it.
+
+#### Feed idle timeout
+
+An adapter that also needs to detect a feed which stopped flowing while the transport stays healthy
+sets a separate idle timeout, which only Text and Binary frames refresh.
+That second window suits a venue which pushes data on a known cadence. Where the venue answers the
+keepalive with a text payload, its reply refreshes the idle timeout exactly like real data does, so
+the window means something only when it sits below the heartbeat interval.
+
+### Adapter and actor integration
+
+Adapter integrations construct a `SocketStateSink` and set it through the network client's
+`state_sink` builder option. Publication requires the `LiveNode` runner; the standalone `AsyncRunner`
+does not publish these events.
+
+Actors subscribe with `subscribe_socket_state(...)` and receive events through
+`on_socket_state(...)`. The Python API exposes `SocketState` and `SocketStateChanged` from
+`nautilus_trader.common`. Delivery stays on the typed in-process bus; external message-bus streaming
+and wire formats do not expose these events.
+
+### Endpoint reconnect commands
+
+An actor or strategy can call `reconnect_socket(client_id, endpoint)` with an endpoint label from a
+state event. The runner routes the typed command through the kernel and the engine that owns the
+registered endpoint. The engine invokes only that transport's reconnect handle. It does not call
+the containing `DataClient` or `ExecutionClient` disconnect and connect lifecycle.
+
+:::note
+The API is **fire-and-observe**. A successful return means the command passed local validation and was
+queued. It does not acknowledge kernel acceptance or completed recovery.
+:::
+
+An accepted request emits `SocketStateChanged` for the selected endpoint:
+
+1. `SocketState.DISCONNECTED` as the transport enters reconnect mode.
+1. `SocketState.CONNECTED` after transport recovery.
+
+The transport's normal reconnect controller preserves its authentication, subscription replay, and
+adapter recovery behavior.
+
+The kernel logs unknown clients, unsupported clients, unknown or ambiguous endpoints, duplicate
+requests, disconnecting transports, and closed transports. These rejections emit no socket state
+change and do not affect another endpoint. Endpoint labels use identifier characters only and never
+contain raw URLs.
+
+## Shutdown on error
+
+Set `LiveNodeConfig.shutdown_on_error=True` so that a Rust error log requests a live node
+shutdown. The Rust logger records the first `log::error!` emitted after the kernel
+starts, including error logs from other threads, and the kernel publishes a `ShutdownSystem`
+command when the live event loop next checks for shutdown.
+
+The shutdown request follows the normal live node stop path. The node stops the trader,
+awaits the post-stop delay, disconnects clients, and stops the engines. It does not abort
+the process.
+
+```python
+from nautilus_trader.config import LiveNodeConfig
+
+config = LiveNodeConfig(shutdown_on_error=True)
+```
+
+The trigger follows these rules:
+
+- Error logs suppressed by component filters or logging bypass mode still request shutdown.
+- A new kernel run clears and re-arms the trigger, so a process can restart a node without
+  reinitializing the logging system.
+- Shutdown-on-error observes **Rust `log` records**, not Python `logging.error(...)` calls.
+
+:::note
+The per-engine `graceful_shutdown_on_error` option has been removed. Configure shutdown-on-error at
+the node/kernel level instead.
+:::
 
 ## Related guides
 
+- [Execution reconciliation](execution/reconciliation.md) - State recovery and runtime consistency checks.
+- [Execution policies](execution/policies.md) - Command delivery, persistence, and recovery
+  boundaries.
+- [Python](python.md) - Python ownership, runtime, and public API boundaries.
+- [Configure a live trading node](../how_to/configure_live_trading.md) - Node and engine configuration.
+- [Run live trading with Rust](../how_to/run_rust_live_trading.md) - Rust node setup and venue connection.
 - [Adapters](adapters.md) - Venue connectivity.
-- [Execution](execution.md) - Order execution in live environments.
-- [Backtesting](backtesting.md) - Testing strategies before deployment.
+- [Execution](execution/) - Command outcomes and order execution.
+- [Message bus](message_bus.md) - Typed in-process publish and subscribe behavior.
+- [Backtesting](backtesting/) - Testing strategies before deployment.

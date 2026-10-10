@@ -16,42 +16,50 @@
 //! Example demonstrating live option chain subscription with the Bybit adapter.
 //!
 //! On start, this actor:
-//! 1. Queries the cache for all BTC option instruments
+//! 1. Queries the cache for all `UNDERLYING` option instruments
 //! 2. Finds the nearest expiry
 //! 3. Builds an `OptionSeriesId` for that expiry
-//! 4. Subscribes to an option chain with 3 strikes above and 3 below ATM
-//! 5. Uses `ForwardPrice` (auto-resolved default) — the exchange-provided forward
-//!    price embedded in every option ticker update, eliminating spot-forward basis error
+//! 4. Subscribes to an option chain with `STRIKES_ABOVE` strikes above and `STRIKES_BELOW` below ATM
+//! 5. Uses the exchange-provided option reference price as the ATM source
 //! 6. Logs received `OptionChainSlice` snapshots in the `on_option_chain` handler
 //!
-//! Run with: `cargo run --example bybit-option-chain --package nautilus-bybit`
+//! Edit the constants below to change the underlying, strike range, snapshot interval, and node name.
+//!
+//! Run with: `cargo run --example bybit-option-chain --package nautilus-bybit --features examples`
+//!
+//! The data client uses public market data endpoints, so no API credentials are needed.
 
-use std::{
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::fmt::Debug;
 
 use nautilus_bybit::{
-    common::enums::BybitProductType, config::BybitDataClientConfig,
+    common::{
+        consts::{BYBIT_CLIENT_ID, BYBIT_VENUE},
+        enums::BybitProductType,
+    },
+    config::BybitDataClientConfig,
     factories::BybitDataClientFactory,
 };
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     enums::Environment,
+    nautilus_actor,
     timer::TimeEvent,
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::{OptionChainSlice, StrikeRange},
-    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
+    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId},
     instruments::{Instrument, any::InstrumentAny},
-    stubs::TestDefault,
 };
 use ustr::Ustr;
 
-// ---------------------------------------------------------------------------
-// OptionChainTester actor
-// ---------------------------------------------------------------------------
+const TRADER_ID: &str = "TESTER-001";
+const NODE_NAME: &str = "BYBIT-OPTION-CHAIN-TESTER-001";
+const ACTOR_ID: &str = "OPTION_CHAIN_TESTER-001";
+const UNDERLYING: &str = "BTC";
+const STRIKES_ABOVE: usize = 3;
+const STRIKES_BELOW: usize = 3;
+const SNAPSHOT_INTERVAL_MS: Option<u64> = Some(5_000);
 
 #[derive(Debug)]
 struct OptionChainTester {
@@ -60,24 +68,13 @@ struct OptionChainTester {
     series_id: Option<OptionSeriesId>,
 }
 
-impl Deref for OptionChainTester {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl DerefMut for OptionChainTester {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
-    }
-}
+nautilus_actor!(OptionChainTester);
 
 impl OptionChainTester {
     fn new(client_id: ClientId) -> Self {
         Self {
             core: DataActorCore::new(DataActorConfig {
-                actor_id: Some("OPTION_CHAIN_TESTER-001".into()),
+                actor_id: Some(ACTOR_ID.into()),
                 ..Default::default()
             }),
             client_id,
@@ -88,8 +85,8 @@ impl OptionChainTester {
 
 impl DataActor for OptionChainTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        let venue = Venue::new("BYBIT");
-        let underlying_filter = Ustr::from("BTC");
+        let venue = *BYBIT_VENUE;
+        let underlying_filter = Ustr::from(UNDERLYING);
 
         // Collect option instrument data from cache (owned copies to release borrow).
         // Each entry: (instrument_id, underlying, settlement_currency, expiry_ns)
@@ -122,7 +119,7 @@ impl DataActor for OptionChainTester {
         }; // cache borrow dropped here
 
         if options.is_empty() {
-            log::warn!("No BTC options found in cache");
+            log::warn!("No {UNDERLYING} options found in cache");
             return Ok(());
         }
 
@@ -132,7 +129,7 @@ impl DataActor for OptionChainTester {
         // Prefer USDT-settled (Bybit BTC options default); fall back to any available settlement
         let settlement_currency = options
             .iter()
-            .find(|(_, _, settlement, exp)| *exp == nearest_expiry && settlement.as_str() == "USDT")
+            .find(|(_, _, settlement, exp)| *exp == nearest_expiry && settlement == "USDT")
             .map_or_else(
                 || {
                     options
@@ -150,11 +147,11 @@ impl DataActor for OptionChainTester {
             .count();
 
         log::info!(
-            "Found {count} BTC options at nearest expiry (ts={nearest_expiry}, settlement={settlement_currency})"
+            "Found {count} {UNDERLYING} options at nearest expiry (ts={nearest_expiry}, settlement={settlement_currency})"
         );
 
         // Build OptionSeriesId for the nearest expiry
-        let series_id = OptionSeriesId::new(
+        let series_id = OptionSeriesId::new_derived(
             venue,
             underlying_filter,
             settlement_currency,
@@ -163,19 +160,17 @@ impl DataActor for OptionChainTester {
 
         log::info!("Subscribing to option chain: {series_id}");
         let strike_range = StrikeRange::AtmRelative {
-            strikes_above: 3,
-            strikes_below: 3,
+            strikes_above: STRIKES_ABOVE,
+            strikes_below: STRIKES_BELOW,
         };
-
-        // Snapshot every 5 seconds (use None for raw stream mode)
-        let snapshot_interval_ms = Some(5_000);
 
         let client_id = self.client_id;
         self.subscribe_option_chain(
             series_id,
             strike_range,
-            snapshot_interval_ms,
+            SNAPSHOT_INTERVAL_MS,
             Some(client_id),
+            None,
         );
 
         self.series_id = Some(series_id);
@@ -252,21 +247,17 @@ impl DataActor for OptionChainTester {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::test_default();
-    let client_id = ClientId::new("BYBIT");
+    let trader_id = TraderId::from(TRADER_ID);
+    let client_id = *BYBIT_CLIENT_ID;
 
     let bybit_config = BybitDataClientConfig {
-        api_key: None,    // Will use 'BYBIT_API_KEY' env var
-        api_secret: None, // Will use 'BYBIT_API_SECRET' env var
+        api_key: None,
+        api_secret: None,
         product_types: vec![BybitProductType::Option],
         ..Default::default()
     };
@@ -274,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_factory = BybitDataClientFactory::new();
 
     let mut node = LiveNode::builder(trader_id, environment)?
-        .with_name("BYBIT-OPTION-CHAIN-TESTER-001".to_string())
+        .with_name(NODE_NAME.to_string())
         .add_data_client(None, Box::new(client_factory), Box::new(bybit_config))?
         .with_delay_post_stop_secs(5)
         .build()?;

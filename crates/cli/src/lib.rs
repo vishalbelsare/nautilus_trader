@@ -24,24 +24,25 @@
 //! - Configuration validation and setup utilities.
 //! - System administration and operational tools.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
 //! This crate provides feature flags to control source code inclusion during compilation,
 //! depending on the intended use case:
 //!
-//! - `defi`: Enables DeFi functionality including blockchain data access and pool analysis.
+//! - `defi`: Enables blockchain/DeFi commands including block sync, DEX pool sync, and pool
+//!   analysis.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::clone_on_ref_ptr)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -49,18 +50,38 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 #[cfg(feature = "defi")]
 mod blockchain;
 mod database;
 pub mod opt;
 
+use nautilus_persistence::backend::parquet::migration::{
+    ParquetMigrationConfig, migrate_parquet_catalog,
+};
+
 #[cfg(feature = "defi")]
 use crate::blockchain::run_blockchain_command;
 use crate::{
     database::postgres::run_database_command,
-    opt::{Commands, NautilusCli},
+    opt::{CatalogCommand, Commands, NautilusCli},
 };
+
+/// Builds the top-level CLI command, augmented with capability-aware blockchain help.
+///
+/// The blockchain subcommands gain `after_long_help` sections derived from the adapter's DEX
+/// registration maps when the `defi` feature is enabled.
+#[must_use]
+pub fn cli_command() -> clap::Command {
+    let command = <NautilusCli as clap::CommandFactory>::command();
+    #[cfg(feature = "defi")]
+    let command = crate::blockchain::augment_blockchain_help(command);
+    command
+}
 
 /// Runs the Nautilus CLI based on the provided options.
 ///
@@ -69,9 +90,23 @@ use crate::{
 /// Returns an error if execution of the specified command fails.
 pub async fn run(opt: NautilusCli) -> anyhow::Result<()> {
     match opt.command {
+        Commands::Catalog(catalog) => match catalog.command {
+            CatalogCommand::MigrateParquet(args) => {
+                let report = migrate_parquet_catalog(ParquetMigrationConfig {
+                    source_uri: args.source,
+                    target_uri: args.destination,
+                    source_options: args.source_options,
+                    target_options: args.target_options,
+                    dry_run: args.dry_run,
+                })?;
+                println!("{report}");
+            }
+        },
         Commands::Database(database_opt) => run_database_command(database_opt).await?,
         #[cfg(feature = "defi")]
-        Commands::Blockchain(blockchain_opt) => run_blockchain_command(blockchain_opt).await?,
+        Commands::Blockchain(blockchain_opt) => {
+            Box::pin(run_blockchain_command(blockchain_opt)).await?;
+        }
     }
     Ok(())
 }

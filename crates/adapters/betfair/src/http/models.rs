@@ -22,23 +22,32 @@
 //!
 //! <https://docs.developer.betfair.com/>
 
+use std::fmt::Debug;
+
 use ahash::AHashMap;
-use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
+use nautilus_core::{
+    serialization::{
+        deserialize_decimal, deserialize_decimal_native, deserialize_optional_decimal,
+    },
+    string::secret::SecretString,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+use zeroize::ZeroizeOnDrop;
 
 use crate::common::{
     enums::{
         BetDelayModel, BetStatus, BetTargetType, BetfairOrderStatus, BetfairOrderType, BetfairSide,
-        BetfairTimeInForce, ExecutionReportErrorCode, ExecutionReportStatus, GroupBy,
-        InstructionReportErrorCode, InstructionReportStatus, MarketBettingType, MarketProjection,
-        MarketSort, OrderBy, OrderProjection, PersistenceType, PriceLadderType, SortDir,
+        BetfairTimeInForce, CertLoginStatus, ExecutionReportErrorCode, ExecutionReportStatus,
+        GroupBy, InstructionReportErrorCode, InstructionReportStatus, MarketBettingType,
+        MarketProjection, MarketSort, OrderBy, OrderProjection, PersistenceType, PriceLadderType,
+        SortDir,
     },
     types::{
         BetId, CompetitionId, CustomerOrderRef, CustomerStrategyRef, EventId, EventTypeId,
-        Handicap, MarketId, SelectionId, deserialize_optional_string_lenient,
-        deserialize_optional_u32_lenient,
+        Handicap, MarketId, SelectionId, deserialize_optional_decimal_native,
+        deserialize_optional_string_lenient, deserialize_optional_u32_lenient,
     },
 };
 
@@ -53,10 +62,11 @@ pub enum LoginStatus {
 }
 
 /// Login response from the interactive Identity SSO API.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ZeroizeOnDrop)]
 pub struct LoginResponse {
-    pub token: String,
+    pub token: SecretString,
     pub product: String,
+    #[zeroize(skip)]
     pub status: LoginStatus,
     pub error: Option<String>,
 }
@@ -64,11 +74,12 @@ pub struct LoginResponse {
 /// Login response from the certificate-based SSO API (`certlogin`).
 ///
 /// Uses different field names from the interactive login endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct CertLoginResponse {
-    pub session_token: Option<String>,
-    pub login_status: String,
+    pub session_token: Option<SecretString>,
+    #[zeroize(skip)]
+    pub login_status: CertLoginStatus,
 }
 
 /// Account details response.
@@ -162,10 +173,11 @@ pub struct Competition {
 pub struct RunnerId {
     pub market_id: MarketId,
     pub selection_id: SelectionId,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub handicap: Option<Handicap>,
 }
 
-/// Market catalogue entry returned by `listMarketCatalogue`.
+/// Market catalog entry returned by `listMarketCatalogue`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketCatalogue {
@@ -234,6 +246,7 @@ pub struct LineRangeInfo {
 pub struct RunnerCatalog {
     pub selection_id: SelectionId,
     pub runner_name: String,
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub handicap: Handicap,
     pub sort_priority: Option<u32>,
     /// Free-form metadata keyed by SCREAMING_SNAKE_CASE field names.
@@ -284,30 +297,37 @@ pub struct MarketFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitOrder {
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub size: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub price: Decimal,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_type: Option<PersistenceType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<BetfairTimeInForce>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub min_fill_size: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bet_target_type: Option<BetTargetType>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub bet_target_size: Option<Decimal>,
 }
 
 /// Limit-on-close order parameters (for BSP markets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitOnCloseOrder {
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub liability: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub price: Decimal,
 }
 
 /// Market-on-close order parameters (for BSP markets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketOnCloseOrder {
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub liability: Decimal,
 }
 
@@ -318,6 +338,7 @@ pub struct PlaceInstruction {
     pub order_type: BetfairOrderType,
     pub selection_id: SelectionId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub handicap: Option<Handicap>,
     pub side: BetfairSide,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,6 +357,7 @@ pub struct PlaceInstruction {
 pub struct CancelInstruction {
     pub bet_id: BetId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub size_reduction: Option<Decimal>,
 }
 
@@ -344,6 +366,7 @@ pub struct CancelInstruction {
 #[serde(rename_all = "camelCase")]
 pub struct ReplaceInstruction {
     pub bet_id: BetId,
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub new_price: Decimal,
 }
 
@@ -468,6 +491,7 @@ pub struct PlaceExecutionReport {
     pub customer_ref: Option<String>,
     pub status: ExecutionReportStatus,
     pub error_code: Option<ExecutionReportErrorCode>,
+    pub error_message: Option<String>,
     pub market_id: Option<MarketId>,
     pub instruction_reports: Option<Vec<PlaceInstructionReport>>,
 }
@@ -478,6 +502,7 @@ pub struct PlaceExecutionReport {
 pub struct PlaceInstructionReport {
     pub status: InstructionReportStatus,
     pub error_code: Option<InstructionReportErrorCode>,
+    pub error_message: Option<String>,
     pub order_status: Option<BetfairOrderStatus>,
     pub instruction: Option<PlaceInstruction>,
     pub bet_id: Option<BetId>,
@@ -495,6 +520,7 @@ pub struct CancelExecutionReport {
     pub customer_ref: Option<String>,
     pub status: ExecutionReportStatus,
     pub error_code: Option<ExecutionReportErrorCode>,
+    pub error_message: Option<String>,
     pub market_id: Option<MarketId>,
     pub instruction_reports: Option<Vec<CancelInstructionReport>>,
 }
@@ -505,6 +531,7 @@ pub struct CancelExecutionReport {
 pub struct CancelInstructionReport {
     pub status: InstructionReportStatus,
     pub error_code: Option<InstructionReportErrorCode>,
+    pub error_message: Option<String>,
     pub instruction: Option<CancelInstruction>,
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     pub size_cancelled: Option<Decimal>,
@@ -518,6 +545,7 @@ pub struct ReplaceExecutionReport {
     pub customer_ref: Option<String>,
     pub status: ExecutionReportStatus,
     pub error_code: Option<ExecutionReportErrorCode>,
+    pub error_message: Option<String>,
     pub market_id: Option<MarketId>,
     pub instruction_reports: Option<Vec<ReplaceInstructionReport>>,
 }
@@ -528,6 +556,7 @@ pub struct ReplaceExecutionReport {
 pub struct ReplaceInstructionReport {
     pub status: InstructionReportStatus,
     pub error_code: Option<InstructionReportErrorCode>,
+    pub error_message: Option<String>,
     pub cancel_instruction_report: Option<CancelInstructionReport>,
     pub place_instruction_report: Option<PlaceInstructionReport>,
 }
@@ -539,6 +568,7 @@ pub struct CurrentOrderSummary {
     pub bet_id: BetId,
     pub market_id: MarketId,
     pub selection_id: SelectionId,
+    #[serde(deserialize_with = "deserialize_decimal_native")]
     pub handicap: Handicap,
     pub price_size: PriceSize,
     #[serde(deserialize_with = "deserialize_decimal")]
@@ -598,6 +628,7 @@ pub struct ClearedOrderSummary {
     pub event_id: Option<EventId>,
     pub market_id: Option<MarketId>,
     pub selection_id: Option<SelectionId>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub handicap: Option<Handicap>,
     pub bet_id: Option<BetId>,
     pub placed_date: Option<String>,
@@ -727,16 +758,57 @@ pub struct FlattenedMarket {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::string::secret::REDACTED;
     use rstest::rstest;
 
     use super::*;
     use crate::common::testing::{load_test_json, parse_jsonrpc};
 
     #[rstest]
+    #[case("0.1234567890123456789012345678", "0.1234567890123456789012345678")]
+    #[case("0.12345678901234567890123456789", "0.1234567890123456789012345679")]
+    fn test_limit_order_decimal_routes(#[case] size: &str, #[case] expected: &str) {
+        let value = serde_json::json!({
+            "size": size,
+            "price": 9007199254740993u64,
+            "minFillSize": "2.375",
+            "betTargetSize": null
+        });
+        let direct: LimitOrder = serde_json::from_str(&value.to_string()).unwrap();
+        let buffered: LimitOrder = serde_json::from_value(value).unwrap();
+        for order in [direct, buffered] {
+            assert_eq!(order.size, Decimal::from_str_exact(expected).unwrap());
+            assert_eq!(order.price, Decimal::from(9_007_199_254_740_993u64));
+            assert_eq!(order.min_fill_size, Some(Decimal::new(2375, 3)));
+            assert_eq!(order.bet_target_size, None);
+            assert_eq!(order.persistence_type, None);
+            assert_eq!(order.time_in_force, None);
+            assert_eq!(order.bet_target_type, None);
+        }
+
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<LimitOrder>(
+                    serde_json::json!({"size": invalid, "price": 2})
+                )
+                .is_err()
+            );
+        }
+
+        assert!(serde_json::from_value::<LimitOrder>(serde_json::json!({"price": 2})).is_err());
+    }
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    #[rstest]
     fn test_cert_login_response() {
         let data = load_test_json("rest/cert_login.json");
         let resp: CertLoginResponse = serde_json::from_str(&data).unwrap();
-        assert_eq!(resp.login_status, "SUCCESS");
+        assert_eq!(resp.login_status, CertLoginStatus::Success);
         assert!(resp.session_token.is_some());
     }
 
@@ -744,8 +816,15 @@ mod tests {
     fn test_cert_login_error_response() {
         let json = r#"{"loginStatus":"CERT_AUTH_REQUIRED"}"#;
         let resp: CertLoginResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.login_status, "CERT_AUTH_REQUIRED");
+        assert_eq!(resp.login_status, CertLoginStatus::CertAuthRequired);
         assert!(resp.session_token.is_none());
+    }
+
+    #[rstest]
+    fn test_cert_login_unknown_status_deserializes_to_other() {
+        let json = r#"{"loginStatus":"SOME_FUTURE_CODE"}"#;
+        let resp: CertLoginResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.login_status, CertLoginStatus::Other);
     }
 
     #[rstest]
@@ -753,6 +832,29 @@ mod tests {
         let data = load_test_json("rest/login_success.json");
         let resp: LoginResponse = serde_json::from_str(&data).unwrap();
         assert_eq!(resp.status, LoginStatus::Success);
+    }
+
+    #[rstest]
+    fn test_login_responses_redact_tokens() {
+        assert_zeroize_on_drop::<LoginResponse>();
+        assert_zeroize_on_drop::<CertLoginResponse>();
+
+        let login = LoginResponse {
+            token: SecretString::from("interactive-session-token"),
+            product: "product".to_string(),
+            status: LoginStatus::Success,
+            error: None,
+        };
+        let certificate = CertLoginResponse {
+            session_token: Some(SecretString::from("certificate-session-token")),
+            login_status: CertLoginStatus::Success,
+        };
+
+        let formatted = format!("{login:?} {certificate:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 2);
+        assert!(!formatted.contains("interactive-session-token"));
+        assert!(!formatted.contains("certificate-session-token"));
     }
 
     #[rstest]
@@ -864,10 +966,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_replace_order_responses() {
+    #[case("rest/betting_replace_orders_success.json")]
+    #[case("rest/betting_replace_orders_cancelled_not_placed_live.json")]
+    fn test_replace_order_responses(#[case] fixture: &str) {
         // betting_replace_orders_success_multi.json contains a streaming OCM,
         // not a REST ReplaceExecutionReport, so it is excluded
-        let data = load_test_json("rest/betting_replace_orders_success.json");
+        let data = load_test_json(fixture);
         let _resp: ReplaceExecutionReport = parse_jsonrpc(&data);
     }
 

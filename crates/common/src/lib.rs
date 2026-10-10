@@ -19,15 +19,13 @@
 //! NautilusTrader applications. This includes the actor system, message bus, caching layer, and other
 //! essential services.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -36,16 +34,23 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `build-info-event-store`: Includes the event-store backend version in build information logs.
+//! - `capnp`: Enables [Cap'n Proto](https://capnproto.org) serialization support.
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision`: Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
 //! - `indicators`: Includes the `nautilus-indicators` crate and indicator utilities.
-//! - `capnp`: Enables [Cap'n Proto](https://capnproto.org/) serialization support.
 //! - `live`: Enables the Tokio async runtime for live trading.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `sbe`: Enables Simple Binary Encoding (SBE) serialization support.
+//! - `simulation`: Enables deterministic simulation testing with
+//!   [MadSim](https://crates.io/crates/madsim).
 //! - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.
-//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -53,12 +58,85 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::similar_names,
+    reason = "domain terms such as cache_greeks/cached_greeks and kv/k are intentionally parallel"
+)]
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "common-layer math casts between i64/u64/usize/f64 with values bounded by domain ranges"
+)]
+#![allow(
+    clippy::must_use_candidate,
+    reason = "common-layer accessors and constructors are pervasive; #[must_use] noise is not warranted"
+)]
+#![allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "trait method signatures are dictated by upstream interfaces and Python API parity"
+)]
+#![allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "config types deserialize plain field values; unsafe in unrelated impls is sound"
+)]
+#![allow(
+    clippy::missing_fields_in_debug,
+    reason = "manual Debug impls intentionally omit verbose internal state and handler maps"
+)]
+#![allow(
+    clippy::struct_excessive_bools,
+    clippy::fn_params_excessive_bools,
+    reason = "config structs and constructors mirror existing Python configuration surfaces"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "actor and message bus dispatch functions exceed the default threshold by design"
+)]
+#![allow(
+    clippy::implicit_hasher,
+    reason = "hash maps in public APIs intentionally accept the default hasher"
+)]
+#![allow(
+    clippy::inline_always,
+    reason = "hot-path throttler and clock functions are intentionally always inlined"
+)]
+#![allow(
+    clippy::match_same_arms,
+    reason = "explicit per-variant arms document message dispatch even when bodies coincide"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::default_trait_access,
+        clippy::float_cmp,
+        clippy::manual_let_else,
+        clippy::no_effect_underscore_binding,
+        clippy::should_panic_without_expect,
+        clippy::single_match_else,
+        clippy::unreadable_literal,
+        clippy::unused_self,
+        clippy::used_underscore_binding,
+        reason = "common tests assert exact float outputs and use loose patterns for fixture setup"
+    )
+)]
 
 pub mod actor;
 pub mod cache;
+pub mod calendar;
 pub mod clients;
 pub mod clock;
 pub mod component;
+pub mod config;
 pub mod custom;
 pub mod enums;
 pub mod factories;
@@ -75,14 +153,13 @@ pub mod throttler;
 pub mod timer;
 pub mod xrate;
 
+mod macros;
+
 #[cfg(feature = "live")]
 pub mod live;
 
 #[cfg(feature = "defi")]
 pub mod defi;
-
-#[cfg(feature = "ffi")]
-pub mod ffi;
 
 #[cfg(feature = "python")]
 pub mod python;

@@ -1,32 +1,33 @@
 # nautilus-binance
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-binance)](https://docs.rs/nautilus-binance/latest/nautilus-binance/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-binance)](https://docs.rs/nautilus-binance/latest/nautilus_binance/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-binance.svg)](https://crates.io/crates/nautilus-binance)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
 
 [NautilusTrader](https://nautilustrader.io) adapter for the
-[Binance](https://www.binance.com/) cryptocurrency exchange.
+[Binance](https://www.binance.com) cryptocurrency exchange.
 
-The `nautilus-binance` crate provides client bindings (HTTP & WebSocket), data models,
-and helper utilities that wrap the official **Binance API** across:
+The `nautilus-binance` crate provides client bindings (HTTP & WebSocket) and data models
+for the official **Binance API**. Live data and execution
+clients are available for:
 
-- Spot trading (api.binance.com)
-- Spot margin trading
+- Spot markets, including Binance US (api.binance.com)
 - USD-M Futures (fapi.binance.com)
 - COIN-M Futures (dapi.binance.com)
-- European Options (eapi.binance.com)
 
-## Platform
+The crate also includes shared enums, endpoint constants, URL routing, and credential
+plumbing for adjacent Binance surfaces such as Margin and European Options. Those
+surfaces do not have live data or execution clients in this crate.
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+## NautilusTrader
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
+
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Authentication
 
@@ -55,10 +56,13 @@ export BINANCE_API_SECRET="$(cat binance_ed25519_private.pem)"
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `arrow`: Enables Apache Arrow data support.
+- `examples`: Enables the crate's example binaries.
 - `extension-module`: Builds as a Python extension module.
-
-[High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
+- `high-precision` (default): Enables
+  [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+  to use 128-bit value types.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 ## Documentation
 

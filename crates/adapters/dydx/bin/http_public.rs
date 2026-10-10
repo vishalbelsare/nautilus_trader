@@ -38,13 +38,16 @@
 
 use std::{collections::HashMap, env};
 
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use nautilus_dydx::{
-    common::{consts::DYDX_TESTNET_HTTP_URL, enums::DydxCandleResolution},
+    common::{
+        consts::{DYDX_TESTNET_HTTP_URL, DYDX_VENUE},
+        enums::{DydxCandleResolution, DydxNetwork},
+    },
     http::client::DydxHttpClient,
 };
 use nautilus_model::{
-    identifiers::{InstrumentId, Symbol, Venue},
+    identifiers::{InstrumentId, Symbol},
     instruments::{Instrument, InstrumentAny},
 };
 
@@ -66,19 +69,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         env::var("DYDX_HTTP_URL").unwrap_or_else(|_| DYDX_TESTNET_HTTP_URL.to_string())
     };
-    let is_testnet = !is_mainnet;
+    let network = if is_mainnet {
+        DydxNetwork::Mainnet
+    } else {
+        DydxNetwork::Testnet
+    };
 
     log::info!("Connecting to dYdX HTTP API: {base_url}");
-    log::info!(
-        "Environment: {}",
-        if is_testnet { "TESTNET" } else { "MAINNET" }
-    );
+    log::info!("Environment: {network}");
     log::info!("");
 
-    let client = DydxHttpClient::new(Some(base_url), Some(30), None, is_testnet, None)?;
+    let client = DydxHttpClient::new(Some(base_url), 30, None, network, None)?;
 
     let start = std::time::Instant::now();
-    let instruments = client.request_instruments(None, None, None).await?;
+    let instruments = client.request_instruments(None).await?;
     let elapsed = start.elapsed();
 
     log::info!(
@@ -108,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Construct InstrumentId for lookup (symbol is in format "BTC-USD", need "BTC-USD-PERP")
     let perp_symbol = format!("{symbol}-PERP");
-    let instrument_id = InstrumentId::new(Symbol::new(&perp_symbol), Venue::new("DYDX"));
+    let instrument_id = InstrumentId::new(Symbol::new(&perp_symbol), *DYDX_VENUE);
     let start = std::time::Instant::now();
     let instrument = client.get_instrument(&instrument_id);
     let elapsed = start.elapsed();
@@ -161,8 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let resolution = DydxCandleResolution::OneMinute;
-    let end_time = Utc::now();
-    let start_time = end_time - Duration::hours(2); // 2 hours = ~120 bars
+    let end_time = Timestamp::now();
+    let start_time = end_time - SignedDuration::from_hours(2); // 2 hours = ~120 bars
 
     let start = std::time::Instant::now();
     let candles = client
@@ -200,8 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("   Time range: {} to {}", first.started_at, last.started_at);
     }
 
-    let end_time = Utc::now();
-    let start_time = end_time - Duration::days(7); // 7 days
+    let end_time = Timestamp::now();
+    let start_time = end_time - SignedDuration::from_hours(7 * 24); // 7 days
 
     log::info!("   Requesting {resolution:?} bars from {start_time} to {end_time}");
 
@@ -211,7 +215,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let elapsed = start.elapsed();
 
-    let expected_bars_large = ((end_time - start_time).num_minutes() as usize).min(10_080);
+    let expected_bars_large = usize::try_from(start_time.duration_until(end_time).as_mins())
+        .unwrap_or(0)
+        .min(10_080);
     let coverage_large = (candles_large.candles.len() as f64 / expected_bars_large as f64) * 100.0;
 
     log::info!(

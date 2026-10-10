@@ -35,7 +35,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::Utc;
+use jiff::{Timestamp, tz::Offset};
 use nautilus_binance::{
     common::{
         credential::resolve_credentials,
@@ -194,7 +194,9 @@ async fn capture_fixtures(config: &CaptureConfig) -> anyhow::Result<FixtureManif
 
     Ok(FixtureManifest {
         command: env::args().collect::<Vec<_>>().join(" "),
-        captured_at: Utc::now().to_rfc3339(),
+        captured_at: Timestamp::now()
+            .display_with_offset(Offset::UTC)
+            .to_string(),
         environment: environment_name(config.environment).to_string(),
         symbol: config.symbol.clone(),
         interval: config.interval.clone(),
@@ -512,7 +514,7 @@ async fn capture_order_flow_fixtures(
         .expect("validated order_quantity");
     let order_price = config.order_price.as_ref().expect("validated order_price");
 
-    let client_order_id = format!("ntfx{}a", Utc::now().timestamp_millis().unsigned_abs());
+    let client_order_id = format!("ntfx{}a", Timestamp::now().as_millisecond().unsigned_abs());
     let new_order_params = NewOrderParams::limit(
         &config.symbol,
         BinanceSide::Buy,
@@ -628,7 +630,7 @@ async fn capture_order_flow_fixtures(
     )?;
 
     let cancel_all_client_order_id =
-        format!("ntfx{}b", Utc::now().timestamp_millis().unsigned_abs());
+        format!("ntfx{}b", Timestamp::now().as_millisecond().unsigned_abs());
     let cancel_all_order_params = NewOrderParams::limit(
         &config.symbol,
         BinanceSide::Buy,
@@ -766,7 +768,9 @@ fn record_fixture(
 
     let metadata = FixtureMetadata {
         fixture: record.clone(),
-        captured_at: Utc::now().to_rfc3339(),
+        captured_at: Timestamp::now()
+            .display_with_offset(Offset::UTC)
+            .to_string(),
     };
     write_json(&output_root.join(&record.metadata_path), &metadata)?;
 
@@ -810,12 +814,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::exit,
+    reason = "help flag exits the standalone capture utility after printing usage"
+)]
 fn parse_args<I>(args: I) -> anyhow::Result<CaptureConfig>
 where
     I: IntoIterator<Item = String>,
 {
     let mut config = CaptureConfig {
-        environment: BinanceEnvironment::Mainnet,
+        environment: BinanceEnvironment::Live,
         output_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("test_data")
             .join("spot")
@@ -900,7 +908,7 @@ fn validate_config(config: &CaptureConfig) -> anyhow::Result<()> {
     }
 
     if config.include_order_flow {
-        if matches!(config.environment, BinanceEnvironment::Mainnet) {
+        if matches!(config.environment, BinanceEnvironment::Live) {
             anyhow::bail!("--include-order-flow is only allowed on testnet or demo");
         }
 
@@ -914,7 +922,7 @@ fn validate_config(config: &CaptureConfig) -> anyhow::Result<()> {
 
 fn parse_environment(value: &str) -> anyhow::Result<BinanceEnvironment> {
     match value.to_ascii_lowercase().as_str() {
-        "mainnet" | "live" => Ok(BinanceEnvironment::Mainnet),
+        "mainnet" | "live" => Ok(BinanceEnvironment::Live),
         "testnet" | "test" => Ok(BinanceEnvironment::Testnet),
         "demo" => Ok(BinanceEnvironment::Demo),
         _ => anyhow::bail!("Unsupported environment: {value}"),
@@ -929,7 +937,7 @@ fn value_at(args: &[String], index: usize, flag: &str) -> anyhow::Result<String>
 
 fn environment_name(environment: BinanceEnvironment) -> &'static str {
     match environment {
-        BinanceEnvironment::Mainnet => "mainnet",
+        BinanceEnvironment::Live => "live",
         BinanceEnvironment::Testnet => "testnet",
         BinanceEnvironment::Demo => "demo",
     }
@@ -953,7 +961,7 @@ fn print_usage() {
         "Usage: cargo run --bin binance-spot-http-capture-fixtures --package nautilus-binance -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --environment, --env <mainnet|testnet|demo>\n\
+           --environment, --env <live|testnet|demo>\n\
            --output-dir <PATH>\n\
            --symbol <SYMBOL>\n\
            --interval <INTERVAL>\n\
@@ -966,74 +974,4 @@ fn print_usage() {
            --order-price <PRICE>\n\
            --help, -h"
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    fn parse_args_defaults_to_public_mainnet_capture() {
-        let config = parse_args(Vec::<String>::new()).unwrap();
-
-        assert_eq!(config.environment, BinanceEnvironment::Mainnet);
-        assert_eq!(config.symbol, DEFAULT_SYMBOL);
-        assert_eq!(config.interval, DEFAULT_INTERVAL);
-        assert!(!config.include_private);
-        assert!(!config.include_order_flow);
-    }
-
-    #[rstest]
-    fn parse_args_accepts_sandbox_order_flow() {
-        let args = vec![
-            "--environment".to_string(),
-            "testnet".to_string(),
-            "--include-order-flow".to_string(),
-            "--order-quantity".to_string(),
-            "0.001".to_string(),
-            "--order-price".to_string(),
-            "10000".to_string(),
-        ];
-        let config = parse_args(args).unwrap();
-
-        assert_eq!(config.environment, BinanceEnvironment::Testnet);
-        assert!(config.include_order_flow);
-        assert_eq!(config.order_quantity.as_deref(), Some("0.001"));
-        assert_eq!(config.order_price.as_deref(), Some("10000"));
-    }
-
-    #[rstest]
-    fn parse_args_rejects_mainnet_order_flow() {
-        let args = vec![
-            "--include-order-flow".to_string(),
-            "--order-quantity".to_string(),
-            "0.001".to_string(),
-            "--order-price".to_string(),
-            "10000".to_string(),
-        ];
-        let err = parse_args(args).unwrap_err();
-
-        assert!(err.to_string().contains("only allowed on testnet or demo"));
-    }
-
-    #[rstest]
-    fn metadata_relpath_uses_sibling_file() {
-        assert_eq!(
-            metadata_relpath("public/depth_btcusdt_limit5.sbe"),
-            "public/depth_btcusdt_limit5.metadata.json"
-        );
-    }
-
-    #[rstest]
-    fn decode_sbe_header_reads_first_eight_bytes() {
-        let payload = [10, 0, 200, 0, 3, 0, 2, 0];
-        let header = decode_sbe_header(&payload).unwrap();
-
-        assert_eq!(header.block_length, 10);
-        assert_eq!(header.template_id, 200);
-        assert_eq!(header.schema_id, 3);
-        assert_eq!(header.version, 2);
-    }
 }

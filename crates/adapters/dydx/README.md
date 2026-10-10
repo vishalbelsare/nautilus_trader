@@ -1,39 +1,39 @@
 # nautilus-dydx
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-dydx)](https://docs.rs/nautilus-dydx/latest/nautilus-dydx/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-dydx)](https://docs.rs/nautilus-dydx/latest/nautilus_dydx/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-dydx.svg)](https://crates.io/crates/nautilus-dydx)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
 
-[NautilusTrader](https://nautilustrader.io) adapter for the [dYdX v4](https://dydx.exchange/) decentralized exchange.
+[NautilusTrader](https://nautilustrader.io) adapter for the [dYdX v4](https://dydx.trade) decentralized exchange.
 
-The `nautilus-dydx` crate provides client bindings (HTTP, WebSocket & gRPC), data models
-and helper utilities that wrap the official **dYdX v4 API**.
+The `nautilus-dydx` crate provides client bindings (HTTP, WebSocket & gRPC) and data models
+for the official **dYdX v4 API**.
 
 dYdX v4 is built as a standalone Cosmos SDK appchain using CometBFT consensus. The order book
 and matching engine run on-chain as part of the validator process. Orders are submitted as
 Cosmos transactions via gRPC and settled each block. An Indexer service exposes REST and
 WebSocket APIs for market data and account state.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `examples`: Enables the crate's example binaries.
 - `extension-module`: Builds as a Python extension module.
-
-[High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
+- `high-precision` (default): Enables
+  [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+  to use 128-bit value types.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 ## Documentation
 

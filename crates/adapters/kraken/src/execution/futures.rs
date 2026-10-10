@@ -16,18 +16,19 @@
 //! Kraken Futures execution client implementation.
 
 use std::{
+    collections::HashSet,
     future::Future,
-    sync::{Arc, Mutex, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use ahash::AHashMap;
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_common::{
+    cache::{Cache, InstrumentLookupError},
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -35,34 +36,57 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    UnixNanos,
+    AtomicMap, DurationNanos, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl, execution::failure::CommandFailure,
+    task::TaskGroup,
+};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
-    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Symbol, Venue, VenueOrderId},
+    enums::{AccountType, OmsType, OrderStatus, OrderType},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
+    },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
-use tokio::task::JoinHandle;
+use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
+use super::{
+    command_failure_from_cancel_error, command_failure_from_futures_batch_error,
+    command_failure_from_futures_batch_item, command_failure_from_modify_error,
+    command_failure_from_submit_error,
+};
 use crate::{
-    common::{consts::KRAKEN_VENUE, credential::KrakenCredential, parse::truncate_cl_ord_id},
-    config::KrakenExecClientConfig,
-    http::KrakenFuturesHttpClient,
-    websocket::futures::{
-        client::KrakenFuturesWebSocketClient,
-        messages::KrakenFuturesWsMessage,
-        parse::{parse_futures_ws_fill_report, parse_futures_ws_order_status_report},
+    common::{
+        consts::KRAKEN_VENUE,
+        credential::KrakenCredential,
+        enums::{KrakenApiResult, KrakenProductType, KrakenSendStatus, product_type_from_symbol},
+        parse::truncate_cl_ord_id,
+    },
+    config::KrakenExecutionClientConfig,
+    http::{
+        KrakenFuturesHttpClient,
+        futures::{
+            client::KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND, models::FuturesBatchCancelStatus,
+            query::KrakenFuturesBatchCancelItem,
+        },
+    },
+    websocket::{
+        dispatch::{self, OrderIdentity, WsDispatchState},
+        futures::{client::KrakenFuturesWebSocketClient, messages::KrakenFuturesWsMessage},
     },
 };
 
-const MUTEX_POISONED: &str = "mutex poisoned";
+const FUTURES_BATCH_CANCEL_LIMIT: usize = 50;
+
+/// Maximum order IDs per `/orders/status` request for Kraken Futures API.
+const FUTURES_ORDERS_STATUS_LIMIT: usize = 50;
 
 /// Kraken Futures execution client.
 ///
@@ -73,23 +97,27 @@ const MUTEX_POISONED: &str = "mutex poisoned";
 pub struct KrakenFuturesExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: KrakenExecClientConfig,
+    config: KrakenExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http: KrakenFuturesHttpClient,
     ws: KrakenFuturesWebSocketClient,
     cancellation_token: CancellationToken,
-    ws_stream_handle: Option<JoinHandle<()>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
-    instruments: Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-    truncated_id_map: Arc<RwLock<AHashMap<String, ClientOrderId>>>,
-    order_instrument_map: Arc<RwLock<AHashMap<String, InstrumentId>>>,
-    venue_client_map: Arc<RwLock<AHashMap<String, ClientOrderId>>>,
-    venue_order_qty: Arc<RwLock<AHashMap<String, Quantity>>>,
+    session_tasks: TaskGroup,
+    pending_tasks: TaskGroup,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    truncated_id_map: Arc<AtomicMap<String, ClientOrderId>>,
+    order_instrument_map: Arc<AtomicMap<String, InstrumentId>>,
+    venue_client_map: Arc<AtomicMap<String, ClientOrderId>>,
+    venue_order_qty: Arc<AtomicMap<String, Quantity>>,
+    ws_dispatch_state: Arc<WsDispatchState>,
 }
 
 impl KrakenFuturesExecutionClient {
     /// Creates a new [`KrakenFuturesExecutionClient`].
-    pub fn new(core: ExecutionClientCore, config: KrakenExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: KrakenExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -99,27 +127,45 @@ impl KrakenFuturesExecutionClient {
             None,
         );
 
-        let cancellation_token = CancellationToken::new();
+        let session_tasks = TaskGroup::new();
+        let cancellation_token = session_tasks.cancellation_token();
+        let pending_tasks = TaskGroup::new();
+        let api_key = config.api_key.expose_secret().to_owned();
+        let api_secret = config.api_secret.expose_secret().to_owned();
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http = KrakenFuturesHttpClient::with_credentials(
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            api_key.clone(),
+            api_secret.clone(),
             config.environment,
             config.base_url.clone(),
             config.timeout_secs,
+            Some(config.max_retries),
             None,
             None,
-            None,
-            config.http_proxy.clone(),
-            config.max_requests_per_second,
+            proxy_url.clone(),
+            config
+                .max_requests_per_second
+                .unwrap_or(KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND),
         )?;
 
-        let credential = KrakenCredential::new(config.api_key.clone(), config.api_secret.clone());
+        let credential = KrakenCredential::new(api_key, api_secret);
         let ws = KrakenFuturesWebSocketClient::with_credentials(
             config.ws_url(),
             config.heartbeat_interval_secs,
             Some(credential),
-        );
+            config.auth_timeout_secs,
+            config.transport_backend,
+            proxy_url,
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*KRAKEN_VENUE),
+            "kraken-futures-user-streams",
+        ));
 
         Ok(Self {
             core,
@@ -129,14 +175,28 @@ impl KrakenFuturesExecutionClient {
             http,
             ws,
             cancellation_token,
-            ws_stream_handle: None,
-            pending_tasks: Mutex::new(Vec::new()),
-            instruments: Arc::new(RwLock::new(AHashMap::new())),
-            truncated_id_map: Arc::new(RwLock::new(AHashMap::new())),
-            order_instrument_map: Arc::new(RwLock::new(AHashMap::new())),
-            venue_client_map: Arc::new(RwLock::new(AHashMap::new())),
-            venue_order_qty: Arc::new(RwLock::new(AHashMap::new())),
+            session_tasks,
+            pending_tasks,
+            instruments: Arc::new(AtomicMap::new()),
+            truncated_id_map: Arc::new(AtomicMap::new()),
+            order_instrument_map: Arc::new(AtomicMap::new()),
+            venue_client_map: Arc::new(AtomicMap::new()),
+            venue_order_qty: Arc::new(AtomicMap::new()),
+            ws_dispatch_state: Arc::new(WsDispatchState::new()),
         })
+    }
+
+    fn register_order_identity(&self, order: &OrderAny) {
+        self.ws_dispatch_state.register_identity(
+            order.client_order_id(),
+            OrderIdentity {
+                strategy_id: order.strategy_id(),
+                instrument_id: order.instrument_id(),
+                order_side: order.order_side(),
+                order_type: order.order_type(),
+                quantity: order.quantity(),
+            },
+        );
     }
 
     /// Returns a reference to the clock.
@@ -155,16 +215,54 @@ impl KrakenFuturesExecutionClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
-        });
+        };
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            log::warn!("Skipping Kraken Futures {description} after shutdown began: {e}");
+        }
+    }
+
+    async fn finish_tasks(&self) -> anyhow::Result<()> {
+        let (session_result, pending_result) = tokio::join!(
+            self.session_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+            self.pending_tasks
+                .finish_shutdown(Duration::from_secs(2), Duration::from_secs(2)),
+        );
+        session_result.context("failed to finish Kraken Futures execution session tasks")?;
+        pending_result.context("failed to finish Kraken Futures execution command tasks")?;
+        Ok(())
+    }
+
+    async fn prepare_task_groups(&mut self) -> anyhow::Result<()> {
+        if !self.session_tasks.is_open() || !self.pending_tasks.is_open() {
+            self.session_tasks.begin_shutdown();
+            self.pending_tasks.begin_shutdown();
+            self.finish_tasks().await?;
+            self.session_tasks
+                .start_generation()
+                .context("failed to start Kraken Futures execution session task generation")?;
+            self.pending_tasks
+                .start_generation()
+                .context("failed to start Kraken Futures execution command task generation")?;
+            self.cancellation_token = self.session_tasks.cancellation_token();
+        }
+        Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.http.cancel_all_requests();
+        self.pending_tasks.begin_shutdown();
+        let ws_result = self.ws.close().await;
+        self.session_tasks.begin_shutdown();
+        let tasks_result = self.finish_tasks().await;
+        self.core.set_disconnected();
+        tasks_result?;
+        Ok(ws_result?)
     }
 
     fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) {
@@ -186,23 +284,25 @@ impl KrakenFuturesExecutionClient {
         let time_in_force = order.time_in_force();
         let price = order.price();
         let trigger_price = order.trigger_price();
+        let trigger_type = order.trigger_type();
         let is_reduce_only = order.is_reduce_only();
         let is_post_only = order.is_post_only();
 
         log::debug!("OrderSubmitted: client_order_id={client_order_id}");
+        self.register_order_identity(order);
         self.emitter.emit_order_submitted(order);
 
         let kraken_cl_ord_id = truncate_cl_ord_id(&client_order_id);
 
-        if kraken_cl_ord_id != client_order_id.as_str()
-            && let Ok(mut map) = self.truncated_id_map.write()
-        {
-            map.insert(kraken_cl_ord_id, client_order_id);
+        if kraken_cl_ord_id != client_order_id.as_str() {
+            self.truncated_id_map
+                .insert(kraken_cl_ord_id, client_order_id);
         }
 
         let http = self.http.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let dispatch_state = self.ws_dispatch_state.clone();
 
         self.spawn_task(task_name, async move {
             let result = http
@@ -216,28 +316,37 @@ impl KrakenFuturesExecutionClient {
                     time_in_force,
                     price,
                     trigger_price,
+                    trigger_type,
                     is_reduce_only,
                     is_post_only,
                 )
                 .await;
 
             match result {
-                Ok(_report) => Ok(()),
-                Err(e) => {
-                    let ts_event = clock.get_time_ns();
-                    let error_msg = format!("{task_name} error: {e}");
-                    let due_post_only = error_msg.contains("POST_ONLY_REJECTED");
-                    emitter.emit_order_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        &error_msg,
-                        ts_event,
-                        due_post_only,
-                    );
-                    Ok(())
-                }
+                Ok(_) => {}
+                Err(e) => match command_failure_from_submit_error(&e) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "{task_name} outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        let ts_event = clock.get_time_ns();
+                        let error_msg = format!("{task_name} error: {reason}");
+                        let due_post_only = error_msg.contains("POST_ONLY_REJECTED");
+                        dispatch_state.cleanup_terminal(&client_order_id);
+                        emitter.emit_order_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            &error_msg,
+                            ts_event,
+                            due_post_only,
+                        );
+                    }
+                },
             }
+            Ok(())
         });
     }
 
@@ -248,7 +357,7 @@ impl KrakenFuturesExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
 
-        log::info!(
+        log::debug!(
             "Canceling order: venue_order_id={venue_order_id:?}, client_order_id={client_order_id}"
         );
 
@@ -257,26 +366,24 @@ impl KrakenFuturesExecutionClient {
         let clock = self.clock;
 
         self.spawn_task("cancel_order", async move {
-            if let Err(e) = http
-                .cancel_order(
-                    account_id,
-                    instrument_id,
-                    Some(client_order_id),
-                    venue_order_id,
-                )
-                .await
+            if let Err(failure) = cancel_order_for_futures(
+                &http,
+                account_id,
+                instrument_id,
+                Some(client_order_id),
+                venue_order_id,
+            )
+            .await
             {
-                log::error!("Cancel order failed: {e}");
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_cancel_rejected_event(
+                handle_cancel_failure(
+                    &emitter,
+                    clock,
                     strategy_id,
                     instrument_id,
                     client_order_id,
                     venue_order_id,
-                    &format!("cancel-order error: {e}"),
-                    ts_event,
+                    failure,
                 );
-                anyhow::bail!("Cancel order failed: {e}");
             }
             Ok(())
         });
@@ -293,11 +400,12 @@ impl KrakenFuturesExecutionClient {
         let order_instrument_map = self.order_instrument_map.clone();
         let venue_client_map = self.venue_client_map.clone();
         let venue_order_qty = self.venue_order_qty.clone();
+        let dispatch_state = self.ws_dispatch_state.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
         let cancellation_token = self.cancellation_token.clone();
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             loop {
                 tokio::select! {
                     () = cancellation_token.cancelled() => {
@@ -310,6 +418,7 @@ impl KrakenFuturesExecutionClient {
                                 Self::handle_ws_message(
                                     ws_msg,
                                     &emitter,
+                                    &dispatch_state,
                                     &instruments,
                                     &truncated_id_map,
                                     &order_instrument_map,
@@ -327,43 +436,23 @@ impl KrakenFuturesExecutionClient {
                     }
                 }
             }
-        });
+        };
 
-        self.ws_stream_handle = Some(handle);
-        Ok(())
+        self.session_tasks
+            .spawn(future)
+            .context("failed to register Kraken Futures execution stream task")
     }
 
-    fn lookup_instrument(
-        instruments: &Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-        product_id: &str,
-    ) -> Option<InstrumentAny> {
-        let instrument_id = InstrumentId::new(Symbol::new(product_id), *KRAKEN_VENUE);
-        instruments
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(&instrument_id).cloned())
-    }
-
-    fn resolve_client_order_id(
-        truncated: &str,
-        truncated_id_map: &Arc<RwLock<AHashMap<String, ClientOrderId>>>,
-    ) -> ClientOrderId {
-        truncated_id_map
-            .read()
-            .ok()
-            .and_then(|map| map.get(truncated).copied())
-            .unwrap_or_else(|| ClientOrderId::new(truncated))
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         msg: KrakenFuturesWsMessage,
         emitter: &ExecutionEventEmitter,
-        instruments: &Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-        truncated_id_map: &Arc<RwLock<AHashMap<String, ClientOrderId>>>,
-        order_instrument_map: &Arc<RwLock<AHashMap<String, InstrumentId>>>,
-        venue_client_map: &Arc<RwLock<AHashMap<String, ClientOrderId>>>,
-        venue_order_qty: &Arc<RwLock<AHashMap<String, Quantity>>>,
+        dispatch_state: &Arc<WsDispatchState>,
+        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+        truncated_id_map: &Arc<AtomicMap<String, ClientOrderId>>,
+        order_instrument_map: &Arc<AtomicMap<String, InstrumentId>>,
+        venue_client_map: &Arc<AtomicMap<String, ClientOrderId>>,
+        venue_order_qty: &Arc<AtomicMap<String, Quantity>>,
         account_id: AccountId,
         clock: &'static AtomicTime,
     ) {
@@ -371,150 +460,43 @@ impl KrakenFuturesExecutionClient {
 
         match msg {
             KrakenFuturesWsMessage::OpenOrdersDelta(delta) => {
-                let product_id = delta.order.instrument.as_str();
-
-                let Some(instrument) = Self::lookup_instrument(instruments, product_id) else {
-                    log::warn!("No instrument for product_id: {product_id}");
-                    return;
-                };
-
-                // Cache order_id -> instrument_id for cancel-only messages
-                if let Ok(mut map) = order_instrument_map.write() {
-                    map.insert(delta.order.order_id.clone(), instrument.id());
-                }
-
-                if let Ok(mut map) = venue_order_qty.write() {
-                    let qty = Quantity::new(delta.order.qty, instrument.size_precision());
-                    map.insert(delta.order.order_id.clone(), qty);
-                }
-
-                match parse_futures_ws_order_status_report(
-                    &delta.order,
-                    delta.is_cancel,
-                    delta.reason.as_deref(),
-                    &instrument,
+                dispatch::futures::open_orders_delta(
+                    &delta,
+                    dispatch_state,
+                    emitter,
+                    instruments,
+                    truncated_id_map,
+                    order_instrument_map,
+                    venue_client_map,
+                    venue_order_qty,
                     account_id,
                     ts_init,
-                ) {
-                    Ok(mut report) => {
-                        if let Some(ref cl_ord_id) = delta.order.cli_ord_id {
-                            let full_id =
-                                Self::resolve_client_order_id(cl_ord_id, truncated_id_map);
-                            report = report.with_client_order_id(full_id);
-
-                            if let Ok(mut map) = venue_client_map.write() {
-                                map.insert(delta.order.order_id.clone(), full_id);
-                            }
-                        }
-                        emitter.send_order_status_report(report);
-                    }
-                    Err(e) => log::error!("Failed to parse futures order status report: {e}"),
-                }
+                );
             }
             KrakenFuturesWsMessage::OpenOrdersCancel(cancel) => {
-                if let Some(ref reason) = cancel.reason
-                    && (reason == "full_fill" || reason == "partial_fill")
-                {
-                    log::debug!(
-                        "Skipping fill-driven cancel: order_id={}, reason={reason}",
-                        cancel.order_id,
-                    );
-                    return;
-                }
-
-                let venue_order_id = VenueOrderId::new(&cancel.order_id);
-
-                let instrument_id = order_instrument_map
-                    .read()
-                    .ok()
-                    .and_then(|map| map.get(&cancel.order_id).copied());
-
-                let Some(instrument_id) = instrument_id else {
-                    log::warn!(
-                        "Cannot resolve instrument for cancel: order_id={}, \
-                         order not seen in previous delta",
-                        cancel.order_id
-                    );
-                    return;
-                };
-
-                let client_order_id = cancel
-                    .cli_ord_id
-                    .as_ref()
-                    .map(|id| Self::resolve_client_order_id(id, truncated_id_map))
-                    .or_else(|| {
-                        venue_client_map
-                            .read()
-                            .ok()
-                            .and_then(|map| map.get(&cancel.order_id).copied())
-                    });
-
-                let Some(quantity) = venue_order_qty
-                    .read()
-                    .ok()
-                    .and_then(|map| map.get(&cancel.order_id).copied())
-                else {
-                    log::warn!(
-                        "Cannot resolve quantity for cancel: order_id={}, skipping",
-                        cancel.order_id
-                    );
-                    return;
-                };
-
-                let report = OrderStatusReport::new(
+                dispatch::futures::open_orders_cancel(
+                    &cancel,
+                    dispatch_state,
+                    emitter,
+                    truncated_id_map,
+                    order_instrument_map,
+                    venue_client_map,
+                    venue_order_qty,
                     account_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    OrderSide::NoOrderSide,
-                    OrderType::Limit,
-                    TimeInForce::Gtc,
-                    OrderStatus::Canceled,
-                    quantity,
-                    Quantity::zero(0),
                     ts_init,
-                    ts_init,
-                    ts_init,
-                    None,
                 );
-
-                let report = if let Some(ref reason) = cancel.reason
-                    && !reason.is_empty()
-                {
-                    report.with_cancel_reason(reason.clone())
-                } else {
-                    report
-                };
-
-                emitter.send_order_status_report(report);
             }
             KrakenFuturesWsMessage::FillsDelta(fills_delta) => {
-                for fill in &fills_delta.fills {
-                    let product_id = match &fill.instrument {
-                        Some(id) => id.as_str(),
-                        None => {
-                            log::warn!("Fill missing instrument field: fill_id={}", fill.fill_id);
-                            continue;
-                        }
-                    };
-
-                    let Some(instrument) = Self::lookup_instrument(instruments, product_id) else {
-                        log::warn!("No instrument for product_id: {product_id}");
-                        continue;
-                    };
-
-                    match parse_futures_ws_fill_report(fill, &instrument, account_id, ts_init) {
-                        Ok(mut report) => {
-                            if let Some(ref cl_ord_id) = fill.cli_ord_id {
-                                let full_id =
-                                    Self::resolve_client_order_id(cl_ord_id, truncated_id_map);
-                                report.client_order_id = Some(full_id);
-                            }
-                            emitter.send_fill_report(report);
-                        }
-                        Err(e) => log::error!("Failed to parse futures fill report: {e}"),
-                    }
-                }
+                dispatch::futures::fills_delta(
+                    &fills_delta,
+                    dispatch_state,
+                    emitter,
+                    instruments,
+                    truncated_id_map,
+                    venue_client_map,
+                    account_id,
+                    ts_init,
+                );
             }
             KrakenFuturesWsMessage::Challenge(challenge) => {
                 log::debug!("Received challenge: length={}", challenge.len());
@@ -565,7 +547,7 @@ impl KrakenFuturesExecutionClient {
         let quantity = cmd.quantity;
         let price = cmd.price;
 
-        log::info!(
+        log::debug!(
             "Modifying order: venue_order_id={venue_order_id:?}, client_order_id={client_order_id}"
         );
 
@@ -574,7 +556,7 @@ impl KrakenFuturesExecutionClient {
         let clock = self.clock;
 
         self.spawn_task("modify_order", async move {
-            if let Err(e) = http
+            match http
                 .modify_order(
                     instrument_id,
                     Some(client_order_id),
@@ -585,17 +567,25 @@ impl KrakenFuturesExecutionClient {
                 )
                 .await
             {
-                log::error!("Modify order failed: {e}");
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_modify_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    &format!("modify-order error: {e}"),
-                    ts_event,
-                );
-                anyhow::bail!("Modify order failed: {e}");
+                Ok(_) => {}
+                Err(e) => match command_failure_from_modify_error(&e) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "modify_order outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        let ts_event = clock.get_time_ns();
+                        emitter.emit_order_modify_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            &format!("modify-order error: {reason}"),
+                            ts_event,
+                        );
+                    }
+                },
             }
             Ok(())
         });
@@ -625,7 +615,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
@@ -634,9 +624,10 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -662,7 +653,10 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             return Ok(());
         }
 
-        self.cancellation_token.cancel();
+        self.http.cancel_all_requests();
+        self.session_tasks.begin_shutdown();
+        self.pending_tasks.begin_shutdown();
+        self.ws.begin_shutdown();
         self.core.set_stopped();
         self.core.set_disconnected();
         log::info!("Stopped: client_id={}", self.core.client_id);
@@ -670,9 +664,13 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
+        if self.core.is_connected() && self.session_tasks.is_open() && self.pending_tasks.is_open()
+        {
             return Ok(());
         }
+
+        self.http.reset_cancellation_token();
+        self.prepare_task_groups().await?;
 
         if !self.core.instruments_initialized() {
             let instruments = self
@@ -680,56 +678,68 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
                 .request_instruments()
                 .await
                 .context("Failed to load Kraken futures instruments")?;
-            log::info!("Loaded {} Futures instruments", instruments.len());
-            self.http.cache_instruments(instruments);
+            log::debug!("Loaded {} Futures instruments", instruments.len());
+            self.http.cache_instruments(&instruments);
             self.core.set_instruments_initialized();
         }
 
-        if let Ok(mut guard) = self.instruments.write() {
-            for entry in self.http.instruments_cache.iter() {
-                let instrument = entry.value().clone();
-                guard.insert(instrument.id(), instrument);
+        self.instruments.rcu(|m| {
+            for instrument in self.http.instruments_cache.load().values() {
+                m.insert(instrument.id(), instrument.clone());
             }
+        });
+
+        let session_result = async {
+            self.ws
+                .connect()
+                .await
+                .context("Failed to connect futures WebSocket")?;
+            self.ws
+                .wait_until_active(10.0)
+                .await
+                .context("Futures WebSocket failed to become active")?;
+
+            self.ws
+                .authenticate()
+                .await
+                .context("Failed to authenticate futures WebSocket")?;
+
+            let account_state = self
+                .http
+                .request_account_state(self.core.account_id)
+                .await
+                .context("Failed to request Kraken futures account state")?;
+
+            if !account_state.balances.is_empty() {
+                log::debug!(
+                    "Received account state with {} balance(s)",
+                    account_state.balances.len()
+                );
+            }
+            self.emitter.send_account_state(account_state);
+            self.await_account_registered(30.0).await?;
+
+            self.spawn_message_handler()?;
+
+            self.ws
+                .subscribe_executions()
+                .await
+                .context("Failed to subscribe to executions")?;
+
+            log::debug!("Futures WebSocket authenticated and subscribed to executions");
+
+            Ok::<(), anyhow::Error>(())
         }
+        .await;
 
-        self.ws
-            .connect()
-            .await
-            .context("Failed to connect futures WebSocket")?;
-        self.ws
-            .wait_until_active(10.0)
-            .await
-            .context("Futures WebSocket failed to become active")?;
-
-        self.ws
-            .authenticate()
-            .await
-            .context("Failed to authenticate futures WebSocket")?;
-
-        // Request and register account state before message handler
-        let account_state = self
-            .http
-            .request_account_state(self.core.account_id)
-            .await
-            .context("Failed to request Kraken futures account state")?;
-
-        if !account_state.balances.is_empty() {
-            log::info!(
-                "Received account state with {} balance(s)",
-                account_state.balances.len()
-            );
+        if let Err(e) = session_result {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Kraken Futures execution startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
         }
-        self.emitter.send_account_state(account_state);
-        self.await_account_registered(30.0).await?;
-
-        self.spawn_message_handler()?;
-
-        self.ws
-            .subscribe_executions()
-            .await
-            .context("Failed to subscribe to executions")?;
-
-        log::info!("Futures WebSocket authenticated and subscribed to executions");
 
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -737,20 +747,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
-            return Ok(());
-        }
-
-        self.cancellation_token.cancel();
-
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
-
-        let _ = self.ws.close().await;
-
-        self.cancellation_token = CancellationToken::new();
-        self.core.set_disconnected();
+        self.teardown_partial_connect().await?;
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -766,14 +763,16 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         );
 
         let account_id = self.core.account_id;
+        // Scoped to the command's instrument, so an unresolvable open order on another contract
+        // is out of scope for this lookup rather than failing it.
         let reports = self
             .http
-            .request_order_status_reports(account_id, None, None, None, false)
+            .request_order_status_reports(account_id, cmd.instrument_id, None, None, false)
             .await?;
 
         // Match by venue_order_id or client_order_id (comparing truncated form
         // since Kraken stores the truncated cl_ord_id for long IDs)
-        Ok(reports.into_iter().find(|r| {
+        let matched = reports.into_iter().find(|r| {
             cmd.venue_order_id
                 .is_some_and(|id| r.venue_order_id.as_str() == id.as_str())
                 || cmd.client_order_id.is_some_and(|id| {
@@ -781,7 +780,103 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
                         .as_ref()
                         .is_some_and(|r_id| r_id.as_str() == truncate_cl_ord_id(&id))
                 })
-        }))
+        });
+
+        if let Some(mut report) = matched {
+            // A terminal history match is priced from its fills; short of them the query fails so
+            // the engine defers, as the orders-status window does below. A failed fills read counts
+            // as an empty page, so a cached order holding every execution still prices it.
+            if is_unpriced_terminal_report(&report) {
+                let cached = self.get_cached_order_for_status_command(cmd);
+                let fills = self
+                    .http
+                    .request_fill_reports(account_id, Some(report.instrument_id), None, None)
+                    .await;
+                let page = fills.as_deref().unwrap_or_default();
+
+                if let Err(covered) = price_from_fills(&mut report, cached.as_ref(), page) {
+                    fills?;
+                    anyhow::bail!(
+                        "Order {} executed per the order history with fills covering {covered} \
+                         of {}; deferring until the fills feed prices it",
+                        report.venue_order_id,
+                        report.filled_qty,
+                    );
+                }
+            }
+
+            return Ok(Some(report));
+        }
+
+        let Some(order) = self.get_cached_order_for_status_command(cmd) else {
+            return Ok(None);
+        };
+
+        // Held orders never appear on /openorders; query the 5-second window
+        let order_ids: Vec<String> = cmd
+            .venue_order_id
+            .or(order.venue_order_id())
+            .map(|id| id.to_string())
+            .into_iter()
+            .collect();
+        let cli_ord_ids: Vec<String> = cmd
+            .client_order_id
+            .map(|id| truncate_cl_ord_id(&id))
+            .into_iter()
+            .collect();
+
+        let recent_reports = self
+            .http
+            .request_orders_status_reports(account_id, &order_ids, &cli_ord_ids)
+            .await?;
+
+        let matched_recent = recent_reports
+            .iter()
+            .find(|report| {
+                cmd.venue_order_id
+                    .is_some_and(|id| report.venue_order_id == id)
+                    || cmd.client_order_id.is_some_and(|id| {
+                        report
+                            .client_order_id
+                            .as_ref()
+                            .is_some_and(|report_id| report_id.as_str() == truncate_cl_ord_id(&id))
+                    })
+            })
+            .cloned();
+
+        // Window filled reports have no avg_px; price them from fills below
+        if matched_recent
+            .as_ref()
+            .is_some_and(|report| report.order_status != OrderStatus::Filled)
+        {
+            return Ok(matched_recent);
+        }
+
+        let now = Timestamp::now();
+        let start = now - Duration::from_secs(5 * 60);
+        let fills = self
+            .http
+            .request_fill_reports(
+                account_id,
+                Some(order.instrument_id()),
+                Some(start),
+                Some(now),
+            )
+            .await?;
+
+        match (
+            synthesize_filled_order_status_report(cmd, &order, &fills),
+            matched_recent,
+        ) {
+            (Some(report), _) => Ok(Some(report)),
+            // Unpriced filled reports would close at the order price
+            (None, Some(_)) => anyhow::bail!(
+                "Order {} fully executed in the orders-status window without visible \
+                 fills; deferring until the fills feed prices it",
+                order.client_order_id(),
+            ),
+            (None, None) => Ok(None),
+        }
     }
 
     async fn generate_order_status_reports(
@@ -795,11 +890,74 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         );
 
         let account_id = self.core.account_id;
-        let start = cmd.start.map(DateTime::<Utc>::from);
-        let end = cmd.end.map(DateTime::<Utc>::from);
-        self.http
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        let mut reports = self
+            .http
             .request_order_status_reports(account_id, cmd.instrument_id, start, end, cmd.open_only)
-            .await
+            .await?;
+
+        // A terminal history report with an executed quantity carries no price: it is priced from
+        // its fills, else withheld. A withheld cached order counts as missing and the engine
+        // resolves it through the single-order query, which prices it or defers; an uncached one
+        // stays withheld until its fills reach the fills page.
+        if reports.iter().any(is_unpriced_terminal_report) {
+            // A failed fills read counts as an empty page: a cached order holding every execution
+            // still prices its report, and only the reports nothing covers are withheld.
+            let fills = match self
+                .http
+                .request_fill_reports(account_id, cmd.instrument_id, None, None)
+                .await
+            {
+                Ok(fills) => fills,
+                Err(e) => {
+                    log::warn!("Failed to read fills to price executed history orders: {e}");
+                    Vec::new()
+                }
+            };
+            let cache = self.core.cache();
+            reports.retain_mut(|report| {
+                if !is_unpriced_terminal_report(report) {
+                    return true;
+                }
+
+                let cached = cached_order_for_report(&cache, report);
+
+                match price_from_fills(report, cached.as_ref(), &fills) {
+                    Ok(()) => true,
+                    Err(covered) => {
+                        log::warn!(
+                            "Withholding executed order {} from the bulk response: fills cover \
+                             {covered} of {}",
+                            report.venue_order_id,
+                            report.filled_qty,
+                        );
+                        false
+                    }
+                }
+            });
+        }
+
+        if cmd.open_only {
+            let extension = self
+                .reports_for_open_orders_absent_from_venue(account_id, cmd.instrument_id, &reports)
+                .await?;
+
+            for report in extension {
+                if report.order_status == OrderStatus::Filled {
+                    log::debug!(
+                        "Deferring fully executed order {} from the bulk response: fills-paired \
+                         pricing applies",
+                        report.venue_order_id,
+                    );
+                    continue;
+                }
+
+                reports.push(report);
+            }
+        }
+
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
@@ -812,11 +970,18 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         );
 
         let account_id = self.core.account_id;
-        let start = cmd.start.map(DateTime::<Utc>::from);
-        let end = cmd.end.map(DateTime::<Utc>::from);
-        self.http
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        let mut reports = self
+            .http
             .request_fill_reports(account_id, cmd.instrument_id, start, end)
-            .await
+            .await?;
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id == venue_order_id);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
@@ -840,16 +1005,41 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         log::debug!("Generating mass status: lookback_mins={lookback_mins:?}");
 
-        let start = lookback_mins.map(|mins| Utc::now() - Duration::from_secs(mins * 60));
-
+        let ts_init = self.clock.get_time_ns();
+        // Saturating arithmetic: an unclamped lookback must not overflow, and a cutoff before the
+        // epoch must not panic converting into `UnixNanos`.
+        let lookback_start = lookback_mins.map(|mins| {
+            let nanos = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+            ts_init.saturating_sub(DurationNanos::new(nanos))
+        });
+        let start = lookback_start.map(Timestamp::from);
         let account_id = self.core.account_id;
-        let order_reports = self
+
+        let (mut order_reports, orders_complete) = self
             .http
-            .request_order_status_reports(account_id, None, start, None, true)
+            .request_order_status_reports_checked(account_id, None, start, None, true)
             .await?;
-        let fill_reports = self
+        let extension = self
+            .reports_for_open_orders_absent_from_venue(account_id, None, &order_reports)
+            .await?;
+
+        // Snapshot recon would infer uncovered fills at the order price
+        for report in extension {
+            if report.order_status == OrderStatus::Filled {
+                log::debug!(
+                    "Deferring fully executed order {} from mass status: fills-paired \
+                     pricing applies",
+                    report.venue_order_id,
+                );
+                continue;
+            }
+
+            order_reports.push(report);
+        }
+
+        let (fill_reports, fills_complete) = self
             .http
-            .request_fill_reports(account_id, None, start, None)
+            .request_fill_reports_checked(account_id, None, start, None)
             .await?;
         let position_reports = self
             .http
@@ -860,18 +1050,20 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             self.core.client_id,
             self.core.account_id,
             *KRAKEN_VENUE,
-            self.clock.get_time_ns(),
+            ts_init,
             None,
         );
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
+        // As for spot: one cutoff for every historical query, recorded with its completeness.
+        mass_status.set_report_window(lookback_start, orders_complete && fills_complete);
 
         Ok(Some(mass_status))
     }
 
-    fn query_account(&self, cmd: &QueryAccount) -> anyhow::Result<()> {
-        log::debug!("Querying account: {cmd:?}");
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        log::debug!("Querying account: {cmd}");
 
         let account_id = self.core.account_id;
         let http = self.http.clone();
@@ -884,6 +1076,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 account_state.ts_event,
+                account_state.info,
             );
             Ok(())
         });
@@ -891,27 +1084,33 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         Ok(())
     }
 
-    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
-        log::debug!("Querying order: {cmd:?}");
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        log::debug!("Querying order: {cmd}");
 
         let venue_order_id = cmd
             .venue_order_id
             .context("venue_order_id required for query_order")?;
         let account_id = self.core.account_id;
+        let instrument_id = cmd.instrument_id;
         let http = self.http.clone();
         let emitter = self.emitter.clone();
 
         self.spawn_task("query_order", async move {
+            // Scoped to the queried instrument, so an unresolvable open order on another contract
+            // is out of scope for this lookup rather than failing it.
             let reports = http
-                .request_order_status_reports(account_id, None, None, None, true)
+                .request_order_status_reports(account_id, Some(instrument_id), None, None, true)
                 .await
                 .context("Failed to query order")?;
 
-            if let Some(report) = reports
+            match reports
                 .into_iter()
                 .find(|r| r.venue_order_id == venue_order_id)
             {
-                emitter.send_order_status_report(report);
+                Some(report) => emitter.send_order_status_report(report),
+                None => log::warn!(
+                    "No open order {venue_order_id} found for {instrument_id}; no report emitted"
+                ),
             }
             Ok(())
         });
@@ -919,56 +1118,161 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         Ok(())
     }
 
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Order not found in cache: {}", cmd.client_order_id))?;
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
         self.submit_single_order(&order, "submit_order");
         Ok(())
     }
 
-    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
-        log::info!(
+        log::debug!(
             "Submitting order list: order_list_id={}, count={}",
             cmd.order_list.id,
             orders.len()
         );
 
+        let mut order_tuples = Vec::with_capacity(orders.len());
+        let mut order_meta = Vec::with_capacity(orders.len());
+
         for order in &orders {
-            self.submit_single_order(order, "submit_order_list");
+            if order.is_closed() {
+                log::warn!(
+                    "Cannot submit closed order: client_order_id={}",
+                    order.client_order_id()
+                );
+                continue;
+            }
+
+            // Kraken batch endpoint only supports limit and stop orders,
+            // submit market orders individually
+            if order.order_type() == OrderType::Market {
+                self.submit_single_order(order, "submit_order_list");
+                continue;
+            }
+
+            let client_order_id = order.client_order_id();
+            let kraken_cl_ord_id = truncate_cl_ord_id(&client_order_id);
+
+            if kraken_cl_ord_id != client_order_id.as_str() {
+                self.truncated_id_map
+                    .insert(kraken_cl_ord_id, client_order_id);
+            }
+
+            self.register_order_identity(order);
+            self.emitter.emit_order_submitted(order);
+
+            order_tuples.push((
+                order.instrument_id(),
+                client_order_id,
+                order.order_side(),
+                order.order_type(),
+                order.quantity(),
+                order.time_in_force(),
+                order.price(),
+                order.trigger_price(),
+                order.trigger_type(),
+                order.is_reduce_only(),
+                order.is_post_only(),
+            ));
+
+            order_meta.push((order.strategy_id(), order.instrument_id(), client_order_id));
         }
 
+        if order_tuples.is_empty() {
+            return Ok(());
+        }
+
+        let http = self.http.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let dispatch_state = self.ws_dispatch_state.clone();
+
+        self.spawn_task("submit_order_list", async move {
+            let results = http.send_order_batches(order_tuples).await;
+            for (result, (strategy_id, instrument_id, client_order_id)) in
+                results.into_iter().zip(&order_meta)
+            {
+                let outcome = match result {
+                    Ok(item) => command_failure_from_futures_batch_item(item),
+                    Err(e) => Err(command_failure_from_futures_batch_error(&e)),
+                };
+
+                match outcome {
+                    Ok(()) => {}
+                    Err(CommandFailure::Ambiguous(reason)) => {
+                        log::warn!(
+                            "submit_order_list outcome is ambiguous for client_order_id={client_order_id}: {reason}"
+                        );
+                    }
+                    Err(
+                        CommandFailure::NotSent(reason)
+                        | CommandFailure::VenueRejected(reason),
+                    ) => {
+                        let ts_event = clock.get_time_ns();
+                        let error_msg =
+                            format!("submit_order_list batch item rejected: {reason}");
+                        dispatch_state.cleanup_terminal(client_order_id);
+                        emitter.emit_order_rejected_event(
+                            *strategy_id,
+                            *instrument_id,
+                            *client_order_id,
+                            &error_msg,
+                            ts_event,
+                            reason == "postWouldExecute",
+                        );
+                    }
+                }
+            }
+            Ok(())
+        });
+
         Ok(())
     }
 
-    fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
-        self.modify_single_order(cmd);
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        self.modify_single_order(&cmd);
         Ok(())
     }
 
-    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
-        self.cancel_single_order(cmd);
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        self.cancel_single_order(&cmd);
         Ok(())
     }
 
-    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        if cmd.order_side == OrderSide::NoOrderSide {
-            log::info!("Canceling all orders: instrument_id={instrument_id} (bulk)");
+        if cmd.order_side.is_none() {
+            log::debug!("Canceling all orders: instrument_id={instrument_id} (bulk)");
 
             let http = self.http.clone();
             let symbol = instrument_id.symbol.to_string();
 
             self.spawn_task("cancel_all_orders", async move {
-                if let Err(e) = http.inner.cancel_all_orders(Some(symbol)).await {
-                    log::error!("Cancel all orders failed: {e}");
-                    anyhow::bail!("Cancel all orders failed: {e}");
+                match http.inner.cancel_all_orders(Some(symbol)).await {
+                    Ok(response) => {
+                        if response.result != KrakenApiResult::Success
+                            && response.cancel_status.cancelled_orders.is_empty()
+                        {
+                            log::warn!(
+                                "Cancel-all failed without per-order results, awaiting reconciliation: status={}",
+                                response.cancel_status.status
+                            );
+                        }
+                    }
+                    Err(e) => match command_failure_from_cancel_error(e) {
+                        CommandFailure::NotSent(reason) => {
+                            log::warn!("Cancel-all failed local validation: {reason}");
+                        }
+                        CommandFailure::Ambiguous(reason)
+                        | CommandFailure::VenueRejected(reason) => {
+                            log::warn!(
+                                "Cancel-all ambiguous failure, awaiting reconciliation: {reason}"
+                            );
+                        }
+                    },
                 }
                 Ok(())
             });
@@ -976,143 +1280,794 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             return Ok(());
         }
 
-        log::info!(
+        log::debug!(
             "Canceling all orders: instrument_id={instrument_id}, side={:?}",
             cmd.order_side
         );
 
-        let orders_to_cancel: Vec<_> = {
+        // Side-filtered cancellation reuses the explicit-id batch path rather than sending one
+        // HTTP cancel per order.
+        let cancels: Vec<CancelOrder> = {
             let cache = self.core.cache();
-            let open_orders = cache.orders_open(None, Some(&instrument_id), None, None, None);
+            let ts_init = self.clock.get_time_ns();
+            let correlation_id = cmd.correlation_id.or(Some(cmd.command_id));
 
-            open_orders
+            // As for spot: the venue can have accepted an order the cache still records as
+            // `Submitted`, so in-flight orders are selected alongside open ones.
+            let mut seen = HashSet::new();
+
+            cache
+                .orders_open(None, Some(&instrument_id), None, None, None)
                 .into_iter()
-                .filter(|order| order.order_side() == cmd.order_side)
-                .filter_map(|order| {
-                    Some((
-                        order.venue_order_id()?,
-                        order.client_order_id(),
-                        order.instrument_id(),
+                .chain(cache.orders_inflight(None, Some(&instrument_id), None, None, None))
+                .filter(|order| Some(order.order_side()) == cmd.order_side)
+                .filter(|order| seen.insert(order.client_order_id()))
+                .map(|order| {
+                    CancelOrder::new(
+                        cmd.trader_id,
+                        cmd.client_id,
+                        // Each cancel keeps the owning strategy of the order it targets.
                         order.strategy_id(),
-                    ))
+                        order.instrument_id(),
+                        order.client_order_id(),
+                        order.venue_order_id(),
+                        UUID4::new(),
+                        ts_init,
+                        cmd.params.clone(),
+                        correlation_id,
+                    )
                 })
                 .collect()
         };
 
-        let account_id = self.core.account_id;
-
-        for (venue_order_id, client_order_id, order_instrument_id, strategy_id) in orders_to_cancel
-        {
-            let http = self.http.clone();
-            let emitter = self.emitter.clone();
-            let clock = self.clock;
-
-            self.spawn_task("cancel_order_by_side", async move {
-                if let Err(e) = http
-                    .cancel_order(
-                        account_id,
-                        order_instrument_id,
-                        Some(client_order_id),
-                        Some(venue_order_id),
-                    )
-                    .await
-                {
-                    log::error!("Cancel order failed: {e}");
-                    let ts_event = clock.get_time_ns();
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        order_instrument_id,
-                        client_order_id,
-                        Some(venue_order_id),
-                        &format!("cancel-order error: {e}"),
-                        ts_event,
-                    );
-                }
-                Ok(())
-            });
+        if cancels.is_empty() {
+            log::debug!("No open orders to cancel for {instrument_id}");
+            return Ok(());
         }
+
+        let http = self.http.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+
+        self.spawn_task("cancel_all_orders_by_side", async move {
+            batch_cancel_orders_for_futures(&http, &emitter, clock, &cancels).await;
+            Ok(())
+        });
 
         Ok(())
     }
 
-    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
-        log::info!(
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
+        log::debug!(
             "Batch canceling orders: instrument_id={}, count={}",
             cmd.instrument_id,
             cmd.cancels.len()
         );
 
-        for cancel in &cmd.cancels {
-            self.cancel_single_order(cancel);
-        }
+        let http = self.http.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let cancels = cmd.cancels;
+
+        self.spawn_task("batch_cancel_orders", async move {
+            batch_cancel_orders_for_futures(&http, &emitter, clock, &cancels).await;
+            Ok(())
+        });
 
         Ok(())
     }
 }
 
+#[derive(Debug, Clone)]
+struct CancelRequestContext {
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    truncated_client_order_id: String,
+    venue_order_id: Option<VenueOrderId>,
+}
+
+async fn cancel_order_for_futures(
+    http: &KrakenFuturesHttpClient,
+    _account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: Option<VenueOrderId>,
+) -> Result<(), CommandFailure> {
+    http.get_cached_instrument(&instrument_id.symbol.inner())
+        .ok_or_else(|| {
+            CommandFailure::not_sent(InstrumentLookupError::not_found(instrument_id).to_string())
+        })?;
+
+    let order_id = venue_order_id.as_ref().map(ToString::to_string);
+    let cli_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
+
+    if order_id.is_none() && cli_ord_id.is_none() {
+        return Err(CommandFailure::not_sent(
+            "Either client_order_id or venue_order_id must be provided",
+        ));
+    }
+
+    let response = http
+        .inner
+        .cancel_order(order_id, cli_ord_id)
+        .await
+        .map_err(command_failure_from_cancel_error)?;
+
+    if response.result != KrakenApiResult::Success
+        || response.cancel_status.status != KrakenSendStatus::Cancelled
+    {
+        return Err(CommandFailure::venue_rejected(format!(
+            "cancel-order rejected: status={}",
+            response.cancel_status.status
+        )));
+    }
+
+    Ok(())
+}
+
+async fn batch_cancel_orders_for_futures(
+    http: &KrakenFuturesHttpClient,
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    cancels: &[CancelOrder],
+) {
+    let mut contexts = Vec::new();
+    let mut items = Vec::new();
+
+    for cancel in cancels {
+        match batch_cancel_item_for_futures(http, cancel) {
+            Ok((context, item)) => {
+                contexts.push(context);
+                items.push(item);
+            }
+            Err(CommandFailure::NotSent(reason)) => {
+                log::warn!(
+                    "Batch cancel command failed local validation for {}: {reason}",
+                    cancel.client_order_id
+                );
+            }
+            Err(CommandFailure::Ambiguous(reason) | CommandFailure::VenueRejected(reason)) => {
+                log::warn!(
+                    "Batch cancel command ambiguous failure for {}, awaiting reconciliation: {reason}",
+                    cancel.client_order_id
+                );
+            }
+        }
+    }
+
+    for (item_chunk, context_chunk) in items
+        .chunks(FUTURES_BATCH_CANCEL_LIMIT)
+        .zip(contexts.chunks(FUTURES_BATCH_CANCEL_LIMIT))
+    {
+        let response = match http
+            .inner
+            .cancel_order_items_batch(item_chunk.to_vec())
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                match command_failure_from_cancel_error(e) {
+                    CommandFailure::NotSent(reason) => {
+                        log::warn!("Batch cancel failed local validation: {reason}");
+                    }
+                    CommandFailure::Ambiguous(reason) | CommandFailure::VenueRejected(reason) => {
+                        log::warn!(
+                            "Batch cancel failed without per-order results, awaiting reconciliation: {reason}"
+                        );
+                    }
+                }
+                continue;
+            }
+        };
+
+        if response.batch_status.is_empty() {
+            if response.result != KrakenApiResult::Success {
+                let reason = response.error.as_deref().unwrap_or("Unknown error");
+                log::warn!(
+                    "Batch cancel failed without per-order results, awaiting reconciliation: {reason}"
+                );
+            }
+            continue;
+        }
+
+        if response.batch_status.len() != context_chunk.len() {
+            log::warn!(
+                "Batch cancel returned {} per-order result(s) for {} request(s); unmatched results await reconciliation",
+                response.batch_status.len(),
+                context_chunk.len()
+            );
+        }
+
+        for (index, status) in response.batch_status.iter().enumerate() {
+            let Some(cancel_status) = batch_cancel_status(status) else {
+                log::warn!("Batch cancel result without status at index {index}");
+                continue;
+            };
+
+            if cancel_status == KrakenSendStatus::Cancelled {
+                continue;
+            }
+
+            let Some(context) = batch_cancel_context(status, context_chunk, index) else {
+                log::warn!(
+                    "Batch cancel rejected item without matching request context at index {index}: status={cancel_status}"
+                );
+                continue;
+            };
+
+            emitter.emit_order_cancel_rejected_event(
+                context.strategy_id,
+                context.instrument_id,
+                context.client_order_id,
+                context.venue_order_id,
+                &format!("batch-cancel rejected: status={cancel_status}"),
+                clock.get_time_ns(),
+            );
+        }
+    }
+}
+
+fn batch_cancel_item_for_futures(
+    http: &KrakenFuturesHttpClient,
+    cancel: &CancelOrder,
+) -> Result<(CancelRequestContext, KrakenFuturesBatchCancelItem), CommandFailure> {
+    http.get_cached_instrument(&cancel.instrument_id.symbol.inner())
+        .ok_or_else(|| {
+            CommandFailure::not_sent(
+                InstrumentLookupError::not_found(cancel.instrument_id).to_string(),
+            )
+        })?;
+
+    let truncated_client_order_id = truncate_cl_ord_id(&cancel.client_order_id);
+    let item = if let Some(venue_order_id) = cancel.venue_order_id {
+        KrakenFuturesBatchCancelItem::from_order_id(venue_order_id.to_string())
+    } else {
+        KrakenFuturesBatchCancelItem::from_client_order_id(truncated_client_order_id.clone())
+    };
+
+    Ok((
+        CancelRequestContext {
+            strategy_id: cancel.strategy_id,
+            instrument_id: cancel.instrument_id,
+            client_order_id: cancel.client_order_id,
+            truncated_client_order_id,
+            venue_order_id: cancel.venue_order_id,
+        },
+        item,
+    ))
+}
+
+fn batch_cancel_status(status: &FuturesBatchCancelStatus) -> Option<KrakenSendStatus> {
+    status
+        .cancel_status
+        .as_ref()
+        .map(|cancel_status| cancel_status.status)
+        .or(status.status)
+}
+
+fn batch_cancel_context<'a>(
+    status: &FuturesBatchCancelStatus,
+    contexts: &'a [CancelRequestContext],
+    index: usize,
+) -> Option<&'a CancelRequestContext> {
+    if let Some(order_id) = status.order_id.as_deref()
+        && let Some(context) = contexts.iter().find(|context| {
+            context
+                .venue_order_id
+                .is_some_and(|venue_order_id| venue_order_id.as_str() == order_id)
+        })
+    {
+        return Some(context);
+    }
+
+    if let Some(cli_ord_id) = status.cli_ord_id.as_deref()
+        && let Some(context) = contexts
+            .iter()
+            .find(|context| context.truncated_client_order_id == cli_ord_id)
+    {
+        return Some(context);
+    }
+
+    if index < contexts.len() && status.order_id.is_none() && status.cli_ord_id.is_none() {
+        return contexts.get(index);
+    }
+
+    None
+}
+
+fn handle_cancel_failure(
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    failure: CommandFailure,
+) {
+    match failure {
+        CommandFailure::VenueRejected(reason) => {
+            emitter.emit_order_cancel_rejected_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                &reason,
+                clock.get_time_ns(),
+            );
+        }
+        CommandFailure::NotSent(reason) => {
+            log::warn!("Cancel command failed local validation for {client_order_id}: {reason}");
+        }
+        CommandFailure::Ambiguous(reason) => {
+            log::warn!(
+                "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {reason}"
+            );
+        }
+    }
+}
+
+impl KrakenFuturesExecutionClient {
+    /// Returns `/orders/status` reports for cached-open orders the given
+    /// venue reports do not cover.
+    ///
+    /// A Maker Protection hold never reaches the book, so it is invisible to
+    /// an open-orders snapshot while the venue still knows the order within
+    /// its 5-second `/orders/status` window. Orders without a venue order ID
+    /// yet (their submit acknowledgement is still inside the hold window) are
+    /// queried by their truncated client order ID, the only venue handle that
+    /// exists during the window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying request fails or the venue rejects
+    /// it, so callers defer rather than treat the orders as missing.
+    async fn reports_for_open_orders_absent_from_venue(
+        &self,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+        reported: &[OrderStatusReport],
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let mut order_ids = Vec::new();
+        let mut cli_ord_ids = Vec::new();
+
+        {
+            let cache = self.core.cache();
+            for order in cache.orders_open(
+                Some(&*KRAKEN_VENUE),
+                instrument_id.as_ref(),
+                None,
+                None,
+                None,
+            ) {
+                // Spot and Futures share the KRAKEN venue and one cache
+                if product_type_from_symbol(order.instrument_id().symbol.inner().as_str())
+                    != KrakenProductType::Futures
+                {
+                    continue;
+                }
+
+                match order.venue_order_id() {
+                    Some(venue_order_id) => {
+                        let already_reported = reported
+                            .iter()
+                            .any(|report| report.venue_order_id == venue_order_id);
+                        if !already_reported {
+                            order_ids.push(venue_order_id.to_string());
+                        }
+                    }
+                    None => {
+                        cli_ord_ids.push(truncate_cl_ord_id(&order.client_order_id()));
+                    }
+                }
+            }
+        }
+
+        if order_ids.is_empty() && cli_ord_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        log::debug!(
+            "Resolving {} venue order ID(s) and {} client order ID(s) from the orders-status window",
+            order_ids.len(),
+            cli_ord_ids.len(),
+        );
+
+        let mut reports = Vec::new();
+        for chunk in order_ids.chunks(FUTURES_ORDERS_STATUS_LIMIT) {
+            reports.extend(
+                self.http
+                    .request_orders_status_reports(account_id, chunk, &[])
+                    .await?,
+            );
+        }
+
+        for chunk in cli_ord_ids.chunks(FUTURES_ORDERS_STATUS_LIMIT) {
+            reports.extend(
+                self.http
+                    .request_orders_status_reports(account_id, &[], chunk)
+                    .await?,
+            );
+        }
+
+        Ok(reports)
+    }
+
+    fn get_cached_order_for_status_command(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<OrderAny> {
+        let cache = self.core.cache();
+
+        if let Some(client_order_id) = cmd.client_order_id {
+            return cache.order(&client_order_id).map(|o| o.clone());
+        }
+
+        let venue_order_id = cmd.venue_order_id?;
+        let client_order_id = *cache.client_order_id(&venue_order_id)?;
+        cache.order(&client_order_id).map(|o| o.clone())
+    }
+}
+
+/// The cached order a report describes, found by its venue order ID.
+fn cached_order_for_report(cache: &Cache, report: &OrderStatusReport) -> Option<OrderAny> {
+    let client_order_id = cache.client_order_id(&report.venue_order_id)?;
+    cache.order(client_order_id).map(|order| order.clone())
+}
+
+/// Whether `report` is terminal with an executed quantity it carries no price for.
+///
+/// An order history row has no average price. Unpriced, reconciliation infers the executed
+/// quantity at the report's limit price, and cannot price a market order at all.
+fn is_unpriced_terminal_report(report: &OrderStatusReport) -> bool {
+    matches!(
+        report.order_status,
+        OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Voided
+    ) && !report.filled_qty.is_zero()
+        && report.avg_px.is_none()
+}
+
+/// Sets `report.avg_px` to the quantity-weighted price of the order's executions.
+///
+/// The venue's own fills price the report when they cover its filled quantity exactly. Otherwise
+/// the fills a cached order has recorded complete the page, each counted once by trade ID, and
+/// must cover it exactly too. Exact coverage rejects a double count: an execution the engine
+/// inferred carries a synthetic trade ID, so it would otherwise be counted beside the venue fill
+/// it stands for. The fills endpoint returns one page with no cursor, so an older execution can be
+/// absent from it.
+///
+/// # Errors
+///
+/// Returns the covered quantity, leaving the report unpriced, when neither source covers the
+/// report's filled quantity exactly.
+fn price_from_fills(
+    report: &mut OrderStatusReport,
+    cached: Option<&OrderAny>,
+    fills: &[FillReport],
+) -> Result<(), Decimal> {
+    let target = report.filled_qty.as_decimal();
+    let order_fills: Vec<&FillReport> = fills
+        .iter()
+        .filter(|fill| fill.venue_order_id == report.venue_order_id)
+        .collect();
+    let total = |fills: &mut dyn Iterator<Item = &&FillReport>| {
+        fills.fold((Decimal::ZERO, Decimal::ZERO), |(qty, notional), fill| {
+            let fill_qty = fill.last_qty.as_decimal();
+            (
+                qty + fill_qty,
+                notional + fill_qty * fill.last_px.as_decimal(),
+            )
+        })
+    };
+
+    let (page_qty, page_notional) = total(&mut order_fills.iter());
+
+    if !target.is_zero() && page_qty == target {
+        report.avg_px = Some(page_notional / target);
+        return Ok(());
+    }
+
+    let Some(order) = cached else {
+        return Err(page_qty);
+    };
+    let recorded: HashSet<TradeId> = order.trade_ids().into_iter().copied().collect();
+    let (new_qty, new_notional) = total(
+        &mut order_fills
+            .iter()
+            .filter(|fill| !recorded.contains(&fill.trade_id)),
+    );
+    let cached_qty = order.filled_qty().as_decimal();
+    let covered = cached_qty + new_qty;
+
+    if !target.is_zero() && covered == target {
+        let cached_notional = order.avg_px().unwrap_or(Decimal::ZERO) * cached_qty;
+        report.avg_px = Some((cached_notional + new_notional) / target);
+        return Ok(());
+    }
+
+    Err(covered.max(page_qty))
+}
+
+fn synthesize_filled_order_status_report(
+    cmd: &GenerateOrderStatusReport,
+    order: &OrderAny,
+    fills: &[FillReport],
+) -> Option<OrderStatusReport> {
+    let venue_order_id = cmd.venue_order_id.or(order.venue_order_id());
+    let truncated_client_order_id = truncate_cl_ord_id(&order.client_order_id());
+
+    let mut matched: Vec<&FillReport> = if let Some(venue_order_id) = venue_order_id {
+        fills
+            .iter()
+            .filter(|fill| fill.venue_order_id == venue_order_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if matched.is_empty() {
+        matched = fills
+            .iter()
+            .filter(|fill| {
+                fill.client_order_id == Some(order.client_order_id())
+                    || fill
+                        .client_order_id
+                        .as_ref()
+                        .is_some_and(|fill_client_order_id| {
+                            fill_client_order_id.as_str() == truncated_client_order_id
+                        })
+            })
+            .collect();
+    }
+
+    if matched.is_empty() {
+        return None;
+    }
+
+    matched.sort_by_key(|fill| fill.ts_event);
+    let first_fill = *matched.first()?;
+    let last_fill = *matched.last()?;
+
+    let total_filled = matched
+        .iter()
+        .fold(Decimal::ZERO, |acc, fill| acc + fill.last_qty.as_decimal());
+    if total_filled < order.quantity().as_decimal() {
+        return None;
+    }
+
+    let total_notional = matched.iter().fold(Decimal::ZERO, |acc, fill| {
+        acc + fill.last_qty.as_decimal() * fill.last_px.as_decimal()
+    });
+    let avg_px = if total_filled.is_zero() {
+        None
+    } else {
+        Some(total_notional / total_filled)
+    };
+    let venue_order_id = venue_order_id.unwrap_or(first_fill.venue_order_id);
+
+    let mut report = OrderStatusReport::new(
+        first_fill.account_id,
+        order.instrument_id(),
+        Some(order.client_order_id()),
+        venue_order_id,
+        order.order_side().into(),
+        order.order_type(),
+        order.time_in_force(),
+        OrderStatus::Filled,
+        order.quantity(),
+        order.quantity(),
+        first_fill.ts_event,
+        last_fill.ts_event,
+        last_fill.ts_init,
+        None,
+    );
+    report.order_list_id = order.order_list_id();
+    report.venue_position_id = matched.iter().rev().find_map(|fill| fill.venue_position_id);
+    report.linked_order_ids = order
+        .linked_order_ids()
+        .map(|linked_order_ids| linked_order_ids.to_vec());
+    report.parent_order_id = order.parent_order_id();
+    report.expire_time = order.expire_time();
+    report.price = order.price();
+    report.trigger_price = order.trigger_price();
+    report.trigger_type = order.trigger_type();
+    report.avg_px = avg_px;
+    report.display_qty = order.display_qty();
+    report.post_only = order.is_post_only();
+    report.reduce_only = order.is_reduce_only();
+    Some(report)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
-
-    use nautilus_common::cache::Cache;
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
-        enums::AccountType,
-        identifiers::{AccountId, ClientId, TraderId},
+        enums::{LiquiditySide, OrderSide, OrderType, TimeInForce},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
+        },
+        orders::OrderTestBuilder,
+        reports::FillReport,
+        types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
 
     use super::*;
-    use crate::{common::enums::KrakenProductType, config::KrakenExecClientConfig};
 
-    fn create_test_core() -> ExecutionClientCore {
-        let cache = Rc::new(RefCell::new(Cache::default()));
-        ExecutionClientCore::new(
-            TraderId::from("TESTER-001"),
-            ClientId::from("KRAKEN"),
-            *KRAKEN_VENUE,
-            OmsType::Netting,
+    const TEST_INSTRUMENT_ID: &str = "PF_XBTUSD.KRAKEN";
+
+    #[tokio::test]
+    async fn test_cancel_order_for_futures_missing_cached_instrument_returns_canonical_error() {
+        let http = KrakenFuturesHttpClient::default();
+        let instrument_id = InstrumentId::from(TEST_INSTRUMENT_ID);
+        let client_order_id = ClientOrderId::from("C-001");
+        let venue_order_id = VenueOrderId::from("V-001");
+
+        let result = cancel_order_for_futures(
+            &http,
             AccountId::from("KRAKEN-001"),
-            AccountType::Margin,
+            instrument_id,
+            Some(client_order_id),
+            Some(venue_order_id),
+        )
+        .await;
+
+        match result {
+            Err(CommandFailure::NotSent(reason)) => {
+                assert_eq!(
+                    reason,
+                    InstrumentLookupError::not_found(instrument_id).to_string()
+                );
+            }
+            _ => panic!("Expected local validation failure"),
+        }
+    }
+
+    #[rstest]
+    fn test_batch_cancel_item_for_futures_missing_cached_instrument_returns_canonical_error() {
+        let http = KrakenFuturesHttpClient::default();
+        let instrument_id = InstrumentId::from(TEST_INSTRUMENT_ID);
+        let cancel = CancelOrder::new(
+            TraderId::from("TESTER-001"),
             None,
-            cache,
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("C-001"),
+            Some(VenueOrderId::from("V-001")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        let result = batch_cancel_item_for_futures(&http, &cancel);
+
+        match result {
+            Err(CommandFailure::NotSent(reason)) => {
+                assert_eq!(
+                    reason,
+                    InstrumentLookupError::not_found(instrument_id).to_string()
+                );
+            }
+            _ => panic!("Expected local validation failure"),
+        }
+    }
+
+    fn make_fill(
+        venue_order_id: &str,
+        client_order_id: Option<&str>,
+        quantity: &str,
+        price: &str,
+        ts_event: u64,
+    ) -> FillReport {
+        FillReport::new(
+            AccountId::from("KRAKEN-001"),
+            InstrumentId::from(TEST_INSTRUMENT_ID),
+            VenueOrderId::from(venue_order_id),
+            TradeId::from(format!("T-{ts_event}").as_str()),
+            OrderSide::Buy,
+            Quantity::from(quantity),
+            Price::from(price),
+            Money::from_decimal(Decimal::ZERO, Currency::USD()).unwrap(),
+            LiquiditySide::Taker,
+            client_order_id.map(ClientOrderId::from),
+            None,
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_event),
+            None,
         )
     }
 
-    #[rstest]
-    fn test_futures_exec_client_new() {
-        let config = KrakenExecClientConfig {
-            product_type: KrakenProductType::Futures,
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            ..Default::default()
-        };
+    fn make_cmd(
+        client_order_id: Option<&str>,
+        venue_order_id: Option<&str>,
+    ) -> GenerateOrderStatusReport {
+        GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from(TEST_INSTRUMENT_ID)),
+            client_order_id.map(ClientOrderId::from),
+            venue_order_id.map(VenueOrderId::from),
+            None,
+            None,
+        )
+    }
 
-        let client = KrakenFuturesExecutionClient::new(create_test_core(), config);
-        assert!(client.is_ok());
-
-        let client = client.unwrap();
-        assert_eq!(client.client_id(), ClientId::from("KRAKEN"));
-        assert_eq!(client.account_id(), AccountId::from("KRAKEN-001"));
-        assert_eq!(client.venue(), *KRAKEN_VENUE);
-        assert!(!client.is_connected());
+    fn make_order(client_order_id: &str) -> OrderAny {
+        OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from(TEST_INSTRUMENT_ID))
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .time_in_force(TimeInForce::Ioc)
+            .build()
     }
 
     #[rstest]
-    fn test_futures_exec_client_start_stop() {
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        nautilus_common::live::runner::set_exec_event_sender(sender);
+    fn test_synthesize_filled_order_status_report_matches_full_fill_by_venue_order_id() {
+        let order = make_order("O-123456");
+        let cmd = make_cmd(Some("O-123456"), Some("KRAKEN-789"));
+        let fills = vec![
+            make_fill("KRAKEN-789", Some("O-123456"), "40", "50000.0", 1),
+            make_fill("KRAKEN-789", Some("O-123456"), "60", "50010.0", 2),
+            make_fill("KRAKEN-OTHER", Some("O-123456"), "999", "1.0", 3),
+        ];
 
-        let config = KrakenExecClientConfig {
-            product_type: KrakenProductType::Futures,
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            ..Default::default()
-        };
+        let report = synthesize_filled_order_status_report(&cmd, &order, &fills)
+            .expect("expected a filled report");
 
-        let mut client = KrakenFuturesExecutionClient::new(create_test_core(), config).unwrap();
+        assert_eq!(report.venue_order_id, VenueOrderId::from("KRAKEN-789"));
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("O-123456"))
+        );
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(report.time_in_force, TimeInForce::Ioc);
+        assert_eq!(report.quantity, Quantity::from("100"));
+        assert_eq!(report.filled_qty, Quantity::from("100"));
+        assert_eq!(
+            report.avg_px,
+            Some(Decimal::from_str_exact("50006.0").unwrap())
+        );
+    }
 
-        assert!(client.start().is_ok());
-        assert!(client.stop().is_ok());
-        assert!(!client.is_connected());
+    #[rstest]
+    fn test_synthesize_filled_order_status_report_requires_full_fill_size() {
+        let order = make_order("O-123457");
+        let cmd = make_cmd(Some("O-123457"), Some("KRAKEN-790"));
+        let fills = vec![make_fill(
+            "KRAKEN-790",
+            Some("O-123457"),
+            "40",
+            "50000.0",
+            1,
+        )];
+
+        assert!(synthesize_filled_order_status_report(&cmd, &order, &fills).is_none());
+    }
+
+    #[rstest]
+    fn test_synthesize_filled_order_status_report_matches_truncated_client_order_id() {
+        let long_client_order_id = "O202602270023210040011";
+        let order = make_order(long_client_order_id);
+        let cmd = make_cmd(Some(long_client_order_id), None);
+        let fills = vec![make_fill(
+            "KRAKEN-791",
+            Some(truncate_cl_ord_id(&ClientOrderId::from(long_client_order_id)).as_str()),
+            "100",
+            "50000.0",
+            1,
+        )];
+
+        let report = synthesize_filled_order_status_report(&cmd, &order, &fills)
+            .expect("expected a filled report");
+
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from(long_client_order_id))
+        );
+        assert_eq!(report.venue_order_id, VenueOrderId::from("KRAKEN-791"));
+        assert_eq!(report.order_status, OrderStatus::Filled);
     }
 }

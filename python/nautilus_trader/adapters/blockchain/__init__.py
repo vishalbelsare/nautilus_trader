@@ -12,21 +12,28 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Integration adapter for blockchain and DeFi venues.
+"""
 
 from __future__ import annotations
 
+from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.blockchain import *  # noqa: F403 (undefined-local-with-import-star)
 
 
-def _reassign_module_names() -> None:
-    for _name, _obj in list(globals().items()):
-        module = getattr(_obj, "__module__", "")
-        if module.startswith("nautilus_trader.core.nautilus_pyo3.blockchain"):
-            try:
-                _obj.__module__ = __name__
-            except (AttributeError, TypeError):
-                continue
+__all__ = [
+    "BlockchainChainAnchorConfig",
+    "BlockchainDataClientConfig",
+    "BlockchainDataClientFactory",
+    "BlockchainExecutionClientConfig",
+    "BlockchainProviderIdentity",
+    "BlockchainVerificationConfig",
+    "BlockchainVerificationProviderConfig",
+    "DexPoolFilters",
+    "QuoteSpendLimit",
+    "load_pool_snapshot",
+]
 
-
-_reassign_module_names()
-del _reassign_module_names
+fixup_module_names(globals(), __name__)
+del fixup_module_names

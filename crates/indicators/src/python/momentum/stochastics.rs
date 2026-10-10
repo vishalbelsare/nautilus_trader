@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::data::Bar;
 use pyo3::prelude::*;
 
@@ -20,43 +21,42 @@ use crate::{
     average::MovingAverageType,
     indicator::Indicator,
     momentum::stochastics::{Stochastics, StochasticsDMethod},
+    python::float_precision,
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl StochasticsDMethod {
+    const fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Stochastics {
-    /// Creates a new Stochastics indicator.
+    /// Stochastic oscillator with smoothed K and D outputs.
     ///
-    /// Parameters
-    /// ----------
-    /// period_k : int
-    ///     The lookback period for %K calculation (highest high / lowest low).
-    /// period_d : int
-    ///     The smoothing period for %D calculation.
-    /// slowing : int, optional
-    ///     The slowing period for %K smoothing. Default is 1 (no slowing).
-    ///     Use >1 for MA smoothed %K.
-    /// ma_type : MovingAverageType, optional
-    ///     The MA type for slowing and MA-based %D. Default is Exponential.
-    /// d_method : StochasticsDMethod, optional
-    ///     The %D calculation method. Default is Ratio (Nautilus original).
-    ///     Use MovingAverage for MA smoothed %D.
+    /// Defaults to `slowing = 1`, `ma_type = Simple`, and `d_method = MovingAverage`,
+    /// so D is a simple moving average of K. Select `StochasticsDMethod.Ratio`
+    /// for the legacy Nautilus range-weighted D calculation.
     #[new]
     #[pyo3(signature = (period_k, period_d, slowing=None, ma_type=None, d_method=None))]
-    #[must_use]
     pub fn py_new(
         period_k: usize,
         period_d: usize,
         slowing: Option<usize>,
         ma_type: Option<MovingAverageType>,
         d_method: Option<StochasticsDMethod>,
-    ) -> Self {
-        Self::new_with_params(
+    ) -> PyResult<Self> {
+        Self::new_checked(
             period_k,
             period_d,
-            slowing.unwrap_or(1),
-            ma_type.unwrap_or(MovingAverageType::Exponential),
-            d_method.unwrap_or(StochasticsDMethod::Ratio),
+            slowing.unwrap_or(Self::DEFAULT_SLOWING),
+            ma_type.unwrap_or(Self::DEFAULT_MA_TYPE),
+            d_method.unwrap_or(Self::DEFAULT_D_METHOD),
         )
+        .map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -126,14 +126,23 @@ impl Stochastics {
         self.initialized
     }
 
+    /// Updates the indicator with raw price values.
+    ///
+    /// # Parameters
+    ///
+    /// - `high`: The high price for the period.
+    /// - `low`: The low price for the period.
+    /// - `close`: The close price for the period.
     #[pyo3(name = "update_raw")]
     fn py_update_raw(&mut self, high: f64, low: f64, close: f64) {
         self.update_raw(high, low, close);
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
         self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

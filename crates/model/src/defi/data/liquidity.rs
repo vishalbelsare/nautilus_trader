@@ -46,7 +46,7 @@ use crate::{
         frozen,
         eq,
         eq_int,
-        module = "nautilus_trader.core.nautilus_pyo3.model",
+        module = "nautilus_trader.model",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -68,7 +68,7 @@ pub enum PoolLiquidityUpdateType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -87,6 +87,9 @@ pub struct PoolLiquidityUpdate {
     pub kind: PoolLiquidityUpdateType,
     /// The blockchain block number where the liquidity update occurred.
     pub block: u64,
+    /// The hash of the block observed when this update was ingested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
     /// The unique hash identifier of the blockchain transaction containing the liquidity update.
     pub transaction_hash: String,
     /// The index position of the transaction within the block.
@@ -107,16 +110,16 @@ pub struct PoolLiquidityUpdate {
     pub tick_lower: i32,
     /// The upper price tick boundary of the liquidity position.
     pub tick_upper: i32,
-    /// The timestamp of the liquidity update in Unix nanoseconds.
-    pub timestamp: Option<UnixNanos>,
+    /// UNIX timestamp (nanoseconds) when the liquidity update event occurred.
+    pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was created.
-    pub ts_init: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
 }
 
 impl PoolLiquidityUpdate {
     /// Creates a new [`PoolLiquidityUpdate`] instance with the specified properties.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub const fn new(
         chain: SharedChain,
         dex: SharedDex,
@@ -134,7 +137,8 @@ impl PoolLiquidityUpdate {
         amount1: U256,
         tick_lower: i32,
         tick_upper: i32,
-        timestamp: Option<UnixNanos>,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
     ) -> Self {
         Self {
             chain,
@@ -143,6 +147,7 @@ impl PoolLiquidityUpdate {
             pool_identifier,
             kind,
             block,
+            block_hash: None,
             transaction_hash,
             transaction_index,
             log_index,
@@ -153,8 +158,8 @@ impl PoolLiquidityUpdate {
             amount1,
             tick_lower,
             tick_upper,
-            timestamp,
-            ts_init: timestamp,
+            ts_event,
+            ts_init,
         }
     }
 }

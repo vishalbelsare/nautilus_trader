@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Bar, BarSpecification, BarType, CustomData, CustomDataTrait, DEPTH10_LEN, DataType, HasTsInit,
-    InstrumentStatus, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+    InstrumentStatus, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     close::InstrumentClose, register_custom_data_json,
 };
 use crate::{
@@ -58,7 +58,7 @@ impl Default for TradeTick {
             instrument_id: InstrumentId::from("AUDUSD.SIM"),
             price: Price::from("1.00000"),
             size: Quantity::from(100_000),
-            aggressor_side: AggressorSide::Buyer,
+            aggressor_side: AggressorSide::Buy,
             trade_id: TradeId::new("123456789"),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
@@ -207,62 +207,56 @@ pub fn stub_deltas() -> OrderBookDeltas {
 }
 
 #[fixture]
-pub fn stub_depth10() -> OrderBookDepth10 {
+pub fn stub_depth10() -> OrderBookDepth {
+    stub_depth(DEPTH10_LEN)
+}
+
+/// Creates a depth snapshot with the requested number of levels per side.
+#[must_use]
+pub fn stub_depth(levels: usize) -> OrderBookDepth {
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let flags = 0;
     let sequence = 0;
     let ts_event = 1;
     let ts_init = 2;
 
-    let mut bids: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
-    let mut asks: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
+    let mut bids = Vec::with_capacity(levels);
+    let mut asks = Vec::with_capacity(levels);
 
-    // Create bids
     let mut price = 99.00;
     let mut quantity = 100.0;
-    let mut order_id = 1;
 
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..DEPTH10_LEN {
-        let order = BookOrder::new(
+    for i in 0..levels {
+        bids.push(BookOrder::new(
             OrderSide::Buy,
             Price::new(price, 2),
             Quantity::new(quantity, 0),
-            order_id,
-        );
-
-        bids[i] = order;
+            (i + 1) as u64,
+        ));
 
         price -= 1.0;
         quantity += 100.0;
-        order_id += 1;
     }
 
-    // Create asks
     let mut price = 100.00;
     let mut quantity = 100.0;
-    let mut order_id = 11;
 
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..DEPTH10_LEN {
-        let order = BookOrder::new(
+    for i in 0..levels {
+        asks.push(BookOrder::new(
             OrderSide::Sell,
             Price::new(price, 2),
             Quantity::new(quantity, 0),
-            order_id,
-        );
-
-        asks[i] = order;
+            (i + levels + 1) as u64,
+        ));
 
         price += 1.0;
         quantity += 100.0;
-        order_id += 1;
     }
 
-    let bid_counts: [u32; DEPTH10_LEN] = [1; DEPTH10_LEN];
-    let ask_counts: [u32; DEPTH10_LEN] = [1; DEPTH10_LEN];
+    let bid_counts = vec![1; levels];
+    let ask_counts = vec![1; levels];
 
-    OrderBookDepth10::new(
+    OrderBookDepth::new(
         instrument_id,
         bids,
         asks,
@@ -312,12 +306,12 @@ pub fn quote_audusd() -> QuoteTick {
 }
 
 #[fixture]
-pub fn stub_trade_ethusdt_buyer() -> TradeTick {
+pub fn stub_trade_ethusdt_buy() -> TradeTick {
     TradeTick {
         instrument_id: InstrumentId::from("ETHUSDT-PERP.BINANCE"),
         price: Price::from("10000.0000"),
         size: Quantity::from("1.00000000"),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::new("123456789"),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::from(1),
@@ -384,9 +378,11 @@ pub struct OrderBookDeltaTestBuilder {
     flags: Option<u8>,
     sequence: Option<u64>,
     ts_event: Option<UnixNanos>,
+    ts_init: Option<UnixNanos>,
 }
 
 impl OrderBookDeltaTestBuilder {
+    #[must_use]
     pub fn new(instrument_id: InstrumentId) -> Self {
         Self {
             instrument_id,
@@ -395,6 +391,7 @@ impl OrderBookDeltaTestBuilder {
             flags: None,
             sequence: None,
             ts_event: None,
+            ts_init: None,
         }
     }
 
@@ -444,6 +441,12 @@ impl OrderBookDeltaTestBuilder {
         self
     }
 
+    pub fn ts_init(&mut self, ts_init: UnixNanos) -> &mut Self {
+        self.ts_init = Some(ts_init);
+        self
+    }
+
+    #[must_use]
     pub fn build(&self) -> OrderBookDelta {
         OrderBookDelta::new(
             self.instrument_id,
@@ -452,7 +455,7 @@ impl OrderBookDeltaTestBuilder {
             self.get_flags(),
             self.get_sequence(),
             self.ts_event.unwrap_or(UnixNanos::from(1)),
-            UnixNanos::from(2),
+            self.ts_init.unwrap_or(UnixNanos::from(2)),
         )
     }
 }
@@ -509,6 +512,7 @@ pub fn ensure_stub_custom_data_registered() {
 }
 
 /// Builds a `CustomData` stub for tests (e.g. Redis add/load).
+#[must_use]
 pub fn stub_custom_data(
     ts_init: u64,
     value: i64,

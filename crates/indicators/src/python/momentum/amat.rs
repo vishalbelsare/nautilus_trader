@@ -13,25 +13,28 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 use pyo3::prelude::*;
 
 use crate::{
     average::MovingAverageType, indicator::Indicator, momentum::amat::ArcherMovingAveragesTrends,
+    python::float_precision,
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl ArcherMovingAveragesTrends {
+    /// Creates a new `ArcherMovingAveragesTrends` instance.
     #[new]
     #[pyo3(signature = (fast_period, slow_period, signal_period, ma_type=None))]
-    #[must_use]
     pub fn py_new(
         fast_period: usize,
         slow_period: usize,
         signal_period: usize,
         ma_type: Option<MovingAverageType>,
-    ) -> Self {
-        Self::new(fast_period, slow_period, signal_period, ma_type)
+    ) -> PyResult<Self> {
+        Self::new_checked(fast_period, slow_period, signal_period, ma_type).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -89,24 +92,27 @@ impl ArcherMovingAveragesTrends {
         self.initialized
     }
 
+    /// Updates the indicator with a new raw price value.
     #[pyo3(name = "update_raw")]
     fn py_update_raw(&mut self, close: f64) {
         self.update_raw(close);
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    const fn py_handle_quote_tick(&mut self, _quote: &QuoteTick) {
-        // Function body intentionally left blank.
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
-    const fn py_handle_trade_tick(&mut self, _trade: &TradeTick) {
-        // Function body intentionally left blank.
+    fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
+        self.handle_trade(trade);
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
         self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

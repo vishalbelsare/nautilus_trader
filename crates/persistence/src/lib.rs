@@ -18,15 +18,13 @@
 //! The `nautilus-persistence` crate provides data persistence capabilities for storing and retrieving
 //! trading data, state, and configuration.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -36,22 +34,34 @@
 //! or as part of a Rust only build.
 //!
 //! - `cloud`: Enables cloud storage backends (S3, Azure, GCP, HTTP) via `object_store`.
-//! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `cloud`).
-//! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
-//! - `extension-module`: Builds the crate as a Python extension module.
+//! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision`: Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `cloud`.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(nonstandard_style)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(rustdoc::broken_intra_doc_links)]
 // #![deny(clippy::missing_errors_doc)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod backend;
-#[cfg(feature = "python")]
+pub mod catalog;
+pub mod common;
 pub mod config;
-pub mod parquet;
+pub mod errors;
 pub mod test_data;
+pub mod writer;
 
 #[cfg(feature = "python")]
 pub mod python;

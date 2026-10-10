@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use super::transform_returns;
@@ -31,6 +32,12 @@ impl CAGR {
     /// Formula: CAGR = (Ending Value / Beginning Value)^(Period/Days) - 1
     ///
     /// For returns: CAGR = ((1 + Total Return)^(Period/Days)) - 1
+    ///
+    /// # References
+    ///
+    /// - Bacon, C. R. (2008). *Practical Portfolio Performance Measurement and Attribution*
+    ///   (2nd ed.). Wiley.
+    /// - CFA Institute Level I Curriculum: Quantitative Methods
     #[new]
     #[pyo3(signature = (period=None))]
     fn py_new(period: Option<usize>) -> Self {
@@ -44,9 +51,19 @@ impl CAGR {
     }
 
     #[pyo3(name = "calculate_from_returns")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_calculate_from_returns(&self, raw_returns: BTreeMap<u64, f64>) -> Option<f64> {
         self.calculate_from_returns(&transform_returns(&raw_returns))
+    }
+
+    #[pyo3(name = "calculate_from_realized_pnls")]
+    fn py_calculate_from_realized_pnls(&self, _realized_pnls: Vec<f64>) -> Option<f64> {
+        None
+    }
+
+    #[pyo3(name = "calculate_from_positions")]
+    fn py_calculate_from_positions(&self, _positions: Vec<Position>) -> Option<f64> {
+        None
     }
 
     fn __repr__(&self) -> String {

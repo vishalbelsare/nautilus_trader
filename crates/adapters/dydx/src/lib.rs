@@ -15,30 +15,27 @@
 
 //! [NautilusTrader](https://nautilustrader.io) adapter for the [dYdX](https://dydx.trade/) decentralized derivatives exchange.
 //!
-//! The `nautilus-dydx` crate provides client bindings (HTTP, WebSocket & gRPC), data
-//! models, and helper utilities that wrap the official **dYdX v4 API**.
+//! The `nautilus-dydx` crate provides client bindings (HTTP, WebSocket & gRPC) and data
+//! models for the official **dYdX v4 API**.
 //!
 //! # Official Documentation
 //!
 //! | Resource                             | Reference                                              |
 //! |--------------------------------------|--------------------------------------------------------|
 //! | Main documentation                   | <https://docs.dydx.xyz>                                |
-//! | Indexer HTTP API                     | <https://docs.dydx.xyz/api_integration-indexer/indexer_api> |
-//! | Indexer WebSocket API                | <https://docs.dydx.xyz/api_integration-indexer/indexer_websocket> |
+//! | Indexer HTTP API                     | <https://docs.dydx.xyz/indexer-client/http> |
+//! | Indexer WebSocket API                | <https://docs.dydx.xyz/indexer-client/websockets> |
 //! | Order types                          | <https://docs.dydx.xyz/concepts/trading/orders>        |
 //! | Permissioned keys                    | <https://docs.dydx.xyz/concepts/trading/authenticators> |
-//! | Validator client (gRPC)              | <https://docs.dydx.xyz/api_integration-clients/validator_client> |
+//! | Validator client (gRPC)              | <https://docs.dydx.xyz/node-client> |
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software
-//! correctness and safety at the highest level, with the aim of supporting mission-critical trading
-//! system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -47,10 +44,12 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `examples`: Enables the crate's example binaries.
 //! - `extension-module`: Builds as a Python extension module.
-//!
-//! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
+//! - `high-precision` (default): Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -59,6 +58,9 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod common;
 pub mod config;

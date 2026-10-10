@@ -25,15 +25,13 @@
 //! - **Trading controls**: Rate limiting, balance validation, and exposure management.
 //! - **Account protection**: Multi-currency balance checks and margin requirement validation.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -42,10 +40,12 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `extension-module`: Builds as a Python extension module.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::clone_on_ref_ptr)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -53,9 +53,16 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 pub mod engine;
 pub mod sizing;
+
+#[cfg(feature = "python")]
+pub mod python;
 
 // Re-exports
 pub use engine::RiskEngine;

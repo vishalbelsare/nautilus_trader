@@ -16,7 +16,7 @@
 //! Error structures and enumerations for the Bybit integration.
 //!
 //! The JSON error schema is described in the Bybit documentation under
-//! *Error Codes* – <https://bybit-exchange.github.io/docs/v5/error>.
+//! *Error Codes* - <https://bybit-exchange.github.io/docs/v5/error>.
 //! The types below mirror that structure and are reused across the entire
 //! crate.
 
@@ -95,6 +95,57 @@ pub enum BybitHttpError {
     UnexpectedStatus { status: u16, body: String },
 }
 
+/// Error raised while submitting a Bybit order.
+#[derive(Debug, Error)]
+pub enum BybitSubmitOrderError {
+    /// Bybit accepted the request envelope, but did not return an order ID.
+    #[error("No order_id in response")]
+    MissingOrderId,
+    /// Bybit returned an order that is rejected with no fills.
+    #[error("Order rejected: {reason}")]
+    Rejected {
+        /// Venue reject reason.
+        reason: String,
+    },
+    /// Bybit returned an order ID, but the immediate order lookup failed.
+    #[error("Order lookup failed after submission: {source}")]
+    PostSubmitLookup {
+        /// Source lookup error.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// Error raised after Bybit accepts a cancel request envelope.
+#[derive(Debug, Error)]
+pub enum BybitCancelOrderError {
+    /// Bybit accepted the request envelope, but did not return an order ID.
+    #[error("No order_id in cancel response")]
+    MissingOrderId,
+    /// Bybit returned an order ID, but the immediate order lookup failed.
+    #[error("Order lookup failed after cancellation: {source}")]
+    PostCancelLookup {
+        /// Source lookup error.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// Error raised after Bybit accepts a modify request envelope.
+#[derive(Debug, Error)]
+pub enum BybitModifyOrderError {
+    /// Bybit accepted the request envelope, but did not return an order ID.
+    #[error("No order_id in amend response")]
+    MissingOrderId,
+    /// Bybit returned an order ID, but the immediate order lookup failed.
+    #[error("Order lookup failed after amendment: {source}")]
+    PostModifyLookup {
+        /// Source lookup error.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 impl From<HttpClientError> for BybitHttpError {
     fn from(error: HttpClientError) -> Self {
         Self::NetworkError(error.to_string())
@@ -122,6 +173,13 @@ impl From<BybitErrorResponse> for BybitHttpError {
             message: error.ret_msg,
         }
     }
+}
+
+pub(crate) fn is_bybit_ambiguous_order_error_code(code: i64) -> bool {
+    matches!(
+        code,
+        10000 | 10016 | 10019 | 170001 | 170007 | 170032 | 20006 | 500000
+    )
 }
 
 #[cfg(test)]
@@ -181,6 +239,25 @@ mod tests {
     }
 
     #[rstest]
+    #[case(10000, true)]
+    #[case(10016, true)]
+    #[case(10019, true)]
+    #[case(170001, true)]
+    #[case(170007, true)]
+    #[case(170032, true)]
+    #[case(20006, true)]
+    #[case(500000, true)]
+    #[case(429, false)]
+    #[case(10006, false)]
+    #[case(10403, false)]
+    #[case(10429, false)]
+    #[case(170005, false)]
+    #[case(20003, false)]
+    fn test_order_error_ambiguity(#[case] code: i64, #[case] expected: bool) {
+        assert_eq!(is_bybit_ambiguous_order_error_code(code), expected);
+    }
+
+    #[rstest]
     fn test_unexpected_status_error() {
         let error = BybitHttpError::UnexpectedStatus {
             status: 502,
@@ -189,6 +266,27 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Unexpected HTTP status code 502: Server error"
+        );
+    }
+
+    #[rstest]
+    fn test_bybit_submit_order_error_display() {
+        let missing_order_id = BybitSubmitOrderError::MissingOrderId;
+        let rejected = BybitSubmitOrderError::Rejected {
+            reason: "EC_PostOnlyWillTakeLiquidity".to_string(),
+        };
+        let post_submit_lookup = BybitSubmitOrderError::PostSubmitLookup {
+            source: anyhow::anyhow!("No order returned after submission"),
+        };
+
+        assert_eq!(missing_order_id.to_string(), "No order_id in response");
+        assert_eq!(
+            rejected.to_string(),
+            "Order rejected: EC_PostOnlyWillTakeLiquidity"
+        );
+        assert_eq!(
+            post_submit_lookup.to_string(),
+            "Order lookup failed after submission: No order returned after submission"
         );
     }
 }

@@ -31,6 +31,7 @@ use ustr::Ustr;
 
 use crate::{
     common::{
+        consts::{METHOD_GET_ACCOUNT_DETAILS, METHOD_LIST_MARKET_CATALOGUE},
         enums::MarketProjection,
         parse::{extract_market_id, parse_betfair_timestamp, parse_market_catalogue},
         types::MarketId,
@@ -285,7 +286,7 @@ pub async fn load_instruments(
     let filtered: Vec<&FlattenedMarket> =
         all_markets.iter().filter(|m| filter.matches(m)).collect();
 
-    log::info!("Found {} markets matching filter", filtered.len());
+    log::debug!("Found {} markets matching filter", filtered.len());
 
     let market_ids: Vec<MarketId> = filtered
         .iter()
@@ -329,7 +330,7 @@ pub async fn load_instruments(
         };
 
         let catalogues: Vec<MarketCatalogue> = client
-            .send_betting("SportsAPING/v1.0/listMarketCatalogue", &params)
+            .send_betting(METHOD_LIST_MARKET_CATALOGUE, &params)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -343,7 +344,7 @@ pub async fn load_instruments(
         }
     }
 
-    log::info!("Loaded {} instruments", all_instruments.len());
+    log::debug!("Loaded {} instruments", all_instruments.len());
     Ok(all_instruments)
 }
 
@@ -395,17 +396,14 @@ impl BetfairInstrumentProvider {
     pub async fn get_account_currency(&self) -> anyhow::Result<Currency> {
         let details: AccountDetailsResponse = self
             .http_client
-            .send_accounts(
-                "AccountAPING/v1.0/getAccountDetails",
-                &serde_json::json!({}),
-            )
+            .send_accounts(METHOD_GET_ACCOUNT_DETAILS, &serde_json::json!({}))
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let code = details
             .currency_code
             .ok_or_else(|| anyhow::anyhow!("No currency_code in account details"))?;
-        code.as_str().parse::<Currency>()
+        Ok(code.parse::<Currency>()?)
     }
 
     /// Builds an effective filter by merging runtime overrides with the base filter.
@@ -500,13 +498,14 @@ impl InstrumentProvider for BetfairInstrumentProvider {
 
         let catalogues: Vec<MarketCatalogue> = self
             .http_client
-            .send_betting("SportsAPING/v1.0/listMarketCatalogue", &params)
+            .send_betting(METHOD_LIST_MARKET_CATALOGUE, &params)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         for catalogue in &catalogues {
             let instruments =
                 parse_market_catalogue(catalogue, self.currency, ts_init, self.min_notional)?;
+
             for inst in instruments {
                 self.store.add(inst);
             }

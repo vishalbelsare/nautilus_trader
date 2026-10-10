@@ -13,14 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Testing helpers shared across dYdX adapter tests.
+//! Shared fixture loading for dYdX adapter tests.
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
 /// Returns the path to the adapter's `test_data` directory.
-pub fn test_data_path() -> PathBuf {
+pub(crate) fn test_data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
 }
 
@@ -29,7 +29,7 @@ pub fn test_data_path() -> PathBuf {
 /// # Panics
 ///
 /// Panics if the file cannot be read or contains invalid JSON.
-pub fn load_json_fixture(filename: &str) -> Value {
+pub(crate) fn load_json_fixture(filename: &str) -> Value {
     let path = test_data_path().join(filename);
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("Failed to read test data file: {}", path.display()));
@@ -38,13 +38,13 @@ pub fn load_json_fixture(filename: &str) -> Value {
 
 /// Loads a JSON fixture and returns the `result` field when present.
 ///
-/// Many dYdX HTTP endpoints wrap payloads in a `result` envelope. This helper
+/// Many dYdX HTTP endpoints wrap payloads in a `result` envelope. This loader
 /// returns the inner payload if it exists, otherwise the root JSON value.
 ///
 /// # Panics
 ///
 /// Panics if the file cannot be read or contains invalid JSON.
-pub fn load_json_result_fixture(filename: &str) -> Value {
+pub(crate) fn load_json_result_fixture(filename: &str) -> Value {
     let json = load_json_fixture(filename);
     json.get("result").cloned().unwrap_or(json)
 }

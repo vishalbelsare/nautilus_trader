@@ -16,27 +16,32 @@
 //! WebSocket message parsers for converting Kraken streaming data to Nautilus domain models.
 
 use anyhow::Context;
+use jiff::Timestamp;
 use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, BookOrder, OrderBookDelta, QuoteTick, TradeTick},
     enums::{
         AggregationSource, AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide,
-        OrderStatus, OrderType, PriceType, TimeInForce, TriggerType,
+        OrderStatus, OrderType, PriceType, RecordFlag, TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{Money, Price, Quantity},
 };
+use rust_decimal::Decimal;
 
 use super::{
     enums::{KrakenExecType, KrakenLiquidityInd, KrakenWsOrderStatus},
     messages::{
-        KrakenWsBookData, KrakenWsBookLevel, KrakenWsExecutionData, KrakenWsOhlcData,
-        KrakenWsTickerData, KrakenWsTradeData,
+        KrakenSpotWsMessage, KrakenWsBookData, KrakenWsBookLevel, KrakenWsExecutionData,
+        KrakenWsOhlcData, KrakenWsOrderResponse, KrakenWsTickerData, KrakenWsTradeData,
     },
 };
-use crate::common::enums::{KrakenOrderSide, KrakenOrderType, KrakenTimeInForce};
+use crate::common::{
+    enums::{KrakenOrderSide, KrakenOrderType, KrakenTimeInForce},
+    parse::get_currency,
+};
 
 /// Parses Kraken WebSocket ticker data into a Nautilus quote tick.
 ///
@@ -53,22 +58,23 @@ pub fn parse_quote_tick(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let bid_price = Price::new_checked(ticker.bid, price_precision).with_context(|| {
+    let bid_price = Price::from_decimal_dp(ticker.bid, price_precision).with_context(|| {
         format!("Failed to construct bid Price with precision {price_precision}")
     })?;
-    let bid_size = Quantity::new_checked(ticker.bid_qty, size_precision).with_context(|| {
-        format!("Failed to construct bid Quantity with precision {size_precision}")
-    })?;
+    let bid_size =
+        Quantity::from_decimal_dp(ticker.bid_qty, size_precision).with_context(|| {
+            format!("Failed to construct bid Quantity with precision {size_precision}")
+        })?;
 
-    let ask_price = Price::new_checked(ticker.ask, price_precision).with_context(|| {
+    let ask_price = Price::from_decimal_dp(ticker.ask, price_precision).with_context(|| {
         format!("Failed to construct ask Price with precision {price_precision}")
     })?;
-    let ask_size = Quantity::new_checked(ticker.ask_qty, size_precision).with_context(|| {
-        format!("Failed to construct ask Quantity with precision {size_precision}")
-    })?;
+    let ask_size =
+        Quantity::from_decimal_dp(ticker.ask_qty, size_precision).with_context(|| {
+            format!("Failed to construct ask Quantity with precision {size_precision}")
+        })?;
 
-    // Kraken ticker doesn't include timestamp
-    let ts_event = ts_init;
+    let ts_event = datetime_to_nanos(ticker.timestamp, "ticker.timestamp")?;
 
     Ok(QuoteTick::new(
         instrument_id,
@@ -97,18 +103,18 @@ pub fn parse_trade_tick(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let price = Price::new_checked(trade.price, price_precision)
+    let price = Price::from_decimal_dp(trade.price, price_precision)
         .with_context(|| format!("Failed to construct Price with precision {price_precision}"))?;
-    let size = Quantity::new_checked(trade.qty, size_precision)
+    let size = Quantity::from_decimal_dp(trade.qty, size_precision)
         .with_context(|| format!("Failed to construct Quantity with precision {size_precision}"))?;
 
     let aggressor = match trade.side {
-        KrakenOrderSide::Buy => AggressorSide::Buyer,
-        KrakenOrderSide::Sell => AggressorSide::Seller,
+        KrakenOrderSide::Buy => AggressorSide::Buy,
+        KrakenOrderSide::Sell => AggressorSide::Sell,
     };
 
     let trade_id = TradeId::new_checked(trade.trade_id.to_string())?;
-    let ts_event = parse_rfc3339_timestamp(&trade.timestamp, "trade.timestamp")?;
+    let ts_event = datetime_to_nanos(trade.timestamp, "trade.timestamp")?;
 
     TradeTick::new_checked(
         instrument_id,
@@ -135,101 +141,151 @@ pub fn parse_book_deltas(
     book: &KrakenWsBookData,
     instrument: &InstrumentAny,
     sequence: u64,
+    is_snapshot: bool,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<OrderBookDelta>> {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    // Parse timestamp if available, otherwise use ts_init
-    let ts_event = if let Some(ref timestamp) = book.timestamp {
-        parse_rfc3339_timestamp(timestamp, "book.timestamp")?
-    } else {
-        ts_init
-    };
+    let ts_event = datetime_to_nanos(book.timestamp, "book.timestamp")?;
 
-    let mut deltas = Vec::new();
     let mut current_sequence = sequence;
+    let mut deltas = Vec::new();
+
+    if is_snapshot {
+        deltas.push(OrderBookDelta::clear(
+            instrument_id,
+            current_sequence,
+            ts_event,
+            ts_init,
+        ));
+        current_sequence += 1;
+    }
 
     if let Some(ref bids) = book.bids {
-        for level in bids {
-            let delta = parse_book_level(
-                level,
-                OrderSide::Buy,
-                instrument_id,
-                price_precision,
-                size_precision,
-                current_sequence,
-                ts_event,
-                ts_init,
-            )?;
-            deltas.push(delta);
-            current_sequence += 1;
-        }
+        parse_book_side_levels(
+            bids,
+            OrderSide::Buy,
+            is_snapshot,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_event,
+            ts_init,
+            &mut current_sequence,
+            &mut deltas,
+        )?;
     }
 
     if let Some(ref asks) = book.asks {
-        for level in asks {
-            let delta = parse_book_level(
-                level,
-                OrderSide::Sell,
-                instrument_id,
-                price_precision,
-                size_precision,
-                current_sequence,
-                ts_event,
-                ts_init,
-            )?;
-            deltas.push(delta);
-            current_sequence += 1;
-        }
+        parse_book_side_levels(
+            asks,
+            OrderSide::Sell,
+            is_snapshot,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_event,
+            ts_init,
+            &mut current_sequence,
+            &mut deltas,
+        )?;
+    }
+
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
     }
 
     Ok(deltas)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
+fn parse_book_side_levels(
+    levels: &[KrakenWsBookLevel],
+    side: OrderSide,
+    is_snapshot: bool,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    current_sequence: &mut u64,
+    deltas: &mut Vec<OrderBookDelta>,
+) -> anyhow::Result<()> {
+    for level in levels {
+        let Some(delta) = parse_book_level(
+            level,
+            side,
+            is_snapshot,
+            instrument_id,
+            price_precision,
+            size_precision,
+            *current_sequence,
+            ts_event,
+            ts_init,
+        )?
+        else {
+            continue;
+        };
+        deltas.push(delta);
+        *current_sequence += 1;
+    }
+
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
 fn parse_book_level(
     level: &KrakenWsBookLevel,
     side: OrderSide,
+    is_snapshot: bool,
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
     sequence: u64,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> anyhow::Result<OrderBookDelta> {
-    let price = Price::new_checked(level.price, price_precision)
+) -> anyhow::Result<Option<OrderBookDelta>> {
+    let price = Price::from_decimal_dp(level.price, price_precision)
         .with_context(|| format!("Failed to construct Price with precision {price_precision}"))?;
-    let size = Quantity::new_checked(level.qty, size_precision)
+    let size = Quantity::from_decimal_dp(level.qty, size_precision)
         .with_context(|| format!("Failed to construct Quantity with precision {size_precision}"))?;
 
-    // Determine action based on quantity
-    let action = if size.raw == 0 {
+    let action = if is_snapshot {
+        if size.is_zero() {
+            return Ok(None);
+        }
+        BookAction::Add
+    } else if size.is_zero() {
         BookAction::Delete
     } else {
         BookAction::Update
     };
 
-    // Create order ID from price (Kraken doesn't provide order IDs)
-    let order_id = price.raw as u64;
-    let order = BookOrder::new(side, price, size, order_id);
+    let order_id = price.raw() as u64;
 
-    Ok(OrderBookDelta::new(
+    let order = BookOrder::new(side, price, size, order_id);
+    let mut flags = RecordFlag::F_MBP as u8;
+    if is_snapshot {
+        flags |= RecordFlag::F_SNAPSHOT as u8;
+    }
+
+    Ok(Some(OrderBookDelta::new(
         instrument_id,
         action,
         order,
-        0, // flags
+        flags,
         sequence,
         ts_event,
         ts_init,
-    ))
+    )))
 }
 
-fn parse_rfc3339_timestamp(value: &str, field: &str) -> anyhow::Result<UnixNanos> {
-    value
-        .parse::<UnixNanos>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse {field}='{value}': {e}"))
+pub(super) fn datetime_to_nanos(value: Timestamp, field: &str) -> anyhow::Result<UnixNanos> {
+    let nanos = u64::try_from(value.as_nanosecond())
+        .with_context(|| format!("Timestamp predates Unix epoch: {field}='{value}'"))?;
+    Ok(UnixNanos::from(nanos))
 }
 
 /// Parses Kraken WebSocket OHLC data into a Nautilus bar.
@@ -250,19 +306,19 @@ pub fn parse_ws_bar(
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
-    let open = Price::new_checked(ohlc.open, price_precision)?;
-    let high = Price::new_checked(ohlc.high, price_precision)?;
-    let low = Price::new_checked(ohlc.low, price_precision)?;
-    let close = Price::new_checked(ohlc.close, price_precision)?;
-    let volume = Quantity::new_checked(ohlc.volume, size_precision)?;
+    let open = Price::from_decimal_dp(ohlc.open, price_precision)?;
+    let high = Price::from_decimal_dp(ohlc.high, price_precision)?;
+    let low = Price::from_decimal_dp(ohlc.low, price_precision)?;
+    let close = Price::from_decimal_dp(ohlc.close, price_precision)?;
+    let volume = Quantity::from_decimal_dp(ohlc.volume, size_precision)?;
 
     let bar_spec = interval_to_bar_spec(ohlc.interval)?;
     let bar_type = BarType::new(instrument_id, bar_spec, AggregationSource::External);
 
     // Compute bar close time: interval_begin + interval minutes
     let interval_secs = i64::from(ohlc.interval) * 60;
-    let close_time = ohlc.interval_begin + chrono::Duration::seconds(interval_secs);
-    let ts_event = UnixNanos::from(close_time.timestamp_nanos_opt().unwrap_or(0) as u64);
+    let close_time = ohlc.interval_begin + jiff::SignedDuration::from_secs(interval_secs);
+    let ts_event = UnixNanos::from(u64::try_from(close_time.as_nanosecond()).unwrap_or(0));
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init)
 }
@@ -319,17 +375,11 @@ fn parse_order_type(order_type: Option<KrakenOrderType>) -> OrderType {
         Some(KrakenOrderType::TakeProfit) => OrderType::MarketIfTouched,
         Some(KrakenOrderType::StopLossLimit) => OrderType::StopLimit,
         Some(KrakenOrderType::TakeProfitLimit) => OrderType::LimitIfTouched,
+        // Trailing stops lack offset fields in WS reports, map to non-trailing equivalents
+        Some(KrakenOrderType::TrailingStop) => OrderType::StopMarket,
+        Some(KrakenOrderType::TrailingStopLimit) => OrderType::StopLimit,
         Some(KrakenOrderType::SettlePosition) => OrderType::Market,
         None => OrderType::Limit,
-    }
-}
-
-/// Parses Kraken order side to Nautilus order side.
-fn parse_order_side(side: Option<KrakenOrderSide>) -> OrderSide {
-    match side {
-        Some(KrakenOrderSide::Buy) => OrderSide::Buy,
-        Some(KrakenOrderSide::Sell) => OrderSide::Sell,
-        None => OrderSide::Buy,
     }
 }
 
@@ -347,6 +397,7 @@ fn parse_time_in_force(
         Some(KrakenTimeInForce::GoodTilCancelled) => TimeInForce::Gtc,
         Some(KrakenTimeInForce::ImmediateOrCancel) => TimeInForce::Ioc,
         Some(KrakenTimeInForce::GoodTilDate) => TimeInForce::Gtd,
+        Some(KrakenTimeInForce::FillOrKill) => TimeInForce::Fok,
         None => TimeInForce::Gtc,
     }
 }
@@ -364,12 +415,12 @@ pub fn parse_ws_order_status_report(
     exec: &KrakenWsExecutionData,
     instrument: &InstrumentAny,
     account_id: AccountId,
-    cached_order_qty: Option<f64>,
+    cached_order_qty: Option<Decimal>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let instrument_id = instrument.id();
     let venue_order_id = VenueOrderId::new(&exec.order_id);
-    let order_side = parse_order_side(exec.side);
+    let order_side = exec.side.map(Into::into);
     let order_type = parse_order_type(exec.order_type);
     let time_in_force = parse_time_in_force(exec.time_in_force, exec.post_only);
     let order_status = parse_order_status(exec.exec_type, exec.order_status);
@@ -380,27 +431,27 @@ pub fn parse_ws_order_status_report(
     // Quantity fallback: order_qty -> cached -> cum_qty -> last_qty (for trade snapshots)
     let last_qty = exec
         .last_qty
-        .map(|qty| Quantity::new_checked(qty, size_precision))
+        .map(|qty| Quantity::from_decimal_dp(qty, size_precision))
         .transpose()
         .context("Failed to parse last_qty")?;
 
     let filled_qty = exec
         .cum_qty
-        .map(|qty| Quantity::new_checked(qty, size_precision))
+        .map(|qty| Quantity::from_decimal_dp(qty, size_precision))
         .transpose()
         .context("Failed to parse cum_qty")?
         .or(last_qty)
-        .unwrap_or_else(|| Quantity::new(0.0, size_precision));
+        .unwrap_or_else(|| Quantity::zero(size_precision));
 
     let quantity = exec
         .order_qty
         .or(cached_order_qty)
-        .map(|qty| Quantity::new_checked(qty, size_precision))
+        .map(|qty| Quantity::from_decimal_dp(qty, size_precision))
         .transpose()
         .context("Failed to parse order_qty")?
         .unwrap_or(filled_qty);
 
-    let ts_event = parse_rfc3339_timestamp(&exec.timestamp, "execution.timestamp")?;
+    let ts_event = datetime_to_nanos(exec.timestamp, "execution.timestamp")?;
 
     let mut report = OrderStatusReport::new(
         account_id,
@@ -430,28 +481,28 @@ pub fn parse_ws_order_status_report(
     // orders we submitted (engine already has the price from submission)
     let price_value = exec
         .limit_price
-        .filter(|&p| p > 0.0)
-        .or(exec.avg_price.filter(|&p| p > 0.0))
-        .or(exec.last_price.filter(|&p| p > 0.0));
+        .filter(|p| *p > Decimal::ZERO)
+        .or(exec.avg_price.filter(|p| *p > Decimal::ZERO))
+        .or(exec.last_price.filter(|p| *p > Decimal::ZERO));
 
     if let Some(px) = price_value {
         let price =
-            Price::new_checked(px, price_precision).context("Failed to parse order price")?;
+            Price::from_decimal_dp(px, price_precision).context("Failed to parse order price")?;
         report = report.with_price(price);
     }
 
     // avg_px fallback: avg_price -> cum_cost / cum_qty -> last_price (for single trades/snapshots)
     let avg_px = exec
         .avg_price
-        .filter(|&p| p > 0.0)
+        .filter(|p| *p > Decimal::ZERO)
         .or_else(|| match (exec.cum_cost, exec.cum_qty) {
-            (Some(cost), Some(qty)) if qty > 0.0 => Some(cost / qty),
+            (Some(cost), Some(qty)) if qty > Decimal::ZERO => Some(cost / qty),
             _ => None,
         })
-        .or_else(|| exec.last_price.filter(|&p| p > 0.0));
+        .or_else(|| exec.last_price.filter(|p| *p > Decimal::ZERO));
 
     if let Some(avg_price) = avg_px {
-        report = report.with_avg_px(avg_price)?;
+        report.avg_px = Some(avg_price);
     }
 
     if exec.post_only == Some(true) {
@@ -507,21 +558,24 @@ pub fn parse_ws_fill_report(
     let trade_id =
         TradeId::new_checked(exec_id).context("Invalid exec_id in Kraken trade execution")?;
 
-    let order_side = parse_order_side(exec.side);
+    let order_side = exec
+        .side
+        .map(Into::into)
+        .context("Missing side for trade execution")?;
 
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
     let last_qty = exec
         .last_qty
-        .map(|qty| Quantity::new_checked(qty, size_precision))
+        .map(|qty| Quantity::from_decimal_dp(qty, size_precision))
         .transpose()
         .context("Failed to parse last_qty")?
         .context("Missing last_qty for trade execution")?;
 
     let last_px = exec
         .last_price
-        .map(|px| Price::new_checked(px, price_precision))
+        .map(|px| Price::from_decimal_dp(px, price_precision))
         .transpose()
         .context("Failed to parse last_price")?
         .context("Missing last_price for trade execution")?;
@@ -531,16 +585,16 @@ pub fn parse_ws_fill_report(
     // Calculate commission from fees array
     let commission = if let Some(ref fees) = exec.fees {
         if let Some(fee) = fees.first() {
-            let currency = Currency::get_or_create_crypto(&fee.asset);
-            Money::new(fee.qty.abs(), currency)
+            let currency = get_currency(&fee.asset);
+            Money::from_decimal(fee.qty.abs(), currency).context("Failed to parse fill fee")?
         } else {
-            Money::new(0.0, instrument.quote_currency())
+            Money::zero(instrument.quote_currency())
         }
     } else {
-        Money::new(0.0, instrument.quote_currency())
+        Money::zero(instrument.quote_currency())
     };
 
-    let ts_event = parse_rfc3339_timestamp(&exec.timestamp, "execution.timestamp")?;
+    let ts_event = datetime_to_nanos(exec.timestamp, "execution.timestamp")?;
 
     let client_order_id = exec
         .cl_ord_id
@@ -566,15 +620,53 @@ pub fn parse_ws_fill_report(
     ))
 }
 
+/// Parses a raw WebSocket JSON string and returns [`KrakenSpotWsMessage::OrderResponse`] if the
+/// message is an order-method response envelope, or `Ok(None)` for unrecognized messages.
+///
+/// # Errors
+///
+/// Returns an error if the message appears to be an order response but cannot be deserialized.
+pub fn parse_order_response(text: &str) -> anyhow::Result<Option<KrakenSpotWsMessage>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).with_context(|| format!("Failed to parse JSON: {text}"))?;
+
+    let method_str = match value.get("method").and_then(|m| m.as_str()) {
+        Some(s) => s.to_owned(),
+        None => return Ok(None),
+    };
+
+    if !matches!(
+        method_str.as_str(),
+        "add_order" | "amend_order" | "cancel_order" | "batch_add"
+    ) {
+        return Ok(None);
+    }
+
+    let response: KrakenWsOrderResponse = serde_json::from_value(value).with_context(|| {
+        format!("Failed to deserialize order response for method '{method_str}'")
+    })?;
+    Ok(Some(KrakenSpotWsMessage::OrderResponse(response)))
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::{identifiers::Symbol, types::Currency};
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use ustr::Ustr;
 
     use super::*;
-    use crate::{common::consts::KRAKEN_VENUE, websocket::spot_v2::messages::KrakenWsMessage};
+    use crate::{common::consts::KRAKEN_VENUE, websocket::spot_v2::messages::KrakenWsRawMessage};
 
     const TS: UnixNanos = UnixNanos::new(1_700_000_000_000_000_000);
+
+    #[rstest]
+    fn test_parse_time_in_force_fok() {
+        assert_eq!(
+            parse_time_in_force(Some(KrakenTimeInForce::FillOrKill), None),
+            TimeInForce::Fok
+        );
+    }
 
     fn load_test_json(filename: &str) -> String {
         let path = format!("test_data/{filename}");
@@ -586,137 +678,313 @@ mod tests {
         use nautilus_model::instruments::currency_pair::CurrencyPair;
 
         let instrument_id = InstrumentId::new(Symbol::new("BTC/USD"), *KRAKEN_VENUE);
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            Symbol::new("XBTUSDT"),
-            Currency::BTC(),
-            Currency::USDT(),
-            1, // price_precision
-            8, // size_precision
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // info
-            TS,
-            TS,
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("XBTUSDT"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USDT())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(TS)
+                .ts_init(TS)
+                .build()
+                .unwrap(),
+        )
     }
 
     #[rstest]
     fn test_parse_quote_tick() {
         let json = load_test_json("ws_ticker_snapshot.json");
-        let message: KrakenWsMessage = serde_json::from_str(&json).unwrap();
-        let ticker: KrakenWsTickerData = serde_json::from_value(message.data[0].clone()).unwrap();
+        let message: KrakenWsRawMessage = serde_json::from_str(&json).unwrap();
+        let ticker: KrakenWsTickerData = serde_json::from_str(message.data[0].get()).unwrap();
 
         let instrument = create_mock_instrument();
         let quote_tick = parse_quote_tick(&ticker, &instrument, TS).unwrap();
 
         assert_eq!(quote_tick.instrument_id, instrument.id());
-        assert!(quote_tick.bid_price.as_f64() > 0.0);
-        assert!(quote_tick.ask_price.as_f64() > 0.0);
-        assert!(quote_tick.bid_size.as_f64() > 0.0);
-        assert!(quote_tick.ask_size.as_f64() > 0.0);
+        assert_eq!(quote_tick.bid_price, Price::from("105944.20"));
+        assert_eq!(quote_tick.ask_price, Price::from("105944.30"));
+        assert_eq!(quote_tick.bid_size, Quantity::from("2.5"));
+        assert_eq!(quote_tick.ask_size, Quantity::from("3.2"));
+        assert_eq!(
+            quote_tick.ts_event,
+            UnixNanos::from(1_671_960_659_123_456_000)
+        );
+        assert_eq!(quote_tick.ts_init, TS);
     }
 
     #[rstest]
     fn test_parse_trade_tick() {
         let json = load_test_json("ws_trade_update.json");
-        let message: KrakenWsMessage = serde_json::from_str(&json).unwrap();
-        let trade: KrakenWsTradeData = serde_json::from_value(message.data[0].clone()).unwrap();
+        let message: KrakenWsRawMessage = serde_json::from_str(&json).unwrap();
+        let trade: KrakenWsTradeData = serde_json::from_str(message.data[0].get()).unwrap();
 
         let instrument = create_mock_instrument();
         let trade_tick = parse_trade_tick(&trade, &instrument, TS).unwrap();
 
         assert_eq!(trade_tick.instrument_id, instrument.id());
-        assert!(trade_tick.price.as_f64() > 0.0);
-        assert!(trade_tick.size.as_f64() > 0.0);
+        assert_eq!(trade_tick.price, Price::from("105944.20"));
+        assert_eq!(trade_tick.size, Quantity::from("0.00027625"));
         assert!(matches!(
             trade_tick.aggressor_side,
-            AggressorSide::Buyer | AggressorSide::Seller
+            AggressorSide::Buy | AggressorSide::Sell
         ));
+        assert_eq!(
+            trade_tick.ts_event,
+            UnixNanos::from(1_696_613_755_440_295_000)
+        );
+        assert_eq!(trade_tick.ts_init, TS);
     }
 
     #[rstest]
     fn test_parse_book_deltas_snapshot() {
         let json = load_test_json("ws_book_snapshot.json");
-        let message: KrakenWsMessage = serde_json::from_str(&json).unwrap();
-        let book: KrakenWsBookData = serde_json::from_value(message.data[0].clone()).unwrap();
+        let message: KrakenWsRawMessage = serde_json::from_str(&json).unwrap();
+        let book: KrakenWsBookData = serde_json::from_str(message.data[0].get()).unwrap();
 
         let instrument = create_mock_instrument();
-        let deltas = parse_book_deltas(&book, &instrument, 1, TS).unwrap();
+        let deltas = parse_book_deltas(&book, &instrument, 1, true, TS).unwrap();
 
         assert!(!deltas.is_empty());
 
-        // Check that we have both bids and asks
         let bid_count = deltas
             .iter()
-            .filter(|d| d.order.side == OrderSide::Buy)
+            .filter(|d| d.order.side == OrderSide::Buy.into())
             .count();
         let ask_count = deltas
             .iter()
-            .filter(|d| d.order.side == OrderSide::Sell)
+            .filter(|d| d.order.side == OrderSide::Sell.into())
             .count();
 
         assert!(bid_count > 0);
         assert!(ask_count > 0);
 
-        // Check first delta
         let first_delta = &deltas[0];
         assert_eq!(first_delta.instrument_id, instrument.id());
-        assert!(first_delta.order.price.as_f64() > 0.0);
-        assert!(first_delta.order.size.as_f64() > 0.0);
+        assert_eq!(first_delta.action, BookAction::Clear);
+        assert!(RecordFlag::F_SNAPSHOT.matches(first_delta.flags));
+        assert!(!RecordFlag::F_LAST.matches(first_delta.flags));
+
+        assert!(deltas[1..].iter().all(|d| d.action == BookAction::Add));
+        assert!(
+            deltas[1..]
+                .iter()
+                .all(|d| RecordFlag::F_MBP.matches(d.flags))
+        );
+        assert!(
+            deltas[1..]
+                .iter()
+                .all(|d| RecordFlag::F_SNAPSHOT.matches(d.flags))
+        );
+        assert!(RecordFlag::F_LAST.matches(deltas.last().unwrap().flags));
+
+        let expected_ts_event = UnixNanos::from(1_696_613_755_440_295_000);
+        assert!(deltas.iter().all(|d| d.ts_event == expected_ts_event));
+        assert!(deltas.iter().all(|d| d.ts_init == TS));
     }
 
     #[rstest]
     fn test_parse_book_deltas_update() {
         let json = load_test_json("ws_book_update.json");
-        let message: KrakenWsMessage = serde_json::from_str(&json).unwrap();
-        let book: KrakenWsBookData = serde_json::from_value(message.data[0].clone()).unwrap();
+        let message: KrakenWsRawMessage = serde_json::from_str(&json).unwrap();
+        let book: KrakenWsBookData = serde_json::from_str(message.data[0].get()).unwrap();
 
         let instrument = create_mock_instrument();
-        let deltas = parse_book_deltas(&book, &instrument, 1, TS).unwrap();
+        let deltas = parse_book_deltas(&book, &instrument, 1, false, TS).unwrap();
 
         assert!(!deltas.is_empty());
 
-        // Check that we have at least one delta
         let first_delta = &deltas[0];
         assert_eq!(first_delta.instrument_id, instrument.id());
-        assert!(first_delta.order.price.as_f64() > 0.0);
+        assert_eq!(first_delta.action, BookAction::Update);
+        assert_eq!(first_delta.order.side, OrderSide::Buy.into());
+        assert_eq!(first_delta.order.price, Price::from("45283.5"));
+        assert!(RecordFlag::F_MBP.matches(first_delta.flags));
+        assert!(RecordFlag::F_LAST.matches(first_delta.flags));
+        assert!(!RecordFlag::F_SNAPSHOT.matches(first_delta.flags));
+
+        let expected_ts_event = UnixNanos::from(1_696_613_755_440_295_000);
+        assert!(deltas.iter().all(|d| d.ts_event == expected_ts_event));
+        assert!(deltas.iter().all(|d| d.ts_init == TS));
     }
 
     #[rstest]
-    fn test_parse_rfc3339_timestamp() {
-        let timestamp = "2023-10-06T17:35:55.440295Z";
-        let result = parse_rfc3339_timestamp(timestamp, "test").unwrap();
-        assert!(result.as_u64() > 0);
+    fn test_parse_book_deltas_snapshot_skips_zero_qty_levels() {
+        let book = KrakenWsBookData {
+            symbol: Ustr::from("BTC/USD"),
+            bids: Some(vec![KrakenWsBookLevel {
+                price: dec!(100),
+                qty: Decimal::ZERO,
+            }]),
+            asks: Some(vec![KrakenWsBookLevel {
+                price: dec!(101),
+                qty: dec!(2),
+            }]),
+            checksum: Some(0),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let instrument = create_mock_instrument();
+        let deltas = parse_book_deltas(&book, &instrument, 7, true, TS).unwrap();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].action, BookAction::Clear);
+        assert_eq!(deltas[0].sequence, 7);
+        assert!(RecordFlag::F_SNAPSHOT.matches(deltas[0].flags));
+        assert!(!RecordFlag::F_LAST.matches(deltas[0].flags));
+
+        let add = &deltas[1];
+        assert_eq!(add.action, BookAction::Add);
+        assert_eq!(add.sequence, 8);
+        assert_eq!(add.order.side, OrderSide::Sell.into());
+        assert_eq!(add.order.price, Price::from("101.0"));
+        assert!(RecordFlag::F_MBP.matches(add.flags));
+        assert!(RecordFlag::F_SNAPSHOT.matches(add.flags));
+        assert!(RecordFlag::F_LAST.matches(add.flags));
+    }
+
+    #[rstest]
+    fn test_parse_book_deltas_update_zero_qty_deletes_level() {
+        let book = KrakenWsBookData {
+            symbol: Ustr::from("BTC/USD"),
+            bids: Some(vec![KrakenWsBookLevel {
+                price: dec!(100),
+                qty: Decimal::ZERO,
+            }]),
+            asks: Some(vec![]),
+            checksum: Some(0),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let instrument = create_mock_instrument();
+        let deltas = parse_book_deltas(&book, &instrument, 11, false, TS).unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        let delete = &deltas[0];
+        assert_eq!(delete.action, BookAction::Delete);
+        assert_eq!(delete.sequence, 11);
+        assert_eq!(delete.order.side, OrderSide::Buy.into());
+        assert_eq!(delete.order.price, Price::from("100.0"));
+        assert_eq!(delete.order.size.raw(), 0);
+        assert!(RecordFlag::F_MBP.matches(delete.flags));
+        assert!(RecordFlag::F_LAST.matches(delete.flags));
+        assert!(!RecordFlag::F_SNAPSHOT.matches(delete.flags));
+    }
+
+    #[rstest]
+    fn test_parse_ws_order_status_report_preserves_decimal_avg_px() {
+        let execution = ws_execution_data(Some(KrakenOrderSide::Buy));
+
+        let report = parse_ws_order_status_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            None,
+            TS,
+        )
+        .unwrap();
+
+        assert_eq!(report.avg_px, Some(dec!(0.1234567890123456789012345678)));
+    }
+
+    #[rstest]
+    fn test_parse_ws_order_status_report_preserves_missing_side() {
+        let execution = ws_execution_data(None);
+
+        let report = parse_ws_order_status_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            None,
+            TS,
+        )
+        .unwrap();
+
+        assert_eq!(report.order_side, None);
+    }
+
+    #[rstest]
+    fn test_parse_ws_fill_report_rejects_missing_side() {
+        let mut execution = ws_execution_data(None);
+        execution.exec_type = KrakenExecType::Trade;
+        execution.exec_id = Some("TRADE-1".to_string());
+        execution.last_qty = Some(dec!(1));
+        execution.last_price = Some(dec!(100));
+
+        let error = parse_ws_fill_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            TS,
+        )
+        .expect_err("a trade execution without a side must be rejected");
+
+        assert_eq!(error.to_string(), "Missing side for trade execution");
+    }
+
+    fn ws_execution_data(side: Option<KrakenOrderSide>) -> KrakenWsExecutionData {
+        KrakenWsExecutionData {
+            exec_type: KrakenExecType::Status,
+            order_id: "ORDER-1".to_string(),
+            cl_ord_id: Some("CLIENT-1".to_string()),
+            symbol: Some("BTC/USD".to_string()),
+            side,
+            order_type: Some(KrakenOrderType::Limit),
+            order_qty: Some(dec!(3)),
+            limit_price: None,
+            order_status: Some(KrakenWsOrderStatus::PartiallyFilled),
+            cum_qty: Some(dec!(3)),
+            cum_cost: Some(dec!(0.3703703670370370367037037034)),
+            avg_price: None,
+            time_in_force: Some(KrakenTimeInForce::GoodTilCancelled),
+            post_only: Some(false),
+            reduce_only: Some(false),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+            exec_id: None,
+            last_qty: None,
+            last_price: None,
+            cost: None,
+            liquidity_ind: None,
+            fees: None,
+            fee_usd_equiv: None,
+            reason: None,
+        }
+    }
+
+    #[rstest]
+    fn test_datetime_to_nanos() {
+        let dt = "2023-10-06T17:35:55.440295Z".parse::<Timestamp>().unwrap();
+        let result = datetime_to_nanos(dt, "test").unwrap();
+        assert_eq!(result, UnixNanos::from(1_696_613_755_440_295_000));
+    }
+
+    #[rstest]
+    fn test_datetime_to_nanos_out_of_range_errors() {
+        let dt = "1500-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let result = datetime_to_nanos(dt, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("test"));
     }
 
     #[rstest]
     fn test_parse_ws_bar() {
         let json = load_test_json("ws_ohlc_update.json");
-        let message: KrakenWsMessage = serde_json::from_str(&json).unwrap();
-        let ohlc: KrakenWsOhlcData = serde_json::from_value(message.data[0].clone()).unwrap();
+        let message: KrakenWsRawMessage = serde_json::from_str(&json).unwrap();
+        let ohlc: KrakenWsOhlcData = serde_json::from_str(message.data[0].get()).unwrap();
 
         let instrument = create_mock_instrument();
         let bar = parse_ws_bar(&ohlc, &instrument, TS).unwrap();
 
         assert_eq!(bar.bar_type.instrument_id(), instrument.id());
-        assert!(bar.open.as_f64() > 0.0);
-        assert!(bar.high.as_f64() > 0.0);
-        assert!(bar.low.as_f64() > 0.0);
-        assert!(bar.close.as_f64() > 0.0);
-        assert!(bar.volume.as_f64() > 0.0);
+        assert_eq!(bar.open, Price::from("106038.2"));
+        assert_eq!(bar.high, Price::from("106044.3"));
+        assert_eq!(bar.low, Price::from("106038.1"));
+        assert_eq!(bar.close, Price::from("106040.1"));
+        assert_eq!(bar.volume, Quantity::from("30927.68066226"));
 
         let spec = bar.bar_type.spec();
         assert_eq!(spec.step.get(), 1);
@@ -725,9 +993,9 @@ mod tests {
 
         // Verify ts_event is computed as interval_begin + interval (close time)
         // interval_begin is 2023-10-04T16:25:00Z, interval is 1 minute, so close is 16:26:00Z
-        let expected_close = ohlc.interval_begin + chrono::Duration::minutes(1);
+        let expected_close = ohlc.interval_begin + jiff::SignedDuration::from_mins(1);
         let expected_ts_event =
-            UnixNanos::from(expected_close.timestamp_nanos_opt().unwrap() as u64);
+            UnixNanos::from(u64::try_from(expected_close.as_nanosecond()).unwrap());
         assert_eq!(bar.ts_event, expected_ts_event);
     }
 
@@ -764,5 +1032,35 @@ mod tests {
     fn test_interval_to_bar_spec_invalid() {
         let result = interval_to_bar_spec(999);
         assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_parse_order_response_envelope_returns_order_response_variant() {
+        use crate::websocket::spot_v2::enums::KrakenWsMethod;
+
+        let raw = load_test_json("ws_add_order_response_success.json");
+        let parsed = parse_order_response(&raw).expect("parse ok");
+        match parsed {
+            Some(KrakenSpotWsMessage::OrderResponse(resp)) => {
+                assert_eq!(resp.method, KrakenWsMethod::AddOrder);
+                assert_eq!(resp.req_id, Some(42));
+                assert!(resp.success);
+            }
+            other => panic!("expected OrderResponse, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_order_response_returns_none_for_non_order_method() {
+        let json = r#"{"method":"subscribe","req_id":1,"success":true}"#;
+        let result = parse_order_response(json).expect("parse ok");
+        assert!(result.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_order_response_returns_none_for_data_message() {
+        let json = r#"{"channel":"ticker","type":"snapshot","data":[]}"#;
+        let result = parse_order_response(json).expect("parse ok");
+        assert!(result.is_none());
     }
 }

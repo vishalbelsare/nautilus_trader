@@ -20,7 +20,7 @@ use std::{
 
 use nautilus_core::{
     from_pydict,
-    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 use rust_decimal::Decimal;
@@ -29,6 +29,7 @@ use crate::{
     enums::OptionKind,
     identifiers::{InstrumentId, Symbol},
     instruments::CryptoOption,
+    python::instruments::register_crypto_currencies_from_dict,
     types::{Currency, Money, Price, Quantity},
 };
 
@@ -36,9 +37,9 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl CryptoOption {
     /// Represents a generic option contract instrument.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, underlying, quote_currency, settlement_currency, is_inverse, option_kind, strike_price, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment,ts_event, ts_init, multiplier=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, info=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, underlying, quote_currency, settlement_currency, is_inverse, option_kind, strike_price, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment,ts_event, ts_init, multiplier=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, tick_scheme=None, info=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -66,49 +67,47 @@ impl CryptoOption {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<String>,
         info: Option<Py<PyDict>>,
     ) -> PyResult<Self> {
         // Convert Python dict to Params
         let info_map = if let Some(info_dict) = info {
-            Python::attach(|py| from_pydict(py, info_dict))?
+            Python::attach(|py| from_pydict(py, &info_dict))?
         } else {
             None
         };
 
-        Self::new_checked(
-            instrument_id,
-            raw_symbol,
-            underlying,
-            quote_currency,
-            settlement_currency,
-            is_inverse,
-            option_kind,
-            strike_price,
-            activation_ns.into(),
-            expiration_ns.into(),
-            price_precision,
-            size_precision,
-            price_increment,
-            size_increment,
-            multiplier,
-            lot_size,
-            max_quantity,
-            min_quantity,
-            max_notional,
-            min_notional,
-            max_price,
-            min_price,
-            margin_init,
-            margin_maint,
-            maker_fee,
-            taker_fee,
-            info_map,
-            ts_event.into(),
-            ts_init.into(),
-        )
-        .map_err(to_pyvalue_err)
+        Self::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(raw_symbol)
+            .underlying(underlying)
+            .quote_currency(quote_currency)
+            .settlement_currency(settlement_currency)
+            .is_inverse(is_inverse)
+            .option_kind(option_kind)
+            .strike_price(strike_price)
+            .activation_ns(activation_ns.into())
+            .expiration_ns(expiration_ns.into())
+            .price_precision(price_precision)
+            .size_precision(size_precision)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_multiplier(multiplier)
+            .maybe_lot_size(lot_size)
+            .maybe_max_quantity(max_quantity)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_notional(max_notional)
+            .maybe_min_notional(min_notional)
+            .maybe_max_price(max_price)
+            .maybe_min_price(min_price)
+            .maybe_margin_init(margin_init)
+            .maybe_margin_maint(margin_maint)
+            .maybe_tick_scheme(tick_scheme.map(|name| ustr::Ustr::from(name.as_str())))
+            .maybe_info(info_map)
+            .ts_event(ts_event.into())
+            .ts_init(ts_init.into())
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     fn __hash__(&self) -> isize {
@@ -275,23 +274,12 @@ impl CryptoOption {
     }
 
     #[getter]
-    #[pyo3(name = "maker_fee")]
-    fn py_maker_fee(&self) -> Decimal {
-        self.maker_fee
-    }
-
-    #[getter]
-    #[pyo3(name = "taker_fee")]
-    fn py_taker_fee(&self) -> Decimal {
-        self.taker_fee
-    }
-
-    #[getter]
     #[pyo3(name = "info")]
     fn py_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         // Convert HashMap<String, serde_json::Value> back to Python dict
         if let Some(ref info_map) = self.info {
             let py_dict = PyDict::new(py);
+
             for (key, value) in info_map {
                 // Convert serde_json::Value back to Python object via JSON
                 let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
@@ -320,7 +308,8 @@ impl CryptoOption {
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
-        from_dict_pyo3(py, values)
+        register_crypto_currencies_from_dict(py, &values, &["underlying"]);
+        crate::python::instruments::from_dict_instrument_pyo3(py, values)
     }
 
     #[pyo3(name = "to_dict")]
@@ -348,13 +337,12 @@ impl CryptoOption {
         dict.set_item("lot_size", self.lot_size.to_string())?;
         dict.set_item("margin_init", self.margin_init.to_string())?;
         dict.set_item("margin_maint", self.margin_maint.to_string())?;
-        dict.set_item("maker_fee", self.maker_fee.to_string())?;
-        dict.set_item("taker_fee", self.taker_fee.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
         // Serialize info dict
         if let Some(ref info_map) = self.info {
             let info_dict = PyDict::new(py);
+
             for (key, value) in info_map {
                 let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
                 let py_value =
@@ -365,30 +353,40 @@ impl CryptoOption {
         } else {
             dict.set_item("info", PyDict::new(py))?;
         }
+
         match self.max_quantity {
             Some(value) => dict.set_item("max_quantity", value.to_string())?,
             None => dict.set_item("max_quantity", py.None())?,
         }
+
         match self.min_quantity {
             Some(value) => dict.set_item("min_quantity", value.to_string())?,
             None => dict.set_item("min_quantity", py.None())?,
         }
+
         match self.max_notional {
             Some(value) => dict.set_item("max_notional", value.to_string())?,
             None => dict.set_item("max_notional", py.None())?,
         }
+
         match self.min_notional {
             Some(value) => dict.set_item("min_notional", value.to_string())?,
             None => dict.set_item("min_notional", py.None())?,
         }
+
         match self.max_price {
             Some(value) => dict.set_item("max_price", value.to_string())?,
             None => dict.set_item("max_price", py.None())?,
         }
+
         match self.min_price {
             Some(value) => dict.set_item("min_price", value.to_string())?,
             None => dict.set_item("min_price", py.None())?,
         }
+        dict.set_item(
+            "tick_scheme",
+            crate::python::instruments::tick_scheme_to_py(self),
+        )?;
         Ok(dict.into())
     }
 }
@@ -398,7 +396,11 @@ mod tests {
     use pyo3::{prelude::*, types::PyDict};
     use rstest::rstest;
 
-    use crate::instruments::{CryptoOption, stubs::*};
+    use crate::{
+        enums::CurrencyType,
+        instruments::{CryptoOption, stubs::*},
+        types::Currency,
+    };
 
     #[rstest]
     fn test_dict_round_trip(crypto_option_btc_deribit: CryptoOption) {
@@ -409,6 +411,26 @@ mod tests {
             let values: Py<PyDict> = values.extract(py).unwrap();
             let new_crypto_future = CryptoOption::py_from_dict(py, values).unwrap();
             assert_eq!(crypto_option, new_crypto_future);
+        });
+    }
+
+    #[rstest]
+    fn test_from_dict_unknown_underlying_registers_as_crypto(
+        crypto_option_btc_deribit: CryptoOption,
+    ) {
+        // Regression: newly listed underlyings must round-trip through `from_dict`
+        // without requiring prior registration of the currency in the Rust map.
+        Python::initialize();
+        Python::attach(|py| {
+            let values = crypto_option_btc_deribit.py_to_dict(py).unwrap();
+            let values: Py<PyDict> = values.extract(py).unwrap();
+            values.bind(py).set_item("underlying", "NEWOPT").unwrap();
+
+            let new_option = CryptoOption::py_from_dict(py, values).unwrap();
+            assert_eq!(new_option.underlying.code, "NEWOPT");
+            assert_eq!(new_option.underlying.precision, 8);
+            assert_eq!(new_option.underlying.currency_type, CurrencyType::Crypto);
+            assert!(Currency::try_from_str("NEWOPT").is_some());
         });
     }
 }

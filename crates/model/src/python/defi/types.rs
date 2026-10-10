@@ -22,11 +22,14 @@ use std::{
     sync::Arc,
 };
 
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use pyo3::{basic::CompareOp, prelude::*};
 
 use crate::{
-    defi::{AmmType, Blockchain, Chain, Dex, DexType, Pool, Token, chain::chains},
+    defi::{
+        AmmType, Blockchain, Chain, Dex, DexType, Pool, Token, chain::chains,
+        validation::validate_address,
+    },
     identifiers::InstrumentId,
 };
 
@@ -53,11 +56,11 @@ impl Chain {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Chain"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -103,9 +106,9 @@ impl Chain {
     #[staticmethod]
     #[pyo3(name = "from_chain_name")]
     fn py_from_chain_name(chain_name: &str) -> PyResult<Self> {
-        Self::from_chain_name(chain_name).cloned().ok_or_else(|| {
-            to_pyvalue_err(format!("`chain_name` '{chain_name}' is not recognized",))
-        })
+        Self::from_chain_name(chain_name)
+            .cloned()
+            .ok_or_else(|| to_pyvalue_err(format!("`chain_name` '{chain_name}' is not recognized")))
     }
 
     /// Returns a reference to the `Chain` corresponding to the given `chain_id`, or `None` if it is not found.
@@ -127,7 +130,7 @@ impl Chain {
 impl Token {
     /// Represents a cryptocurrency token on a blockchain network.
     #[new]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         address: String,
@@ -154,11 +157,11 @@ impl Token {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Token"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -198,7 +201,7 @@ impl Token {
 impl Dex {
     /// Represents a decentralized exchange (DEX) in a blockchain ecosystem.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         name: String,
@@ -214,6 +217,9 @@ impl Dex {
         let amm_type = AmmType::from_str(&amm_type).map_err(to_pyvalue_err)?;
         let dex_type = DexType::from_dex_name(&name)
             .ok_or_else(|| to_pyvalue_err(format!("Invalid DEX name: {name}")))?;
+
+        validate_address(&factory).map_err(to_pyvalue_err)?;
+
         Ok(Self::new(
             chain,
             dex_type,
@@ -244,11 +250,11 @@ impl Dex {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Dex"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -320,22 +326,22 @@ impl Pool {
     /// - `address` = pool contract address
     /// - `pool_identifier` = same as address (hex string)
     ///
-    /// **UniswapV4**: All pools share a singleton PoolManager contract. Pools are distinguished
+    /// **`UniswapV4`**: All pools share a singleton `PoolManager` contract. Pools are distinguished
     /// by a unique Pool ID (keccak256 hash of currencies, fee, tick spacing, and hooks).
-    /// - `address` = PoolManager contract address (shared by all pools)
+    /// - `address` = `PoolManager` contract address (shared by all pools)
     /// - `pool_identifier` = Pool ID (bytes32 as hex string)
     ///
     /// ## Instrument ID Format
     ///
     /// The instrument ID encodes with the following components:
-    /// - `symbol` – The pool identifier (address for V2/V3, Pool ID for V4)
-    /// - `venue`  – The chain name plus DEX ID
+    /// - `symbol` - The pool identifier (address for V2/V3, Pool ID for V4)
+    /// - `venue`  - The chain name plus DEX ID
     ///
     /// String representation: `<POOL_IDENTIFIER>.<CHAIN_NAME>:<DEX_ID>`
     ///
     /// Example: `0x11b815efB8f581194ae79006d24E0d814B7697F6.Ethereum:UniswapV3`
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         dex: Dex,
@@ -379,11 +385,11 @@ impl Pool {
         hasher.finish()
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
-            CompareOp::Eq => self == other,
-            CompareOp::Ne => self != other,
-            _ => panic!("Unsupported comparison for Pool"),
+            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
+            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
         }
     }
 
@@ -439,6 +445,12 @@ impl Pool {
     #[pyo3(name = "tick_spacing")]
     fn py_tick_spacing(&self) -> Option<u32> {
         self.tick_spacing
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
     }
 
     #[getter]

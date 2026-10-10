@@ -18,16 +18,19 @@
 use std::fmt::Debug;
 
 use nautilus_core::UnixNanos;
-use nautilus_model::instruments::{Instrument, InstrumentAny};
+use nautilus_model::instruments::{BinaryOption, Instrument, InstrumentAny};
 
-use crate::http::query::{GetGammaEventsParams, GetGammaMarketsParams, GetSearchParams};
+use crate::{
+    http::query::{GetGammaEventsParams, GetGammaMarketsParams, GetSearchParams},
+    websocket::messages::PolymarketNewMarket,
+};
 
 /// Declarative filter for controlling which instruments are loaded.
 ///
 /// All three methods default to `None`. At least one must return `Some` for
 /// the filter to be useful. Methods are called on each `load_all()` cycle,
 /// enabling dynamic re-evaluation (e.g., time-based slug generation).
-pub trait InstrumentFilter: Debug {
+pub trait InstrumentFilter: Debug + Send + Sync {
     /// Market slugs for concurrent per-slug fetching via `GET /markets?slug=`.
     fn market_slugs(&self) -> Option<Vec<String>> {
         None
@@ -67,11 +70,20 @@ pub trait InstrumentFilter: Debug {
         let _ = instrument;
         true
     }
+
+    /// Pre-fetch gate for new market WS events: returns `true` if the market
+    /// should proceed to Gamma HTTP fetch. Used when this filter is set as
+    /// the dedicated `new_market_filter` in the data client config.
+    /// Default accepts all new markets.
+    fn accept_new_market(&self, new_market: &PolymarketNewMarket) -> bool {
+        let _ = new_market;
+        true
+    }
 }
 
 /// Filter that provides market slugs, optionally via a dynamic closure.
 pub struct MarketSlugFilter {
-    slug_fn: Box<dyn Fn() -> Vec<String>>,
+    slug_fn: Box<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl MarketSlugFilter {
@@ -79,7 +91,7 @@ impl MarketSlugFilter {
     ///
     /// The closure is re-evaluated on each `load_all()` call, enabling
     /// time-based or stateful slug generation.
-    pub fn new<F: Fn() -> Vec<String> + 'static>(slug_fn: F) -> Self {
+    pub fn new<F: Fn() -> Vec<String> + Send + Sync + 'static>(slug_fn: F) -> Self {
         Self {
             slug_fn: Box::new(slug_fn),
         }
@@ -109,7 +121,7 @@ impl InstrumentFilter for MarketSlugFilter {
 
 /// Filter that provides event slugs, optionally via a dynamic closure.
 pub struct EventSlugFilter {
-    slug_fn: Box<dyn Fn() -> Vec<String>>,
+    slug_fn: Box<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl EventSlugFilter {
@@ -117,7 +129,7 @@ impl EventSlugFilter {
     ///
     /// The closure is re-evaluated on each `load_all()` call, enabling
     /// time-based or stateful slug generation.
-    pub fn new<F: Fn() -> Vec<String> + 'static>(slug_fn: F) -> Self {
+    pub fn new<F: Fn() -> Vec<String> + Send + Sync + 'static>(slug_fn: F) -> Self {
         Self {
             slug_fn: Box::new(slug_fn),
         }
@@ -196,16 +208,16 @@ impl InstrumentFilter for EventQueryFilter {
 
 /// Pure post-fetch filter that accepts/rejects instruments via a closure.
 ///
-/// Does not provide any slugs or query params — combine with source filters
+/// Does not provide any slugs or query params: combine with source filters
 /// via the provider's `with_filters()` or `add_filter()` methods.
 pub struct PredicateFilter {
-    predicate: Box<dyn Fn(&InstrumentAny) -> bool>,
+    predicate: Box<dyn Fn(&InstrumentAny) -> bool + Send + Sync>,
     label: String,
 }
 
 impl PredicateFilter {
     /// Creates a new [`PredicateFilter`] with a label and closure predicate.
-    pub fn new<F: Fn(&InstrumentAny) -> bool + 'static>(
+    pub fn new<F: Fn(&InstrumentAny) -> bool + Send + Sync + 'static>(
         label: impl Into<String>,
         predicate: F,
     ) -> Self {
@@ -237,13 +249,52 @@ impl PredicateFilter {
     /// Only [`InstrumentAny::BinaryOption`] instruments are checked; non-binary variants are accepted.
     pub fn not_expired(now_ns: UnixNanos) -> Self {
         Self::new("not_expired", move |instrument| {
-            if let Some(expiration_ns) = Instrument::expiration_ns(instrument) {
-                expiration_ns > now_ns
-            } else {
-                true // no expiration means not expired
-            }
+            !is_expired(instrument, now_ns)
         })
     }
+}
+
+/// Returns `true` if `instrument` has a real expiration timestamp at or before `now_ns`.
+///
+/// An `expiration_ns` of `0` is treated as a "no expiration" sentinel, the same as a missing
+/// timestamp, so both report as not expired.
+pub(crate) fn is_expired(instrument: &InstrumentAny, now_ns: UnixNanos) -> bool {
+    Instrument::expiration_ns(instrument)
+        .is_some_and(|expiration_ns| expiration_ns.as_u64() != 0 && expiration_ns <= now_ns)
+}
+
+pub(crate) const MARKET_CLOSED_KEY: &str = "closed";
+
+pub(crate) fn market_closed(instrument: &InstrumentAny) -> Option<bool> {
+    match instrument {
+        InstrumentAny::BinaryOption(binary) => binary_market_closed(binary),
+        _ => None,
+    }
+}
+
+pub(crate) fn binary_market_closed(instrument: &BinaryOption) -> Option<bool> {
+    instrument
+        .info
+        .as_ref()
+        .and_then(|info| info.get_bool(MARKET_CLOSED_KEY))
+}
+
+pub(crate) fn set_market_closed(instrument: &mut BinaryOption, closed: bool) {
+    let mut info = instrument.info.clone().unwrap_or_default();
+    info.insert(MARKET_CLOSED_KEY.to_string(), closed.into());
+    instrument.info = Some(info);
+}
+
+/// Returns whether `instrument` is past its expiration without Gamma reporting it still open.
+///
+/// Gamma `endDate` is a scheduled end, not proof that trading stopped, so an expired instrument is
+/// retained while Gamma reports `closed=false`. A missing `closed` key means the instrument did not
+/// come from the live Gamma path, which keeps the time-only retirement behavior.
+pub(crate) fn is_expired_and_not_reported_open(
+    instrument: &InstrumentAny,
+    now_ns: UnixNanos,
+) -> bool {
+    is_expired(instrument, now_ns) && market_closed(instrument) != Some(false)
 }
 
 impl Debug for PredicateFilter {
@@ -309,10 +360,6 @@ impl InstrumentFilter for SearchFilter {
 }
 
 /// Filter that queries markets by tag ID.
-///
-/// Use [`TagFilter::from_tag_id`] when you already have the tag ID.
-/// For slug-based resolution, use the async helper
-/// [`resolve_tag_slug`](crate::providers::resolve_tag_slug) first.
 #[derive(Debug, Clone)]
 pub struct TagFilter {
     inner: GammaQueryFilter,
@@ -320,10 +367,10 @@ pub struct TagFilter {
 
 impl TagFilter {
     /// Creates a new [`TagFilter`] from a known tag ID.
-    pub fn from_tag_id(tag_id: impl Into<String>) -> Self {
+    pub fn from_tag_id(tag_id: u64) -> Self {
         Self {
             inner: GammaQueryFilter::new(GetGammaMarketsParams {
-                tag_id: Some(tag_id.into()),
+                tag_id: Some(vec![tag_id]),
                 ..Default::default()
             }),
         }
@@ -333,6 +380,51 @@ impl TagFilter {
 impl InstrumentFilter for TagFilter {
     fn query_params(&self) -> Option<GetGammaMarketsParams> {
         self.inner.query_params()
+    }
+}
+
+/// Pre-fetch gate filter for new market WS events via closure.
+///
+/// Intended for use as `new_market_filter` in the data client config.
+/// Does not affect initial instrument loading.
+pub struct NewMarketPredicateFilter {
+    predicate: Box<dyn Fn(&PolymarketNewMarket) -> bool + Send + Sync>,
+    label: String,
+}
+
+impl NewMarketPredicateFilter {
+    pub fn new<F: Fn(&PolymarketNewMarket) -> bool + Send + Sync + 'static>(
+        label: impl Into<String>,
+        predicate: F,
+    ) -> Self {
+        Self {
+            predicate: Box::new(predicate),
+            label: label.into(),
+        }
+    }
+
+    /// Accept new markets where `question` or `description` contains the keyword
+    /// (case-insensitive).
+    pub fn keyword(keyword: impl Into<String>) -> Self {
+        let kw = keyword.into().to_lowercase();
+        let label = format!("keyword={kw}");
+        Self::new(label, move |nm| {
+            nm.question.to_lowercase().contains(&kw) || nm.description.to_lowercase().contains(&kw)
+        })
+    }
+}
+
+impl Debug for NewMarketPredicateFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(NewMarketPredicateFilter))
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl InstrumentFilter for NewMarketPredicateFilter {
+    fn accept_new_market(&self, new_market: &PolymarketNewMarket) -> bool {
+        (self.predicate)(new_market)
     }
 }
 
@@ -349,39 +441,31 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+    use crate::websocket::messages::PolymarketNewMarketEvent;
 
     fn stub_binary_option_with_expiration(
         outcome: Option<&str>,
         expiration: UnixNanos,
     ) -> InstrumentAny {
         let raw_symbol = Symbol::new("test-token-id");
-        InstrumentAny::BinaryOption(BinaryOption::new(
-            InstrumentId::from("test-token-id.POLYMARKET"),
-            raw_symbol,
-            AssetClass::Alternative,
-            Currency::USDC(),
-            UnixNanos::default(),
-            expiration,
-            3,
-            2,
-            Price::from("0.001"),
-            Quantity::from("0.01"),
-            outcome.map(Ustr::from),
-            None, // description
-            None, // max_quantity
-            None, // min_quantity
-            None, // max_notional
-            None, // min_notional
-            None, // max_price
-            None, // min_price
-            None, // margin_init
-            None, // margin_maint
-            None, // maker_fee
-            None, // taker_fee
-            None, // info
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::BinaryOption(
+            BinaryOption::builder()
+                .instrument_id(InstrumentId::from("test-token-id.POLYMARKET"))
+                .raw_symbol(raw_symbol)
+                .asset_class(AssetClass::Alternative)
+                .currency(Currency::pUSD())
+                .activation_ns(UnixNanos::default())
+                .expiration_ns(expiration)
+                .price_precision(3)
+                .size_precision(2)
+                .price_increment(Price::from("0.001"))
+                .size_increment(Quantity::from("0.01"))
+                .maybe_outcome(outcome.map(Ustr::from))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn stub_binary_option(outcome: Option<&str>) -> InstrumentAny {
@@ -426,6 +510,37 @@ mod tests {
         assert!(filter.accept(&instrument));
     }
 
+    #[rstest]
+    fn test_not_expired_accepts_zero_sentinel_expiration() {
+        // A zero expiration is the "no expiration" sentinel, so it must be treated as not expired
+        let now = UnixNanos::from(1_000_000u64);
+        let instrument = stub_binary_option_with_expiration(Some("Yes"), UnixNanos::from(0u64));
+        let filter = PredicateFilter::not_expired(now);
+        assert!(filter.accept(&instrument));
+    }
+
+    #[rstest]
+    #[case(2_000_000, Some(false), false)]
+    #[case(2_000_000, Some(true), true)]
+    #[case(2_000_000, None, true)]
+    #[case(500_000, Some(true), false)]
+    fn test_expired_and_not_reported_open_requires_expiration_and_no_open_market_state(
+        #[case] now: u64,
+        #[case] closed: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let mut instrument =
+            stub_binary_option_with_expiration(Some("Yes"), UnixNanos::from(1_000_000));
+        if let (Some(closed), InstrumentAny::BinaryOption(binary)) = (closed, &mut instrument) {
+            set_market_closed(binary, closed);
+        }
+
+        assert_eq!(
+            is_expired_and_not_reported_open(&instrument, UnixNanos::from(now)),
+            expected
+        );
+    }
+
     #[fixture]
     fn yes_instrument() -> InstrumentAny {
         stub_binary_option(Some("Yes"))
@@ -454,7 +569,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_predicate_filter_outcome_helper(
+    fn test_predicate_filter_outcome_constructor(
         yes_instrument: InstrumentAny,
         no_instrument: InstrumentAny,
         no_outcome_instrument: InstrumentAny,
@@ -469,5 +584,95 @@ mod tests {
     fn test_default_accept_returns_true(yes_instrument: InstrumentAny) {
         let filter = MarketSlugFilter::from_slugs(vec!["test".to_string()]);
         assert!(filter.accept(&yes_instrument)); // default impl returns true
+    }
+
+    fn stub_new_market(
+        slug: &str,
+        tags: Vec<String>,
+        event_slug: Option<&str>,
+    ) -> PolymarketNewMarket {
+        PolymarketNewMarket {
+            id: "1".to_string(),
+            question: "Test?".to_string(),
+            market: Ustr::from("0xabc"),
+            slug: slug.to_string(),
+            description: String::new(),
+            assets_ids: vec![],
+            outcomes: vec!["Yes".to_string(), "No".to_string()],
+            timestamp: "0".to_string(),
+            tags,
+            condition_id: "0xabc".to_string(),
+            active: true,
+            clob_token_ids: vec![],
+            order_price_min_tick_size: None,
+            group_item_title: None,
+            event_message: event_slug.map(|s| PolymarketNewMarketEvent {
+                id: "1".to_string(),
+                ticker: s.to_string(),
+                slug: s.to_string(),
+                title: "Test event".to_string(),
+                description: String::new(),
+            }),
+            sports_market_type: None,
+            line: None,
+            game_start_time: None,
+            taker_base_fee: None,
+            fees_enabled: None,
+            fee_schedule: None,
+        }
+    }
+
+    #[rstest]
+    fn test_default_accept_new_market_returns_true() {
+        let filter = GammaQueryFilter::new(GetGammaMarketsParams::default());
+        let nm = stub_new_market("any-market", vec![], None);
+        assert!(filter.accept_new_market(&nm));
+    }
+
+    #[rstest]
+    fn test_market_slug_filter_default_accept_new_market() {
+        let filter = MarketSlugFilter::from_slugs(vec!["trump-win".to_string()]);
+        let nm = stub_new_market("biden-win", vec![], None);
+        assert!(filter.accept_new_market(&nm)); // default: accept all
+    }
+
+    #[rstest]
+    fn test_event_slug_filter_default_accept_new_market() {
+        let filter = EventSlugFilter::from_slugs(vec!["us-election-2024".to_string()]);
+        let nm = stub_new_market("some-market", vec![], Some("uk-election-2024"));
+        assert!(filter.accept_new_market(&nm)); // default: accept all
+    }
+
+    #[rstest]
+    fn test_tag_filter_default_accept_new_market() {
+        let filter = TagFilter::from_tag_id(123);
+        let nm = stub_new_market("nvda-market", vec!["stocks".to_string()], None);
+        assert!(filter.accept_new_market(&nm)); // default: accept all
+    }
+
+    #[rstest]
+    fn test_new_market_predicate_keyword_matches_question() {
+        let filter = NewMarketPredicateFilter::keyword("BTC");
+        let mut nm = stub_new_market("btc-market", vec![], None);
+        nm.question = "Will BTC reach 100k?".to_string();
+        assert!(filter.accept_new_market(&nm));
+    }
+
+    #[rstest]
+    fn test_new_market_predicate_keyword_matches_description() {
+        let filter = NewMarketPredicateFilter::keyword("bitcoin");
+        let mut nm = stub_new_market("some-market", vec![], None);
+        nm.question = "Some question".to_string();
+        nm.description = "This market is about Bitcoin price".to_string();
+        assert!(filter.accept_new_market(&nm));
+    }
+
+    #[rstest]
+    fn test_new_market_predicate_keyword_rejects_no_match() {
+        let filter = NewMarketPredicateFilter::keyword("BTC");
+        let mut nm = stub_new_market("eth-market", vec![], None);
+        nm.question = "Will ETH reach 10k?".to_string();
+        nm.description = "Ethereum price market".to_string();
+        assert!(!filter.accept_new_market(&nm));
     }
 }

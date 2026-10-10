@@ -19,10 +19,7 @@ use pyo3::prelude::*;
 
 use crate::cache::fifo::FifoCache;
 
-#[pyo3::pyclass(
-    name = "FifoCache",
-    module = "nautilus_trader.core.nautilus_pyo3.common"
-)]
+#[pyo3::pyclass(name = "FifoCache", module = "nautilus_trader.common")]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 #[derive(Debug)]
 pub struct PyFifoCache {
@@ -56,7 +53,7 @@ impl PyFifoCache {
         self.inner.len()
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn __contains__(&self, key: String) -> bool {
         self.inner.contains(&key)
     }
@@ -65,7 +62,7 @@ impl PyFifoCache {
         self.inner.add(key);
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn remove(&mut self, key: String) {
         self.inner.remove(&key);
     }

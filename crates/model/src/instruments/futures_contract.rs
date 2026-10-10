@@ -18,14 +18,15 @@ use std::hash::{Hash, Hasher};
 use nautilus_core::{
     Params, UnixNanos,
     correctness::{
-        FAILED, check_equal_u8, check_valid_string_ascii, check_valid_string_ascii_optional,
+        CorrectnessResult, check_equal_u8, check_valid_string_ascii,
+        check_valid_string_ascii_optional,
     },
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -42,7 +43,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -81,10 +82,6 @@ pub struct FuturesContract {
     pub margin_init: Decimal,
     /// The maintenance (position) margin in percentage of position value.
     pub margin_maint: Decimal,
-    /// The fee rate for liquidity makers as a percentage of order value.
-    pub maker_fee: Decimal,
-    /// The fee rate for liquidity takers as a percentage of order value.
-    pub taker_fee: Decimal,
     /// The maximum allowable order quantity.
     pub max_quantity: Option<Quantity>,
     /// The minimum allowable order quantity.
@@ -93,6 +90,8 @@ pub struct FuturesContract {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -101,17 +100,10 @@ pub struct FuturesContract {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl FuturesContract {
-    /// Creates a new [`FuturesContract`] instance with correctness checking.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_checked(
+    #[expect(clippy::too_many_arguments)]
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -130,14 +122,13 @@ impl FuturesContract {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Self> {
-        check_valid_string_ascii_optional(exchange.map(|u| u.as_str()), stringify!(exchange))?;
-        check_valid_string_ascii(underlying.as_str(), stringify!(underlying))?;
+    ) -> CorrectnessResult<Self> {
+        check_valid_string_ascii_optional(exchange, stringify!(exchange))?;
+        check_valid_string_ascii(underlying, stringify!(underlying))?;
         check_equal_u8(
             price_precision,
             price_increment.precision,
@@ -145,6 +136,7 @@ impl FuturesContract {
             stringify!(price_increment.precision),
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
+        check_tick_scheme(tick_scheme)?;
         check_positive_quantity(multiplier, stringify!(multiplier))?;
         check_positive_quantity(lot_size, stringify!(lot_size))?;
 
@@ -169,21 +161,23 @@ impl FuturesContract {
             min_price,
             margin_init: margin_init.unwrap_or_default(),
             margin_maint: margin_maint.unwrap_or_default(),
-            maker_fee: maker_fee.unwrap_or_default(),
-            taker_fee: taker_fee.unwrap_or_default(),
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`FuturesContract`] instance.
+    /// Returns a fluent builder for a [`FuturesContract`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any input parameter is invalid (see `new_checked`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -202,12 +196,11 @@ impl FuturesContract {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -227,13 +220,11 @@ impl FuturesContract {
             min_price,
             margin_init,
             margin_maint,
-            maker_fee,
-            taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect(FAILED)
     }
 }
 
@@ -363,6 +354,14 @@ impl Instrument for FuturesContract {
         self.min_price
     }
 
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
+
+    fn info(&self) -> Option<&Params> {
+        self.info.as_ref()
+    }
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -378,25 +377,193 @@ impl Instrument for FuturesContract {
     fn margin_maint(&self) -> Decimal {
         self.margin_maint
     }
-
-    fn maker_fee(&self) -> Decimal {
-        self.maker_fee
-    }
-
-    fn taker_fee(&self) -> Decimal {
-        self.taker_fee
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use ustr::Ustr;
 
-    use crate::instruments::stubs::*;
+    use crate::{
+        enums::{AssetClass, InstrumentClass},
+        identifiers::{InstrumentId, Symbol},
+        instruments::{FuturesContract, Instrument, stubs::*},
+        types::{Currency, Price, Quantity},
+    };
 
     #[rstest]
-    fn test_equality() {
-        let futures_contract = futures_contract_es(None, None);
-        assert_eq!(futures_contract, futures_contract.clone());
+    fn test_trait_accessors() {
+        let inst = futures_contract_es(None, None);
+        assert_eq!(inst.id(), InstrumentId::from("ESZ21.GLBX"));
+        assert_eq!(inst.raw_symbol(), Symbol::from("ESZ21"));
+        assert_eq!(inst.asset_class(), AssetClass::Index);
+        assert_eq!(inst.instrument_class(), InstrumentClass::Future);
+        assert_eq!(inst.quote_currency(), Currency::USD());
+        assert!(!inst.is_inverse());
+        assert_eq!(inst.price_precision(), 2);
+        assert_eq!(inst.size_precision(), 0);
+        assert_eq!(inst.price_increment(), Price::from("0.01"));
+        assert_eq!(inst.size_increment(), Quantity::from("1"));
+        assert_eq!(inst.multiplier(), Quantity::from("1"));
+        assert_eq!(inst.lot_size(), Some(Quantity::from("1")));
+        assert_eq!(inst.underlying(), Some(Ustr::from("ES")));
+        assert_eq!(inst.exchange(), Some(Ustr::from("XCME")));
+        assert!(inst.activation_ns().is_some());
+        assert!(inst.expiration_ns().is_some());
+        assert_eq!(inst.min_quantity(), Some(Quantity::from("1")));
+    }
+
+    #[rstest]
+    fn test_new_checked_price_precision_mismatch() {
+        let result = FuturesContract::new_checked(
+            InstrumentId::from("ESZ21.GLBX"),
+            Symbol::from("ESZ21"),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from("ES"),
+            0.into(),
+            0.into(),
+            Currency::USD(),
+            4, // mismatch
+            Price::from("0.01"),
+            Quantity::from(1),
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_new_checked_zero_multiplier() {
+        let result = FuturesContract::new_checked(
+            InstrumentId::from("ESZ21.GLBX"),
+            Symbol::from("ESZ21"),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from("ES"),
+            0.into(),
+            0.into(),
+            Currency::USD(),
+            2,
+            Price::from("0.01"),
+            Quantity::from("0"), // zero multiplier
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_new_checked_zero_lot_size() {
+        let result = FuturesContract::new_checked(
+            InstrumentId::from("ESZ21.GLBX"),
+            Symbol::from("ESZ21"),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from("ES"),
+            0.into(),
+            0.into(),
+            Currency::USD(),
+            2,
+            Price::from("0.01"),
+            Quantity::from(1),
+            Quantity::from("0"), // zero lot_size
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_serialization_roundtrip() {
+        let inst = futures_contract_es(None, None);
+        let json = serde_json::to_string(&inst).unwrap();
+        let deserialized: FuturesContract = serde_json::from_str(&json).unwrap();
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = FuturesContract::new_checked(
+            InstrumentId::from("ESZ21.GLBX"),
+            Symbol::from("ESZ21"),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from("ES"),
+            1_000.into(),
+            2_000.into(),
+            Currency::USD(),
+            2,
+            Price::from("0.01"),
+            Quantity::from(50),
+            Quantity::from(10),
+            Some(Quantity::from("10000")),
+            Some(Quantity::from("5")),
+            Some(Price::from("9999.99")),
+            Some(Price::from("0.01")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            None,
+            None,
+            1.into(),
+            2.into(),
+        )
+        .unwrap();
+
+        let built = FuturesContract::builder()
+            .instrument_id(InstrumentId::from("ESZ21.GLBX"))
+            .raw_symbol(Symbol::from("ESZ21"))
+            .asset_class(AssetClass::Index)
+            .exchange(Ustr::from("XCME"))
+            .underlying(Ustr::from("ES"))
+            .activation_ns(1_000.into())
+            .expiration_ns(2_000.into())
+            .currency(Currency::USD())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from(50))
+            .lot_size(Quantity::from(10))
+            .max_quantity(Quantity::from("10000"))
+            .min_quantity(Quantity::from("5"))
+            .max_price(Price::from("9999.99"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(1.into())
+            .ts_init(2.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

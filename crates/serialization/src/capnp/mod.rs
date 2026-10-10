@@ -18,6 +18,9 @@
 //! This module provides Cap'n Proto serialization support for Nautilus domain types.
 //! The generated schema modules are available at the crate root for proper cross-referencing.
 //!
+//! **Warning:** The Cap'n Proto wire format is not yet stable and may change without notice
+//! between releases. Do not depend on wire compatibility across versions.
+//!
 //! # Generated Modules
 //!
 //! The following modules are generated from Cap'n Proto schemas:
@@ -31,16 +34,18 @@
 //! - `crate::position_capnp` - Position events
 //! - `crate::account_capnp` - Account events
 //! - `crate::market_capnp` - Market data types
+//! - `crate::instruments_capnp` - Instrument types
 
 pub mod conversions;
+pub mod instruments;
 
 // Re-export generated modules for convenience.
 // Re-export conversion functions for use by other crates
 pub use conversions::order_side_to_capnp;
 
 pub use crate::{
-    account_capnp, base_capnp, data_capnp, enums_capnp, identifiers_capnp, market_capnp,
-    order_capnp, position_capnp, trading_capnp, types_capnp,
+    account_capnp, base_capnp, data_capnp, enums_capnp, identifiers_capnp, instruments_capnp,
+    market_capnp, order_capnp, position_capnp, trading_capnp, types_capnp,
 };
 
 /// Trait for converting Rust types to Cap'n Proto builders.
@@ -48,7 +53,7 @@ pub trait ToCapnp<'a> {
     /// The Cap'n Proto builder type for this Rust type.
     type Builder;
 
-    /// Convert this Rust value to a Cap'n Proto builder.
+    /// Converts this Rust value to a Cap'n Proto builder.
     fn to_capnp(&self, builder: Self::Builder);
 }
 
@@ -57,7 +62,7 @@ pub trait FromCapnp<'a> {
     /// The Cap'n Proto reader type for this Rust type.
     type Reader;
 
-    /// Convert a Cap'n Proto reader to this Rust type.
+    /// Converts a Cap'n Proto reader to this Rust type.
     ///
     /// # Errors
     ///

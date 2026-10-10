@@ -15,7 +15,6 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -36,12 +35,11 @@ use crate::{
 
 /// Represents an event where an order was released from the `OrderEmulated` by the Nautilus system.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -56,6 +54,7 @@ pub struct OrderReleased {
     pub instrument_id: InstrumentId,
     /// The client order ID associated with the event.
     pub client_order_id: ClientOrderId,
+    /// The price the order was released at.
     pub released_price: Price,
     /// The unique identifier for the event.
     pub event_id: UUID4,
@@ -63,11 +62,15 @@ pub struct OrderReleased {
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the event was initialized.
     pub ts_init: UnixNanos,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderReleased {
     /// Creates a new [`OrderReleased`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -87,6 +90,7 @@ impl OrderReleased {
             event_id,
             ts_event,
             ts_init,
+            causation_id: None,
         }
     }
 }
@@ -206,6 +210,10 @@ impl OrderEvent for OrderReleased {
         None
     }
 
+    fn activation_price(&self) -> Option<Price> {
+        None
+    }
+
     fn trigger_price(&self) -> Option<Price> {
         None
     }
@@ -289,13 +297,41 @@ impl OrderEvent for OrderReleased {
     fn ts_init(&self) -> UnixNanos {
         self.ts_init
     }
+    fn causation_id(&self) -> Option<UUID4> {
+        self.causation_id
+    }
+
+    fn released_price(&self) -> Option<Price> {
+        Some(self.released_price)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::{UUID4, UnixNanos};
     use rstest::rstest;
 
-    use crate::events::order::{released::OrderReleased, stubs::*};
+    use crate::{
+        events::order::{released::OrderReleased, stubs::*},
+        identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+        types::Price,
+    };
+
+    fn distinct_order_released() -> OrderReleased {
+        let mut event = OrderReleased::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-002"),
+            InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            ClientOrderId::from("O-19700101-000000-001-001-3"),
+            Price::from("1234.56"),
+            UUID4::new(),
+            UnixNanos::from(111_222_333_444_555_666_u64),
+            UnixNanos::from(777_888_999_111_222_333_u64),
+        );
+        event.causation_id = Some(UUID4::new());
+        event
+    }
+
     #[rstest]
     fn test_order_released_display(order_released: OrderReleased) {
         let display = format!("{order_released}");
@@ -303,5 +339,24 @@ mod tests {
             display,
             "OrderReleased(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, released_price=22_000)"
         );
+    }
+
+    #[rstest]
+    fn test_order_released_serialization() {
+        let original = distinct_order_released();
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderReleased = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.trader_id, original.trader_id);
+        assert_eq!(deserialized.strategy_id, original.strategy_id);
+        assert_eq!(deserialized.instrument_id, original.instrument_id);
+        assert_eq!(deserialized.client_order_id, original.client_order_id);
+        assert_eq!(deserialized.released_price, original.released_price);
+        assert_eq!(deserialized.event_id, original.event_id);
+        assert_eq!(deserialized.ts_event, original.ts_event);
+        assert_eq!(deserialized.ts_init, original.ts_init);
+        assert_eq!(deserialized.causation_id, original.causation_id);
+        assert_eq!(deserialized, original);
     }
 }

@@ -22,8 +22,8 @@
 use std::str::FromStr;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, Data, OrderBookDelta, OrderBookDeltas, TradeTick},
@@ -38,7 +38,7 @@ use rust_decimal::Decimal;
 use super::{DydxWsError, DydxWsResult};
 use crate::{
     common::{
-        enums::{DydxOrderStatus, DydxPositionSide, DydxTickerType},
+        enums::{DydxOrderStatus, DydxTickerType},
         instrument_cache::InstrumentCache,
     },
     execution::{encoder::ClientOrderIdEncoder, types::OrderContext},
@@ -60,12 +60,12 @@ use crate::{
 ///
 /// # Arguments
 ///
-/// * `ws_order` - The WebSocket order message to parse
-/// * `instrument_cache` - Cache for looking up instruments by clob_pair_id
-/// * `order_contexts` - Map of dYdX u32 client IDs to order contexts
-/// * `encoder` - Bidirectional encoder for ClientOrderId ↔ u32 mapping
-/// * `account_id` - Account ID for the report
-/// * `ts_init` - Timestamp for initialization
+/// - `ws_order` - The WebSocket order message to parse
+/// - `instrument_cache` - Cache for looking up instruments by clob_pair_id
+/// - `order_contexts` - Map of dYdX u32 client IDs to order contexts
+/// - `encoder` - Bidirectional encoder for ClientOrderId ↔ u32 mapping
+/// - `account_id` - Account ID for the report
+/// - `ts_init` - Timestamp for initialization
 ///
 /// # Errors
 ///
@@ -211,8 +211,7 @@ fn convert_ws_order_to_http(
     let good_til_block_time = ws_order
         .good_til_block_time
         .as_ref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| s.parse::<Timestamp>().ok());
 
     let trigger_price = ws_order
         .trigger_price
@@ -223,8 +222,7 @@ fn convert_ws_order_to_http(
     let updated_at = ws_order
         .updated_at
         .as_ref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+        .and_then(|s| s.parse::<Timestamp>().ok());
 
     // Parse updated_at_height (optional for BEST_EFFORT_OPENED orders)
     let updated_at_height = ws_order
@@ -359,9 +357,10 @@ fn convert_ws_fill_to_http(ws_fill: &DydxWsFillSubaccountMessageContents) -> any
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Missing required field: order_id"))?;
 
-    let created_at = DateTime::parse_from_rfc3339(&ws_fill.created_at)
-        .context("Failed to parse created_at")?
-        .with_timezone(&Utc);
+    let created_at = ws_fill
+        .created_at
+        .parse::<Timestamp>()
+        .context("Failed to parse created_at")?;
 
     Ok(Fill {
         id: ws_fill.id.clone(),
@@ -468,23 +467,21 @@ fn convert_ws_position_to_http(
         .parse()
         .context("Failed to parse net_funding")?;
 
-    let created_at = DateTime::parse_from_rfc3339(&ws_position.created_at)
-        .context("Failed to parse created_at")?
-        .with_timezone(&Utc);
+    let created_at = ws_position
+        .created_at
+        .parse::<Timestamp>()
+        .context("Failed to parse created_at")?;
 
     let closed_at = ws_position
         .closed_at
         .as_ref()
-        .map(|s| DateTime::parse_from_rfc3339(s))
+        .map(|s| s.parse::<Timestamp>())
         .transpose()
-        .context("Failed to parse closed_at")?
-        .map(|dt| dt.with_timezone(&Utc));
+        .context("Failed to parse closed_at")?;
 
-    let side = if size.is_sign_positive() {
-        DydxPositionSide::Long
-    } else {
-        DydxPositionSide::Short
-    };
+    // Preserve the venue-supplied side; only derive from size sign when side is absent
+    // (the WS schema always provides it, but this keeps the behavior explicit).
+    let side = ws_position.side;
 
     Ok(PerpetualPosition {
         market: ws_position.market,
@@ -521,18 +518,36 @@ pub fn parse_orderbook_snapshot(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> DydxWsResult<OrderBookDeltas> {
-    let mut deltas = Vec::new();
-    deltas.push(OrderBookDelta::clear(*instrument_id, 0, ts_init, ts_init));
-
     let bids = contents.bids.as_deref().unwrap_or(&[]);
     let asks = contents.asks.as_deref().unwrap_or(&[]);
+
+    let mut deltas = Vec::with_capacity(1 + bids.len() + asks.len());
+    let snapshot_flag = RecordFlag::F_SNAPSHOT as u8;
+
+    // Empty book snapshot: Clear alone must carry F_SNAPSHOT | F_LAST
+    if bids.is_empty() && asks.is_empty() {
+        let clear_flags = snapshot_flag | RecordFlag::F_LAST as u8;
+        let mut clear_delta = OrderBookDelta::clear(*instrument_id, 0, ts_init, ts_init);
+        clear_delta.flags = clear_flags;
+        deltas.push(clear_delta);
+        return Ok(OrderBookDeltas::new(*instrument_id, deltas));
+    }
+
+    // Non-empty: Clear carries F_SNAPSHOT (not last)
+    let mut clear_delta = OrderBookDelta::clear(*instrument_id, 0, ts_init, ts_init);
+    clear_delta.flags = snapshot_flag;
+    deltas.push(clear_delta);
 
     let bids_len = bids.len();
     let asks_len = asks.len();
 
     for (idx, bid) in bids.iter().enumerate() {
         let is_last = idx == bids_len - 1 && asks_len == 0;
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
+        let flags = if is_last {
+            snapshot_flag | RecordFlag::F_LAST as u8
+        } else {
+            snapshot_flag
+        };
 
         let price = Decimal::from_str(&bid.price)
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse bid price: {e}")))?;
@@ -564,7 +579,11 @@ pub fn parse_orderbook_snapshot(
 
     for (idx, ask) in asks.iter().enumerate() {
         let is_last = idx == asks_len - 1;
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
+        let flags = if is_last {
+            snapshot_flag | RecordFlag::F_LAST as u8
+        } else {
+            snapshot_flag
+        };
 
         let price = Decimal::from_str(&ask.price)
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse ask price: {e}")))?;
@@ -625,7 +644,6 @@ pub fn parse_orderbook_deltas(
 /// # Errors
 ///
 /// Returns an error if price/size parsing fails.
-#[allow(clippy::too_many_arguments)]
 pub fn parse_orderbook_deltas_with_flag(
     instrument_id: &InstrumentId,
     contents: &DydxOrderbookContents,
@@ -738,9 +756,8 @@ pub fn parse_trade_ticks(
 
     for trade in &contents.trades {
         let aggressor_side = match trade.side {
-            OrderSide::Buy => AggressorSide::Buyer,
-            OrderSide::Sell => AggressorSide::Seller,
-            _ => continue,
+            OrderSide::Buy => AggressorSide::Buy,
+            OrderSide::Sell => AggressorSide::Sell,
         };
 
         let price = Decimal::from_str(&trade.price)
@@ -749,7 +766,7 @@ pub fn parse_trade_ticks(
         let size = Decimal::from_str(&trade.size)
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse trade size: {e}")))?;
 
-        let trade_ts = trade.created_at.timestamp_nanos_opt().ok_or_else(|| {
+        let trade_ts = u64::try_from(trade.created_at.as_nanosecond()).map_err(|_| {
             DydxWsError::Parse(format!("Timestamp out of range for trade {}", trade.id))
         })?;
 
@@ -763,7 +780,7 @@ pub fn parse_trade_ticks(
             })?,
             aggressor_side,
             TradeId::new(&trade.id),
-            UnixNanos::from(trade_ts as u64),
+            UnixNanos::from(trade_ts),
             ts_init,
         );
         ticks.push(Data::Trade(tick));
@@ -803,25 +820,21 @@ pub fn parse_candle_bar(
         .map_err(|e| DydxWsError::Parse(format!("Failed to parse volume: {e}")))?
         .unwrap_or(Decimal::ZERO);
 
-    let started_at_nanos = candle.started_at.timestamp_nanos_opt().ok_or_else(|| {
+    let started_at_nanos = u64::try_from(candle.started_at.as_nanosecond()).map_err(|_| {
         DydxWsError::Parse(format!(
             "Timestamp out of range for candle at {}",
             candle.started_at
         ))
     })?;
-    let mut ts_event = UnixNanos::from(started_at_nanos as u64);
+    let mut ts_event = UnixNanos::from(started_at_nanos);
 
     if timestamp_on_close {
-        let interval_ns = bar_type
-            .spec()
-            .timedelta()
-            .num_nanoseconds()
-            .ok_or_else(|| DydxWsError::Parse("Bar interval overflow".to_string()))?;
-        let updated = (started_at_nanos as u64)
-            .checked_add(interval_ns as u64)
-            .ok_or_else(|| {
-                DydxWsError::Parse("Bar timestamp overflowed adjusting to close time".to_string())
-            })?;
+        let interval_ns = bar_type.spec().timedelta().as_nanos();
+        let interval_ns = u64::try_from(interval_ns)
+            .map_err(|_| DydxWsError::Parse("Bar interval overflow".to_string()))?;
+        let updated = started_at_nanos.checked_add(interval_ns).ok_or_else(|| {
+            DydxWsError::Parse("Bar timestamp overflowed adjusting to close time".to_string())
+        })?;
         ts_event = UnixNanos::from(updated);
     }
 
@@ -859,9 +872,9 @@ mod tests {
         data::{BarType, Data},
         enums::{
             AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            PositionSideSpecified,
+            PositionSide,
         },
-        identifiers::{AccountId, InstrumentId, Symbol, Venue},
+        identifiers::{AccountId, InstrumentId, Symbol},
         instruments::{CryptoPerpetual, InstrumentAny},
         types::{Currency, Price, Quantity},
     };
@@ -872,6 +885,7 @@ mod tests {
     use super::*;
     use crate::{
         common::{
+            consts::DYDX_VENUE,
             enums::{
                 DydxFillType, DydxLiquidity, DydxMarketStatus, DydxOrderStatus, DydxOrderType,
                 DydxPositionSide, DydxPositionStatus, DydxTickerType, DydxTimeInForce,
@@ -893,7 +907,7 @@ mod tests {
             step_size: dec!(0.001),
             tick_size: dec!(0.01),
             index_price: Some(dec!(50000)),
-            oracle_price: dec!(50000),
+            oracle_price: Some(dec!(50000)),
             price_change_24h: dec!(0),
             next_funding_rate: dec!(0),
             next_funding_at: None,
@@ -924,35 +938,33 @@ mod tests {
     }
 
     fn create_test_instrument() -> InstrumentAny {
-        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
 
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("BTC-USD"),
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::USD(),
-            false,
-            2,
-            8,
-            Price::new(0.01, 2),
-            Quantity::new(0.001, 8),
-            Some(Quantity::new(1.0, 0)),
-            Some(Quantity::new(0.001, 8)),
-            Some(Quantity::new(100000.0, 8)),
-            Some(Quantity::new(0.001, 8)),
-            None,
-            None,
-            Some(Price::new(1000000.0, 2)),
-            Some(Price::new(0.01, 2)),
-            Some(rust_decimal_macros::dec!(0.05)),
-            Some(rust_decimal_macros::dec!(0.03)),
-            Some(rust_decimal_macros::dec!(0.0002)),
-            Some(rust_decimal_macros::dec!(0.0005)),
-            None, // info: Option<Params>
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("BTC-USD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::USD())
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(8)
+                .price_increment(Price::new(0.01, 2))
+                .size_increment(Quantity::new(0.001, 8))
+                .multiplier(Quantity::new(1.0, 0))
+                .lot_size(Quantity::new(0.001, 8))
+                .max_quantity(Quantity::new(100000.0, 8))
+                .min_quantity(Quantity::new(0.001, 8))
+                .max_price(Price::new(1000000.0, 2))
+                .min_price(Price::new(0.01, 2))
+                .margin_init(rust_decimal_macros::dec!(0.05))
+                .margin_maint(rust_decimal_macros::dec!(0.03))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     #[rstest]
@@ -1037,7 +1049,7 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.account_id, account_id);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, Some(OrderSide::Sell));
     }
 
     #[rstest]
@@ -1127,7 +1139,7 @@ mod tests {
     #[rstest]
     fn test_parse_ws_fill_report_success() {
         let instrument_cache = create_test_instrument_cache();
-        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
 
         // dYdX WS fills use market format "BTC-USD" (not "BTC-USD-PERP")
         // but the instrument symbol is "BTC-USD-PERP"
@@ -1261,10 +1273,85 @@ mod tests {
         assert_eq!(http_position.net_funding, rust_decimal_macros::dec!(-10.25));
     }
 
+    /// The converter must preserve the venue-supplied `side`, not re-derive it from
+    /// the sign of `size`. A zero-size position reported as `Long` must stay `Long`,
+    /// and a mismatched (Long, negative-size) payload must retain the venue side.
+    #[rstest]
+    #[case::long_positive(DydxPositionSide::Long, "1.0", DydxPositionSide::Long)]
+    #[case::short_negative(DydxPositionSide::Short, "-1.0", DydxPositionSide::Short)]
+    #[case::long_zero(DydxPositionSide::Long, "0.0", DydxPositionSide::Long)]
+    #[case::short_zero(DydxPositionSide::Short, "0.0", DydxPositionSide::Short)]
+    #[case::long_with_negative_size(DydxPositionSide::Long, "-1.0", DydxPositionSide::Long)]
+    #[case::short_with_positive_size(DydxPositionSide::Short, "1.0", DydxPositionSide::Short)]
+    fn test_convert_ws_position_preserves_venue_side(
+        #[case] venue_side: DydxPositionSide,
+        #[case] size: &str,
+        #[case] expected_side: DydxPositionSide,
+    ) {
+        let ws_position = DydxPerpetualPosition {
+            market: "BTC-USD".into(),
+            status: DydxPositionStatus::Open,
+            side: venue_side,
+            size: size.to_string(),
+            max_size: "1.0".to_string(),
+            entry_price: "50000.0".to_string(),
+            exit_price: None,
+            realized_pnl: "0.0".to_string(),
+            unrealized_pnl: "0.0".to_string(),
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            closed_at: None,
+            sum_open: "0.0".to_string(),
+            sum_close: "0.0".to_string(),
+            net_funding: "0.0".to_string(),
+        };
+
+        let http_position =
+            convert_ws_position_to_http(&ws_position).expect("conversion should succeed");
+        assert_eq!(http_position.side, expected_side);
+    }
+
+    /// End-to-end verification that the venue-supplied side flows through to the
+    /// emitted `PositionStatusReport`. The previous implementation re-derived side
+    /// from `size.is_sign_positive()` inside `parse_position_status_report`, which
+    /// silently overrode the venue side for the mismatched case below.
+    #[rstest]
+    fn test_ws_position_report_emits_venue_side_for_mismatched_size() {
+        use nautilus_model::enums::PositionSide;
+
+        let instrument_cache = create_test_instrument_cache();
+        // Venue reports a Short position but the `size` field would round to
+        // positive via the legacy sign check. The report must show Short.
+        let ws_position = DydxPerpetualPosition {
+            market: "BTC-USD".into(),
+            status: DydxPositionStatus::Open,
+            side: DydxPositionSide::Short,
+            size: "1.0".to_string(),
+            max_size: "1.0".to_string(),
+            entry_price: "50000.0".to_string(),
+            exit_price: None,
+            realized_pnl: "0.0".to_string(),
+            unrealized_pnl: "0.0".to_string(),
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            closed_at: None,
+            sum_open: "0.0".to_string(),
+            sum_close: "0.0".to_string(),
+            net_funding: "0.0".to_string(),
+        };
+
+        let report = parse_ws_position_report(
+            &ws_position,
+            &instrument_cache,
+            AccountId::new("DYDX-001"),
+            UnixNanos::default(),
+        )
+        .expect("parse should succeed");
+        assert_eq!(report.position_side, PositionSide::Short);
+    }
+
     #[rstest]
     fn test_parse_ws_position_report_success() {
         let instrument_cache = create_test_instrument_cache();
-        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
 
         let ws_position = DydxPerpetualPosition {
             market: "BTC-USD".into(),
@@ -1291,7 +1378,7 @@ mod tests {
 
         let position_report = result.unwrap();
         assert_eq!(position_report.instrument_id, instrument_id);
-        assert_eq!(position_report.position_side, PositionSideSpecified::Long);
+        assert_eq!(position_report.position_side, PositionSide::Long);
         assert_eq!(position_report.quantity.as_f64(), 0.5);
         // avg_px_open should be entry_price
         assert!(position_report.avg_px_open.is_some());
@@ -1300,7 +1387,7 @@ mod tests {
     #[rstest]
     fn test_parse_ws_position_report_short() {
         let instrument_cache = create_test_instrument_cache();
-        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
 
         let ws_position = DydxPerpetualPosition {
             market: "BTC-USD".into(),
@@ -1327,7 +1414,7 @@ mod tests {
 
         let position_report = result.unwrap();
         assert_eq!(position_report.instrument_id, instrument_id);
-        assert_eq!(position_report.position_side, PositionSideSpecified::Short);
+        assert_eq!(position_report.position_side, PositionSide::Short);
         assert_eq!(position_report.quantity.as_f64(), 0.25); // Quantity is always positive
     }
 
@@ -1585,7 +1672,7 @@ mod tests {
     #[rstest]
     fn test_parse_ws_position_closed() {
         let instrument_cache = create_test_instrument_cache();
-        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), Venue::new("DYDX"));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
 
         let ws_position = DydxPerpetualPosition {
             market: "BTC-USD".into(),
@@ -1721,17 +1808,94 @@ mod tests {
 
         assert_eq!(deltas.deltas[0].action, BookAction::Clear);
         assert_eq!(deltas.deltas[1].action, BookAction::Add);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, Some(OrderSide::Buy));
         assert_eq!(deltas.deltas[1].order.price.to_string(), "43240.00");
         assert_eq!(deltas.deltas[1].order.size.to_string(), "1.50000000");
 
         assert_eq!(deltas.deltas[4].action, BookAction::Add);
-        assert_eq!(deltas.deltas[4].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[4].order.side, Some(OrderSide::Sell));
         assert_eq!(deltas.deltas[4].order.price.to_string(), "43250.00");
         assert_eq!(deltas.deltas[4].order.size.to_string(), "1.20000000");
 
-        let last = deltas.deltas.last().unwrap();
-        assert_ne!(last.flags, 0);
+        // Every snapshot delta must carry F_SNAPSHOT. The Clear carries F_SNAPSHOT only
+        // (not last); every intermediate delta carries F_SNAPSHOT only; the terminator
+        // carries F_SNAPSHOT | F_LAST.
+        let snapshot = RecordFlag::F_SNAPSHOT as u8;
+        let last_flag = RecordFlag::F_LAST as u8;
+
+        assert_eq!(deltas.deltas[0].flags, snapshot, "Clear missing F_SNAPSHOT");
+        for (idx, delta) in deltas.deltas.iter().enumerate().skip(1) {
+            let expected = if idx == deltas.deltas.len() - 1 {
+                snapshot | last_flag
+            } else {
+                snapshot
+            };
+            assert_eq!(
+                delta.flags, expected,
+                "delta at index {idx} has wrong flags: got {:#010b}, expected {expected:#010b}",
+                delta.flags,
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::empty_book(vec![], vec![], 1)]
+    #[case::bids_only(vec![("100.0", "1.0")], vec![], 2)]
+    #[case::asks_only(vec![], vec![("101.0", "2.0")], 2)]
+    fn test_parse_orderbook_snapshot_flag_shapes(
+        #[case] bids: Vec<(&str, &str)>,
+        #[case] asks: Vec<(&str, &str)>,
+        #[case] expected_len: usize,
+    ) {
+        use crate::websocket::messages::DydxPriceLevel;
+        let contents = DydxOrderbookSnapshotContents {
+            bids: if bids.is_empty() {
+                None
+            } else {
+                Some(
+                    bids.into_iter()
+                        .map(|(p, s)| DydxPriceLevel {
+                            price: p.to_string(),
+                            size: s.to_string(),
+                        })
+                        .collect(),
+                )
+            },
+            asks: if asks.is_empty() {
+                None
+            } else {
+                Some(
+                    asks.into_iter()
+                        .map(|(p, s)| DydxPriceLevel {
+                            price: p.to_string(),
+                            size: s.to_string(),
+                        })
+                        .collect(),
+                )
+            },
+        };
+        let instrument_id = InstrumentId::from("BTC-USD-PERP.DYDX");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let deltas = parse_orderbook_snapshot(&instrument_id, &contents, 2, 8, ts_init)
+            .expect("Failed to parse orderbook snapshot");
+
+        let snapshot = RecordFlag::F_SNAPSHOT as u8;
+        let last_flag = RecordFlag::F_LAST as u8;
+
+        assert_eq!(deltas.deltas.len(), expected_len);
+
+        if expected_len == 1 {
+            // Empty book: Clear alone must carry F_SNAPSHOT | F_LAST so buffered
+            // subscribers flush when the book is empty.
+            assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+            assert_eq!(deltas.deltas[0].flags, snapshot | last_flag);
+        } else {
+            // Non-empty: Clear carries F_SNAPSHOT only; terminator carries both.
+            assert_eq!(deltas.deltas[0].flags, snapshot);
+            let terminator = deltas.deltas.last().unwrap();
+            assert_eq!(terminator.flags, snapshot | last_flag);
+        }
     }
 
     #[rstest]
@@ -1750,16 +1914,16 @@ mod tests {
         assert_eq!(deltas.deltas.len(), 4);
 
         assert_eq!(deltas.deltas[0].action, BookAction::Update);
-        assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[0].order.side, Some(OrderSide::Buy));
         assert_eq!(deltas.deltas[0].order.price.to_string(), "43240.00");
 
         // First ask with size 0.0 should be a Delete
         assert_eq!(deltas.deltas[2].action, BookAction::Delete);
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, Some(OrderSide::Sell));
         assert_eq!(deltas.deltas[2].order.price.to_string(), "43250.00");
 
         assert_eq!(deltas.deltas[3].action, BookAction::Update);
-        assert_eq!(deltas.deltas[3].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[3].order.side, Some(OrderSide::Sell));
     }
 
     #[rstest]
@@ -1780,7 +1944,7 @@ mod tests {
             assert_eq!(tick.instrument_id, instrument_id);
             assert_eq!(tick.price.to_string(), "43250.00");
             assert_eq!(tick.size.to_string(), "0.50000000");
-            assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+            assert_eq!(tick.aggressor_side, AggressorSide::Buy);
             assert_eq!(tick.trade_id.to_string(), "trade-001");
         } else {
             panic!("Expected Trade data");

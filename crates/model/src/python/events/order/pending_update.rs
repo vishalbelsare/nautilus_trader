@@ -29,7 +29,7 @@ use crate::{
 impl OrderPendingUpdate {
     /// Represents an event where an `ModifyOrder` command has been sent to the
     /// trading venue.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, account_id, event_id, ts_event, ts_init, reconciliation, venue_order_id=None))]
     fn py_new(
@@ -37,7 +37,7 @@ impl OrderPendingUpdate {
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
-        account_id: AccountId,
+        account_id: Option<AccountId>,
         event_id: UUID4,
         ts_event: u64,
         ts_init: u64,
@@ -72,6 +72,12 @@ impl OrderPendingUpdate {
 
     fn __str__(&self) -> String {
         self.to_string()
+    }
+
+    #[getter]
+    #[pyo3(name = "causation_id")]
+    fn py_causation_id(&self) -> Option<UUID4> {
+        self.causation_id
     }
 
     #[staticmethod]
@@ -112,7 +118,7 @@ impl OrderPendingUpdate {
 
     #[getter]
     #[pyo3(name = "account_id")]
-    fn py_account_id(&self) -> AccountId {
+    fn py_account_id(&self) -> Option<AccountId> {
         self.account_id
     }
 
@@ -137,7 +143,7 @@ impl OrderPendingUpdate {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[pyo3(name = "to_dict")]
@@ -148,7 +154,10 @@ impl OrderPendingUpdate {
         dict.set_item("strategy_id", self.strategy_id.to_string())?;
         dict.set_item("instrument_id", self.instrument_id.to_string())?;
         dict.set_item("client_order_id", self.client_order_id.to_string())?;
-        dict.set_item("account_id", self.account_id.to_string())?;
+        match self.account_id {
+            Some(account_id) => dict.set_item("account_id", account_id.to_string())?,
+            None => dict.set_item("account_id", py.None())?,
+        }
         dict.set_item("event_id", self.event_id.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
@@ -156,6 +165,11 @@ impl OrderPendingUpdate {
         match self.venue_order_id {
             Some(venue_order_id) => dict.set_item("venue_order_id", venue_order_id.to_string())?,
             None => dict.set_item("venue_order_id", py.None())?,
+        }
+
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
         }
         Ok(dict.into())
     }

@@ -16,15 +16,13 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    ops::Deref,
 };
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
-use pyo3::{prelude::*, pyclass::CompareOp, types::PyCapsule};
+use nautilus_core::python::{IntoPyObjectNautilusExt, serialization::to_dict_pyo3, to_pyvalue_err};
+use pyo3::{IntoPyObjectExt, prelude::*, pyclass::CompareOp, types::PyList};
 
-use super::data_to_pycapsule;
 use crate::{
-    data::{Data, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API},
+    data::{OrderBookDelta, OrderBookDeltas},
     identifiers::InstrumentId,
     python::common::PY_MODULE_MODEL,
 };
@@ -81,6 +79,13 @@ impl OrderBookDeltas {
         self.flags
     }
 
+    /// Returns whether the batch is a snapshot.
+    #[getter]
+    #[pyo3(name = "is_snapshot")]
+    fn py_is_snapshot(&self) -> bool {
+        self.is_snapshot()
+    }
+
     #[getter]
     #[pyo3(name = "sequence")]
     fn py_sequence(&self) -> u64 {
@@ -105,42 +110,29 @@ impl OrderBookDeltas {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(OrderBookDeltas))
     }
 
-    /// # Panics
-    ///
-    /// Panics if downcasting the Python object to `PyCapsule` fails.
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let reconstruct = py.get_type::<Self>().getattr("_from_dicts")?;
+        let delta_dicts: Vec<_> = self
+            .deltas
+            .iter()
+            .map(|d| to_dict_pyo3(py, d))
+            .collect::<PyResult<_>>()?;
+        let py_list = PyList::new(py, delta_dicts)?;
+        (reconstruct, (self.instrument_id, py_list)).into_py_any(py)
+    }
+
     #[staticmethod]
-    #[pyo3(name = "from_pycapsule")]
-    #[allow(unsafe_code)]
-    pub fn py_from_pycapsule(capsule: &Bound<'_, PyAny>) -> Self {
-        let capsule: &Bound<'_, PyCapsule> = capsule
-            .cast::<PyCapsule>()
-            .expect("Error on downcast to `&PyCapsule`");
-        let data: &OrderBookDeltas_API = unsafe {
-            &*(capsule.pointer_checked(None).unwrap().as_ptr() as *const OrderBookDeltas_API)
-        };
-        data.deref().clone()
+    fn _from_dicts(
+        instrument_id: InstrumentId,
+        delta_dicts: Vec<pyo3::Py<pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        use nautilus_core::python::serialization::from_dict_pyo3;
+        let deltas: Vec<OrderBookDelta> = pyo3::Python::attach(|py| {
+            delta_dicts
+                .into_iter()
+                .map(|d| from_dict_pyo3(py, d))
+                .collect::<PyResult<_>>()
+        })?;
+        Self::new_checked(instrument_id, deltas).map_err(to_pyvalue_err)
     }
-
-    /// Creates a `PyCapsule` containing a raw pointer to a [`Data::Deltas`] object.
-    ///
-    /// This function takes the current object (assumed to be of a type that can be represented as
-    /// `Data::Deltas`), and encapsulates a raw pointer to it within a `PyCapsule`.
-    ///
-    /// # Safety
-    ///
-    /// This function is safe as long as the following conditions are met:
-    /// - The `Data::Deltas` object pointed to by the capsule must remain valid for the lifetime of the capsule.
-    /// - The consumer of the capsule must ensure proper handling to avoid dereferencing a dangling pointer.
-    ///
-    /// # Panics
-    ///
-    /// The function will panic if the `PyCapsule` creation fails, which can occur if the
-    /// [`Data::Deltas`] object cannot be converted into a raw pointer.
-    #[pyo3(name = "as_pycapsule")]
-    fn py_as_pycapsule(&self, py: Python<'_>) -> Py<PyAny> {
-        let deltas = OrderBookDeltas_API::new(self.clone());
-        data_to_pycapsule(py, Data::Deltas(deltas))
-    }
-
-    // TODO: Implement `Serializable` and the other methods can be added
 }

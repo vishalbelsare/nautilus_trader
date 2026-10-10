@@ -15,9 +15,12 @@
 
 //! Per-series option chain aggregator for event accumulation and snapshots.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
+};
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     data::{
         QuoteTick,
@@ -27,10 +30,11 @@ use nautilus_model::{
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
+use rust_decimal::prelude::ToPrimitive;
 
 use super::{
     AtmTracker,
-    constants::{DEFAULT_REBALANCE_COOLDOWN_NS, DEFAULT_REBALANCE_HYSTERESIS},
+    constants::{DEFAULT_REBALANCE_COOLDOWN, DEFAULT_REBALANCE_HYSTERESIS},
 };
 
 /// Per-series aggregator that accumulates quotes and greeks between snapshots.
@@ -55,7 +59,7 @@ pub struct OptionChainAggregator {
     /// Hysteresis band for ATM rebalancing.
     hysteresis: f64,
     /// Minimum nanoseconds between rebalances.
-    cooldown_ns: u64,
+    cooldown_ns: DurationNanos,
     /// Timestamp of the last rebalance.
     last_rebalance_ns: Option<UnixNanos>,
     /// Maximum `ts_event` seen across all quote updates.
@@ -81,35 +85,24 @@ impl OptionChainAggregator {
         atm_tracker: AtmTracker,
         instruments: HashMap<InstrumentId, (Price, OptionKind)>,
     ) -> Self {
-        let all_strikes = Self::sorted_strikes(&instruments);
-        let atm_price = atm_tracker.atm_price();
-        let active_strikes: HashSet<Price> = strike_range
-            .resolve(atm_price, &all_strikes)
-            .into_iter()
-            .collect();
-        let active_ids: HashSet<InstrumentId> = instruments
-            .iter()
-            .filter(|(_, (strike, _))| active_strikes.contains(strike))
-            .map(|(id, _)| *id)
-            .collect();
-        let last_atm_strike =
-            atm_price.and_then(|atm| Self::find_closest_strike(&all_strikes, atm));
-
-        Self {
+        let mut aggregator = Self {
             series_id,
             strike_range,
             atm_tracker,
             instruments,
-            active_ids,
-            last_atm_strike,
+            active_ids: HashSet::new(),
+            last_atm_strike: None,
             hysteresis: DEFAULT_REBALANCE_HYSTERESIS,
-            cooldown_ns: DEFAULT_REBALANCE_COOLDOWN_NS,
+            cooldown_ns: DEFAULT_REBALANCE_COOLDOWN,
             last_rebalance_ns: None,
             max_ts_event: UnixNanos::default(),
             pending_greeks: HashMap::new(),
             call_buffer: BTreeMap::new(),
             put_buffer: BTreeMap::new(),
-        }
+        };
+        // No Greeks exist at construction, so a `Delta` range resolves to its ATM fallback.
+        aggregator.recompute_active_set();
+        aggregator
     }
 
     /// Returns a mutable reference to the ATM tracker.
@@ -133,6 +126,12 @@ impl OptionChainAggregator {
     #[must_use]
     pub fn series_id(&self) -> OptionSeriesId {
         self.series_id
+    }
+
+    /// Returns `true` if the given timestamp is at or past the series expiration.
+    #[must_use]
+    pub fn is_expired(&self, now_ns: UnixNanos) -> bool {
+        now_ns >= self.series_id.expiration_ns
     }
 
     /// Returns a reference to the full instrument set.
@@ -198,8 +197,7 @@ impl OptionChainAggregator {
         let atm_price = self.atm_tracker.atm_price();
         let all_strikes = Self::sorted_strikes(&self.instruments);
         let active_strikes: HashSet<Price> = self
-            .strike_range
-            .resolve(atm_price, &all_strikes)
+            .resolve_active_strikes(atm_price, &all_strikes)
             .into_iter()
             .collect();
         self.active_ids = self
@@ -211,6 +209,138 @@ impl OptionChainAggregator {
         self.last_atm_strike =
             atm_price.and_then(|atm| Self::find_closest_strike(&all_strikes, atm));
         self.active_ids.iter().copied().collect()
+    }
+
+    /// Resolves the active strikes for the current strike range.
+    ///
+    /// `Delta` is resolved here from stored Greeks (see [`Self::resolve_delta`]);
+    /// the price-based variants delegate to [`StrikeRange::resolve`].
+    fn resolve_active_strikes(
+        &self,
+        atm_price: Option<Price>,
+        all_strikes: &[Price],
+    ) -> Vec<Price> {
+        match &self.strike_range {
+            StrikeRange::Delta { target, tolerance } => {
+                self.resolve_delta(*target, *tolerance, atm_price, all_strikes)
+            }
+            _ => self.strike_range.resolve(atm_price, all_strikes),
+        }
+    }
+
+    /// Resolves strikes whose buffered or pending Greeks have an absolute delta
+    /// within `tolerance` of `target`.
+    ///
+    /// A strike qualifies when either its call or put delta magnitude matches
+    /// (calls have positive delta, puts negative; both are compared by absolute
+    /// value), so a typical target selects an OTM strike on each side of ATM.
+    /// Strikes with only pending Greeks (received before their first quote) are
+    /// eligible. Before the resolver changes from a fallback set to a selected
+    /// set, every current fallback leg must have Greeks. This avoids unsubscribing
+    /// legs whose Greeks have not arrived yet, including when the fallback window
+    /// shifts with ATM. When no Greeks fall in the band, this falls back to the
+    /// ATM-relative window from [`StrikeRange::resolve`].
+    fn resolve_delta(
+        &self,
+        target: f64,
+        tolerance: f64,
+        atm_price: Option<Price>,
+        all_strikes: &[Price],
+    ) -> Vec<Price> {
+        let selected: Vec<Price> = self
+            .deltas_by_strike()
+            .into_iter()
+            .filter(|(_, deltas)| {
+                deltas
+                    .iter()
+                    .any(|delta| Self::delta_within_band(*delta, target, tolerance))
+            })
+            .map(|(strike, _)| strike)
+            .collect();
+
+        let fallback_strikes = self.strike_range.resolve(atm_price, all_strikes);
+
+        if selected.is_empty() {
+            return fallback_strikes;
+        }
+
+        let selected_ids = self.instrument_ids_for_strikes(&selected);
+        let fallback_ids = self.instrument_ids_for_strikes(&fallback_strikes);
+
+        if self.active_ids != selected_ids && !self.delta_window_ready(&fallback_ids) {
+            return fallback_strikes;
+        }
+
+        selected
+    }
+
+    fn instrument_ids_for_strikes(&self, strikes: &[Price]) -> HashSet<InstrumentId> {
+        let strike_set: HashSet<Price> = strikes.iter().copied().collect();
+        self.instruments
+            .iter()
+            .filter(|(_, (strike, _))| strike_set.contains(strike))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn delta_window_ready(&self, instrument_ids: &HashSet<InstrumentId>) -> bool {
+        !instrument_ids.is_empty()
+            && instrument_ids
+                .iter()
+                .all(|id| self.instrument_has_greeks(id))
+    }
+
+    fn instrument_has_greeks(&self, instrument_id: &InstrumentId) -> bool {
+        if self.pending_greeks.contains_key(instrument_id) {
+            return true;
+        }
+
+        let Some((strike, kind)) = self.instruments.get(instrument_id) else {
+            return false;
+        };
+        let buffer = match kind {
+            OptionKind::Call => &self.call_buffer,
+            OptionKind::Put => &self.put_buffer,
+        };
+
+        buffer
+            .get(strike)
+            .and_then(|data| data.greeks.as_ref())
+            .is_some()
+    }
+
+    /// Collects every reported delta per strike, from buffered Greeks and from
+    /// Greeks still pending their first quote.
+    fn deltas_by_strike(&self) -> BTreeMap<Price, Vec<f64>> {
+        let mut deltas_by_strike: BTreeMap<Price, Vec<f64>> = BTreeMap::new();
+
+        for (strike, data) in self.call_buffer.iter().chain(self.put_buffer.iter()) {
+            if let Some(greeks) = data.greeks.as_ref() {
+                deltas_by_strike
+                    .entry(*strike)
+                    .or_default()
+                    .push(greeks.delta);
+            }
+        }
+
+        for (id, greeks) in &self.pending_greeks {
+            if let Some((strike, _)) = self.instruments.get(id) {
+                deltas_by_strike
+                    .entry(*strike)
+                    .or_default()
+                    .push(greeks.delta);
+            }
+        }
+
+        deltas_by_strike
+    }
+
+    /// Returns `true` when `delta`'s magnitude is within `tolerance` of `target`.
+    ///
+    /// Compares by absolute value so a put (negative delta) matches the same
+    /// target as the equivalent call.
+    fn delta_within_band(delta: f64, target: f64, tolerance: f64) -> bool {
+        (delta.abs() - target).abs() <= tolerance
     }
 
     /// Adds a newly discovered instrument to the series.
@@ -236,8 +366,7 @@ impl OptionChainAggregator {
         let all_strikes = Self::sorted_strikes(&self.instruments);
         let atm_price = self.atm_tracker.atm_price();
         let active_strikes: HashSet<Price> = self
-            .strike_range
-            .resolve(atm_price, &all_strikes)
+            .resolve_active_strikes(atm_price, &all_strikes)
             .into_iter()
             .collect();
 
@@ -260,16 +389,22 @@ impl OptionChainAggregator {
     fn find_closest_strike(all_strikes: &[Price], atm: Price) -> Option<Price> {
         all_strikes
             .iter()
-            .min_by(|a, b| {
-                let da = (a.as_f64() - atm.as_f64()).abs();
-                let db = (b.as_f64() - atm.as_f64()).abs();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by_key(|strike| strike.raw().abs_diff(atm.raw()))
             .copied()
     }
 
     /// Handles an incoming quote tick by updating the accumulator buffers.
     pub fn update_quote(&mut self, quote: &QuoteTick) {
+        if self.is_expired(quote.ts_event) {
+            log::warn!(
+                "Dropping quote for {}, series {} expired at {}",
+                quote.instrument_id,
+                self.series_id,
+                self.series_id.expiration_ns,
+            );
+            return;
+        }
+
         if !self.active_ids.contains(&quote.instrument_id) {
             return;
         }
@@ -284,6 +419,7 @@ impl OptionChainAggregator {
                 OptionKind::Call => &mut self.call_buffer,
                 OptionKind::Put => &mut self.put_buffer,
             };
+
             match buffer.get_mut(&strike) {
                 Some(data) => data.quote = *quote,
                 None => {
@@ -307,6 +443,16 @@ impl OptionChainAggregator {
     /// the greeks are stored in `pending_greeks` and will be attached when
     /// the first quote arrives.
     pub fn update_greeks(&mut self, greeks: &OptionGreeks) {
+        if self.is_expired(greeks.ts_event) {
+            log::warn!(
+                "Dropping greeks for {}, series {} expired at {}",
+                greeks.instrument_id,
+                self.series_id,
+                self.series_id.expiration_ns,
+            );
+            return;
+        }
+
         if !self.active_ids.contains(&greeks.instrument_id) {
             return;
         }
@@ -316,10 +462,11 @@ impl OptionChainAggregator {
                 OptionKind::Call => &mut self.call_buffer,
                 OptionKind::Put => &mut self.put_buffer,
             };
+
             match buffer.get_mut(&strike) {
                 Some(data) => data.greeks = Some(*greeks),
                 None => {
-                    // No quote yet — park the greeks for later
+                    // No quote yet: park the greeks for later
                     self.pending_greeks.insert(greeks.instrument_id, *greeks);
                 }
             }
@@ -352,12 +499,14 @@ impl OptionChainAggregator {
 
         // Build filtered snapshot (clone from buffers)
         let mut calls = BTreeMap::new();
+
         for (strike, data) in &self.call_buffer {
             if active_strikes.contains(strike) {
                 calls.insert(*strike, data.clone());
             }
         }
         let mut puts = BTreeMap::new();
+
         for (strike, data) in &self.put_buffer {
             if active_strikes.contains(strike) {
                 puts.insert(*strike, data.clone());
@@ -393,6 +542,11 @@ impl OptionChainAggregator {
     /// ATM strike unchanged, hysteresis not exceeded, or cooldown not elapsed).
     /// Returns `Some(RebalanceAction)` with instrument add/remove lists when the
     /// closest ATM strike shifts past the hysteresis threshold.
+    ///
+    /// `Delta` ranges resolve from Greeks rather than an ATM window, so their
+    /// active set can change while the closest ATM strike is unchanged. They skip
+    /// the ATM-shift and hysteresis gates and rebalance on any resolved-set change,
+    /// with the cooldown still applied to throttle churn.
     #[must_use]
     pub fn check_rebalance(&self, now_ns: UnixNanos) -> Option<RebalanceAction> {
         // Fixed ranges never rebalance
@@ -404,52 +558,47 @@ impl OptionChainAggregator {
         let all_strikes = Self::sorted_strikes(&self.instruments);
         let current_atm_strike = Self::find_closest_strike(&all_strikes, atm_price)?;
 
-        // No change → no rebalance
-        if self.last_atm_strike == Some(current_atm_strike) {
-            return None;
-        }
+        let is_delta = matches!(self.strike_range, StrikeRange::Delta { .. });
 
-        // Hysteresis check: price must cross hysteresis fraction of the gap to next strike
-        if let Some(last_strike) = self.last_atm_strike
-            && self.hysteresis > 0.0
-        {
-            let last_f = last_strike.as_f64();
-            let atm_f = atm_price.as_f64();
-            let direction = atm_f - last_f;
+        if !is_delta {
+            // No change: no rebalance
+            if self.last_atm_strike == Some(current_atm_strike) {
+                return None;
+            }
 
-            // Find the next strike in the direction of price movement
-            let next_strike = if direction > 0.0 {
-                all_strikes.iter().find(|s| s.as_f64() > last_f)
-            } else {
-                all_strikes.iter().rev().find(|s| s.as_f64() < last_f)
-            };
+            // Hysteresis check: price must cross hysteresis fraction of the gap to next strike
+            if let Some(last_strike) = self.last_atm_strike
+                && self.hysteresis > 0.0
+            {
+                // Find the next strike in the direction of price movement
+                let next_strike = match atm_price.cmp(&last_strike) {
+                    Ordering::Greater => all_strikes.iter().find(|s| **s > last_strike),
+                    Ordering::Less => all_strikes.iter().rev().find(|s| **s < last_strike),
+                    Ordering::Equal => None,
+                };
 
-            if let Some(next) = next_strike {
-                let gap = (next.as_f64() - last_f).abs();
-                let threshold = last_f + direction.signum() * self.hysteresis * gap;
-                // Check if price has not crossed the threshold
-                if direction > 0.0 && atm_f < threshold {
-                    return None;
-                }
-
-                if direction < 0.0 && atm_f > threshold {
-                    return None;
+                if let Some(next) = next_strike {
+                    let progress = (atm_price.as_decimal() - last_strike.as_decimal()).abs();
+                    let gap = (next.as_decimal() - last_strike.as_decimal()).abs();
+                    let progress_ratio = (progress / gap).to_f64().unwrap_or(f64::MAX);
+                    if progress_ratio < self.hysteresis {
+                        return None;
+                    }
                 }
             }
         }
 
         // Cooldown check
-        if self.cooldown_ns > 0
+        if !self.cooldown_ns.is_zero()
             && let Some(last_ts) = self.last_rebalance_ns
-            && now_ns.as_u64().saturating_sub(last_ts.as_u64()) < self.cooldown_ns
+            && now_ns.saturating_duration_since(last_ts) < self.cooldown_ns
         {
             return None;
         }
 
         // Compute new active set
         let new_active_strikes: HashSet<Price> = self
-            .strike_range
-            .resolve(Some(atm_price), &all_strikes)
+            .resolve_active_strikes(Some(atm_price), &all_strikes)
             .into_iter()
             .collect();
         let new_active: HashSet<InstrumentId> = self
@@ -459,8 +608,14 @@ impl OptionChainAggregator {
             .map(|(id, _)| *id)
             .collect();
 
-        let add = new_active.difference(&self.active_ids).copied().collect();
-        let remove = self.active_ids.difference(&new_active).copied().collect();
+        let add: Vec<InstrumentId> = new_active.difference(&self.active_ids).copied().collect();
+        let remove: Vec<InstrumentId> = self.active_ids.difference(&new_active).copied().collect();
+
+        // Suppress no-op delta rebalances so the cooldown timestamp is not reset on
+        // every snapshot while the resolved set is stable.
+        if is_delta && add.is_empty() && remove.is_empty() {
+            return None;
+        }
 
         Some(RebalanceAction { add, remove })
     }
@@ -471,6 +626,7 @@ impl OptionChainAggregator {
         for id in &action.add {
             self.active_ids.insert(*id);
         }
+
         for id in &action.remove {
             self.active_ids.remove(id);
         }
@@ -529,7 +685,7 @@ impl OptionChainAggregator {
         self.hysteresis = h;
     }
 
-    fn set_cooldown_ns(&mut self, ns: u64) {
+    fn set_cooldown_ns(&mut self, ns: DurationNanos) {
         self.cooldown_ns = ns;
     }
 
@@ -546,7 +702,7 @@ mod tests {
     use super::*;
 
     fn make_series_id() -> OptionSeriesId {
-        OptionSeriesId::new(
+        OptionSeriesId::new_derived(
             Venue::new("DERIBIT"),
             ustr::Ustr::from("BTC"),
             ustr::Ustr::from("BTC"),
@@ -571,7 +727,7 @@ mod tests {
         UnixNanos::from(1_000_000_000_000_000_000u64)
     }
 
-    /// Sets ATM price on an aggregator via a synthetic OptionGreeks with the given forward price.
+    /// Sets ATM price on an aggregator via a synthetic `OptionGreeks` with the given forward price.
     fn set_atm_via_greeks(agg: &mut OptionChainAggregator, price: f64) {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
@@ -599,6 +755,29 @@ mod tests {
         );
 
         (agg, call_id, put_id)
+    }
+
+    #[rstest]
+    fn test_find_closest_strike_preserves_subprecision_atm() {
+        let mut atm = Price::from("100.75");
+        atm.precision = 0;
+        let strikes = [Price::from("100"), Price::from("101")];
+        assert_eq!(
+            OptionChainAggregator::find_closest_strike(&strikes, atm),
+            Some(strikes[1])
+        );
+    }
+
+    #[rstest]
+    fn test_find_closest_strike_prefers_exact_high_value_match() {
+        let collapsed = Price::from("9007199253.999000000");
+        let atm = Price::from("9007199253.999000001");
+        let strikes = [collapsed, atm];
+        assert_eq!(collapsed.as_f64(), atm.as_f64());
+
+        let result = OptionChainAggregator::find_closest_strike(&strikes, atm);
+
+        assert_eq!(result, Some(atm));
     }
 
     #[rstest]
@@ -681,11 +860,12 @@ mod tests {
 
     // -- Rebalance tests --
 
-    /// Builds instruments with 5 strike prices (45000..55000 step 2500) and AtmRelative +-1.
+    /// Builds instruments with 5 strike prices (45000..55000 step 2500) and `AtmRelative` +-1.
     /// Hysteresis and cooldown are disabled so existing rebalance tests pass unchanged.
     fn make_multi_strike_aggregator() -> OptionChainAggregator {
         let strikes = [45000, 47500, 50000, 52500, 55000];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -706,13 +886,13 @@ mod tests {
         );
         // Disable guards so existing tests exercise pure rebalance logic
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
         agg
     }
 
     #[rstest]
     fn test_check_rebalance_fixed_always_none() {
-        // Fixed range + ATM price set → still returns None
+        // Fixed range + ATM price set: still returns None
         let (mut agg, _, _) = make_aggregator();
         set_atm_via_greeks(&mut agg, 50000.0);
         assert!(agg.check_rebalance(now()).is_none());
@@ -721,7 +901,7 @@ mod tests {
     #[rstest]
     fn test_check_rebalance_no_atm_returns_none() {
         let agg = make_multi_strike_aggregator();
-        // No ATM price set → None
+        // No ATM price set: None
         assert!(agg.check_rebalance(now()).is_none());
     }
 
@@ -730,7 +910,7 @@ mod tests {
         let mut agg = make_multi_strike_aggregator();
         // Set ATM to 50000 and apply initial rebalance
         set_atm_via_greeks(&mut agg, 50000.0);
-        // First check detects ATM shift (from None → 50000)
+        // First check detects ATM shift from None to 50000
         let action = agg.check_rebalance(now()).unwrap();
         agg.apply_rebalance(&action, now());
 
@@ -747,7 +927,7 @@ mod tests {
         let action = agg.check_rebalance(now()).unwrap();
         agg.apply_rebalance(&action, now());
         // Active: 47500, 50000, 52500 (ATM=50000, +-1 strike)
-        assert_eq!(agg.instrument_ids().len(), 6); // 3 strikes × 2
+        assert_eq!(agg.instrument_ids().len(), 6); // 3 strikes * 2
 
         // Now shift ATM to 55000
         set_atm_via_greeks(&mut agg, 55000.0);
@@ -766,16 +946,16 @@ mod tests {
 
         // Active should be 3 strikes (47500, 50000, 52500)
         let active_ids = agg.instrument_ids();
-        assert_eq!(active_ids.len(), 6); // 3 strikes × 2 (call + put)
+        assert_eq!(active_ids.len(), 6); // 3 strikes * 2 (call + put)
 
         // Now shift to 55000
         set_atm_via_greeks(&mut agg, 55000.0);
         let action2 = agg.check_rebalance(now()).unwrap();
         agg.apply_rebalance(&action2, now());
 
-        // Active should now be (52500, 55000) — 2 strikes at the top end
+        // Active should now be (52500, 55000): 2 strikes at the top end
         let active_ids2 = agg.instrument_ids();
-        assert_eq!(active_ids2.len(), 4); // 2 strikes × 2
+        assert_eq!(active_ids2.len(), 4); // 2 strikes * 2
     }
 
     #[rstest]
@@ -804,7 +984,7 @@ mod tests {
     #[rstest]
     fn test_initial_active_set_empty_when_no_atm() {
         let agg = make_multi_strike_aggregator();
-        // AtmRelative with no ATM price → empty active set (deferred)
+        // AtmRelative with no ATM price: empty active set (deferred)
         assert_eq!(agg.instrument_ids().len(), 0);
         assert_eq!(agg.all_instrument_ids().len(), 10);
     }
@@ -882,7 +1062,7 @@ mod tests {
         assert!(result);
         assert!(!agg.active_ids().contains(&new_id));
 
-        // Shift ATM to 57500 — rebalance should pick up the new instrument
+        // Shift ATM to 57500: rebalance should pick up the new instrument
         set_atm_via_greeks(&mut agg, 57500.0);
         let action2 = agg.check_rebalance(now()).unwrap();
         agg.apply_rebalance(&action2, now());
@@ -896,6 +1076,7 @@ mod tests {
     fn test_hysteresis_blocks_small_movement() {
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -912,7 +1093,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -920,7 +1101,7 @@ mod tests {
         agg.apply_rebalance(&action, now());
         assert_eq!(agg.last_atm_strike(), Some(Price::from("50000")));
 
-        // Move ATM slightly toward 52500 — gap=2500, threshold=50000+0.6*2500=51500
+        // Move ATM slightly toward 52500: gap=2500, threshold=50000+0.6*2500=51500
         // 51000 does NOT cross 51500
         set_atm_via_greeks(&mut agg, 51000.0);
         assert!(agg.check_rebalance(now()).is_none());
@@ -930,6 +1111,7 @@ mod tests {
     fn test_hysteresis_allows_large_movement() {
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -946,7 +1128,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -959,10 +1141,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_hysteresis_exact_strike_gap_boundary() {
+        let lower = Price::from("9007199253.999000000");
+        let upper = Price::from("9007199253.999002800");
+        let blocked = Price::from("9007199253.999001673");
+        let allowed = Price::from("9007199253.999001680");
+        let mut instruments = HashMap::new();
+        instruments.insert(
+            InstrumentId::from("BTC-LOW-C.DERIBIT"),
+            (lower, OptionKind::Call),
+        );
+        instruments.insert(
+            InstrumentId::from("BTC-HIGH-C.DERIBIT"),
+            (upper, OptionKind::Call),
+        );
+        let mut tracker = AtmTracker::new();
+        tracker.set_initial_price(lower);
+        let mut agg = OptionChainAggregator::new(
+            make_series_id(),
+            StrikeRange::AtmRelative {
+                strikes_above: 0,
+                strikes_below: 0,
+            },
+            tracker,
+            instruments,
+        );
+        agg.set_hysteresis(0.6);
+        agg.set_cooldown_ns(DurationNanos::default());
+
+        agg.atm_tracker_mut().set_initial_price(blocked);
+        assert!(agg.check_rebalance(now()).is_none());
+
+        agg.atm_tracker_mut().set_initial_price(allowed);
+        assert!(agg.check_rebalance(now()).is_some());
+    }
+
+    #[rstest]
     fn test_zero_hysteresis_disables_guard() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let action = agg.check_rebalance(now()).unwrap();
@@ -979,14 +1197,14 @@ mod tests {
     fn test_cooldown_blocks_rapid_rebalance() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(5_000_000_000); // 5s
+        agg.set_cooldown_ns(DurationNanos::from_secs(5));
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
         let action = agg.check_rebalance(t0).unwrap();
         agg.apply_rebalance(&action, t0);
 
-        // Shift ATM immediately — cooldown blocks
+        // Shift ATM immediately: cooldown blocks
         set_atm_via_greeks(&mut agg, 55000.0);
         let t1 = UnixNanos::from(t0.as_u64() + 1_000_000_000); // 1s later
         assert!(agg.check_rebalance(t1).is_none());
@@ -996,7 +1214,7 @@ mod tests {
     fn test_cooldown_allows_after_elapsed() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(5_000_000_000); // 5s
+        agg.set_cooldown_ns(DurationNanos::from_secs(5));
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
@@ -1013,14 +1231,14 @@ mod tests {
     fn test_zero_cooldown_disables_guard() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
         let action = agg.check_rebalance(t0).unwrap();
         agg.apply_rebalance(&action, t0);
 
-        // Shift ATM immediately — no cooldown block
+        // Shift ATM immediately: no cooldown block
         set_atm_via_greeks(&mut agg, 55000.0);
         assert!(agg.check_rebalance(t0).is_some());
     }
@@ -1043,7 +1261,7 @@ mod tests {
         agg.update_greeks(&greeks);
         assert_eq!(agg.pending_greeks_count(), 1);
 
-        // Now send the first quote — pending greeks should be consumed
+        // Now send the first quote: pending greeks should be consumed
         let quote = make_quote(call_id, "100.00", "101.00");
         agg.update_quote(&quote);
         assert_eq!(agg.pending_greeks_count(), 0);
@@ -1078,7 +1296,7 @@ mod tests {
             Price::from("51.00"),
             Quantity::from("1.0"),
             Quantity::from("1.0"),
-            UnixNanos::from(800u64), // ts_event — later
+            UnixNanos::from(800u64), // ts_event: later
             UnixNanos::from(800u64),
         );
         agg.update_quote(&quote2);
@@ -1092,7 +1310,7 @@ mod tests {
     fn test_snapshot_ts_event_fallback_when_no_quotes() {
         let (agg, _, _) = make_aggregator();
         let slice = agg.snapshot(UnixNanos::from(1000u64));
-        // No quotes → ts_event falls back to ts_init
+        // No quotes: ts_event falls back to ts_init
         assert_eq!(slice.ts_event, UnixNanos::from(1000u64));
     }
 
@@ -1101,6 +1319,7 @@ mod tests {
         // Setup: 3 strikes at 47500/50000/52500, AtmRelative +-1, hysteresis enabled
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -1117,7 +1336,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000, rebalance -> active: {47500, 50000, 52500}
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -1191,7 +1410,7 @@ mod tests {
         agg.update_quote(&quote);
         assert_eq!(agg.call_buffer_len(), 1);
 
-        // Remove original — sibling still shares the strike+kind
+        // Remove original: sibling still shares the strike+kind
         let _ = agg.remove_instrument(&call_id);
         assert_eq!(agg.call_buffer_len(), 1); // buffer preserved
         assert!(agg.instruments().contains_key(&sibling_id));
@@ -1233,5 +1452,339 @@ mod tests {
 
         let _ = agg.remove_instrument(&put_id);
         assert!(agg.is_catalog_empty());
+    }
+
+    // -- Expiry guard tests --
+
+    #[rstest]
+    fn test_expired_quote_is_dropped() {
+        let (mut agg, call_id, _) = make_aggregator();
+        // Series expires at 1_700_000_000_000_000_000; send quote AT that timestamp
+        let expired_quote = QuoteTick::new(
+            call_id,
+            Price::from("100.00"),
+            Price::from("101.00"),
+            Quantity::from("1.0"),
+            Quantity::from("1.0"),
+            UnixNanos::from(1_700_000_000_000_000_000u64),
+            UnixNanos::from(1_700_000_000_000_000_000u64),
+        );
+        agg.update_quote(&expired_quote);
+        assert!(agg.is_buffer_empty());
+    }
+
+    #[rstest]
+    fn test_expired_greeks_are_dropped() {
+        let (mut agg, call_id, _) = make_aggregator();
+        // First add a valid quote so greeks would normally land in the buffer
+        let quote = make_quote(call_id, "100.00", "101.00");
+        agg.update_quote(&quote);
+        assert_eq!(agg.call_buffer_len(), 1);
+
+        // Send greeks at expiry timestamp: should be dropped
+        let greeks = OptionGreeks {
+            instrument_id: call_id,
+            ts_event: UnixNanos::from(1_700_000_000_000_000_000u64),
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        agg.update_greeks(&greeks);
+
+        let strike = Price::from("50000");
+        assert!(agg.get_call_greeks_from_buffer(&strike).is_none());
+    }
+
+    // -- Delta range tests --
+
+    /// Builds a `Delta`-range aggregator over `strikes` (call + put per strike),
+    /// with hysteresis and cooldown disabled so rebalance decisions reflect pure
+    /// delta resolution.
+    fn make_delta_aggregator(
+        strikes: &[i64],
+        target: f64,
+        tolerance: f64,
+    ) -> OptionChainAggregator {
+        let mut instruments = HashMap::new();
+
+        for s in strikes {
+            let strike = Price::from(&s.to_string());
+            instruments.insert(option_id(*s, OptionKind::Call), (strike, OptionKind::Call));
+            instruments.insert(option_id(*s, OptionKind::Put), (strike, OptionKind::Put));
+        }
+        let tracker = AtmTracker::new();
+        let mut agg = OptionChainAggregator::new(
+            make_series_id(),
+            StrikeRange::Delta { target, tolerance },
+            tracker,
+            instruments,
+        );
+        agg.set_hysteresis(0.0);
+        agg.set_cooldown_ns(DurationNanos::default());
+        agg
+    }
+
+    fn option_id(strike: i64, kind: OptionKind) -> InstrumentId {
+        let suffix = match kind {
+            OptionKind::Call => "C",
+            OptionKind::Put => "P",
+        };
+        InstrumentId::from(&format!("BTC-20240101-{strike}-{suffix}.DERIBIT"))
+    }
+
+    /// Feeds a quote then greeks (with the given `delta`) for one option leg.
+    fn feed_quote_and_greeks(
+        agg: &mut OptionChainAggregator,
+        strike: i64,
+        kind: OptionKind,
+        delta: f64,
+    ) {
+        let id = option_id(strike, kind);
+        agg.update_quote(&make_quote(id, "100.00", "101.00"));
+        agg.update_greeks(&OptionGreeks {
+            instrument_id: id,
+            greeks: OptionGreekValues {
+                delta,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    #[rstest]
+    #[case(0.30, 0.30, 0.03, true)] // exact target
+    #[case(-0.30, 0.30, 0.03, true)] // negative delta, magnitude matches
+    #[case(0.28, 0.30, 0.03, true)] // inside band, below target
+    #[case(0.32, 0.30, 0.03, true)] // inside band, above target
+    #[case(0.20, 0.30, 0.03, false)] // below band
+    #[case(0.40, 0.30, 0.03, false)] // above band
+    fn test_delta_within_band(
+        #[case] delta: f64,
+        #[case] target: f64,
+        #[case] tolerance: f64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            OptionChainAggregator::delta_within_band(delta, target, tolerance),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn test_delta_target_hit() {
+        let strikes = [40000, 45000, 50000, 55000, 60000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        // Bootstrap the ATM-relative fallback so the window is active and greeks can land.
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+        assert_eq!(agg.instrument_ids().len(), 10); // all 5 strikes (fallback)
+
+        // Only the 55000 call sits at the 0.30 target.
+        feed_quote_and_greeks(&mut agg, 40000, OptionKind::Call, 0.95);
+        feed_quote_and_greeks(&mut agg, 40000, OptionKind::Put, -0.95);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.80);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.80);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.30);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.12);
+        feed_quote_and_greeks(&mut agg, 60000, OptionKind::Call, 0.12);
+        feed_quote_and_greeks(&mut agg, 60000, OptionKind::Put, -0.10);
+
+        let active = agg.recompute_active_set();
+        assert_eq!(active.len(), 2); // 55000 call + put
+        assert!(active.contains(&option_id(55000, OptionKind::Call)));
+        assert!(active.contains(&option_id(55000, OptionKind::Put)));
+    }
+
+    #[rstest]
+    fn test_delta_tolerance_band() {
+        let strikes = [45000, 50000, 55000, 60000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.05);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+
+        // Band is [0.25, 0.35]: 0.50 and 0.10 are outside, 0.32 and 0.30 inside.
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.50);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.50);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.32);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.50);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.30);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.50);
+        feed_quote_and_greeks(&mut agg, 60000, OptionKind::Call, 0.10);
+        feed_quote_and_greeks(&mut agg, 60000, OptionKind::Put, -0.10);
+
+        let active = agg.recompute_active_set();
+        assert_eq!(active.len(), 4); // 50000 + 55000, both legs each
+        assert!(active.contains(&option_id(50000, OptionKind::Call)));
+        assert!(active.contains(&option_id(55000, OptionKind::Call)));
+        assert!(!active.contains(&option_id(45000, OptionKind::Call)));
+        assert!(!active.contains(&option_id(60000, OptionKind::Call)));
+    }
+
+    #[rstest]
+    fn test_delta_matches_put_by_magnitude() {
+        let strikes = [45000, 50000, 55000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+
+        // Only the 45000 put matches the target, isolating put-side matching.
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.30);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.55);
+
+        let active = agg.recompute_active_set();
+        // |-0.30| == target, so the 45000 strike (both legs) is selected.
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&option_id(45000, OptionKind::Put)));
+        assert!(active.contains(&option_id(45000, OptionKind::Call)));
+    }
+
+    #[rstest]
+    fn test_delta_no_greeks_falls_back_to_atm_window() {
+        // 13 strikes so the ATM-relative fallback window is a proper subset.
+        let strikes: Vec<i64> = (0..13).map(|i| 40000 + i * 1000).collect();
+        let mut agg = make_delta_aggregator(&strikes, 0.25, 0.05);
+        set_atm_via_greeks(&mut agg, 46000.0); // centered
+
+        let active = agg.recompute_active_set();
+
+        // No greeks -> a bounded ATM-relative window: neither empty nor the full chain.
+        // The exact window width is asserted in the model-level resolve test.
+        assert!(active.len() > 2);
+        assert!(active.len() < strikes.len() * 2);
+        assert!(active.contains(&option_id(46000, OptionKind::Call))); // ATM included
+        assert!(!active.contains(&option_id(40000, OptionKind::Call))); // extreme excluded
+        assert!(!active.contains(&option_id(52000, OptionKind::Call))); // extreme excluded
+    }
+
+    #[rstest]
+    fn test_delta_pending_only_greeks_eligible() {
+        let strikes = [45000, 50000, 55000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.55);
+
+        // Greeks arrive before any quote, so they land in pending_greeks.
+        agg.update_greeks(&OptionGreeks {
+            instrument_id: option_id(55000, OptionKind::Call),
+            greeks: OptionGreekValues {
+                delta: 0.30,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(agg.pending_greeks_count(), 1);
+
+        let active = agg.recompute_active_set();
+        // Pending-only greeks are eligible for delta resolution.
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&option_id(55000, OptionKind::Call)));
+    }
+
+    #[rstest]
+    fn test_delta_waits_for_fallback_window_greeks_before_narrowing() {
+        let strikes = [45000, 50000, 55000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+        assert_eq!(agg.instrument_ids().len(), 6); // fallback: all 3 strikes
+
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.30);
+
+        assert!(agg.check_rebalance(now()).is_none());
+        assert_eq!(agg.instrument_ids().len(), 6);
+    }
+
+    #[rstest]
+    fn test_delta_waits_when_fallback_window_shifts_during_warmup() {
+        let strikes: Vec<i64> = (0..13).map(|i| 40000 + i * 1000).collect();
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 46000.0);
+        agg.recompute_active_set();
+        assert!(
+            agg.active_ids()
+                .contains(&option_id(42000, OptionKind::Call))
+        );
+        assert!(
+            agg.active_ids()
+                .contains(&option_id(51000, OptionKind::Put))
+        );
+
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.30);
+        set_atm_via_greeks(&mut agg, 47000.0);
+
+        let action = agg
+            .check_rebalance(now())
+            .expect("fallback window shift should rebalance active legs");
+
+        assert!(action.add.contains(&option_id(52000, OptionKind::Call)));
+        assert!(!action.remove.contains(&option_id(42000, OptionKind::Call)));
+        assert!(!action.remove.contains(&option_id(51000, OptionKind::Put)));
+    }
+
+    #[rstest]
+    fn test_delta_rebalances_on_greeks_with_atm_unchanged() {
+        let strikes = [45000, 50000, 55000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+        assert_eq!(agg.last_atm_strike(), Some(Price::from("50000")));
+        assert_eq!(agg.instrument_ids().len(), 6); // fallback: all 3 strikes
+
+        // Greeks arrive; only 55000 matches. The closest ATM strike is unchanged.
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.45);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.45);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.30);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.12);
+
+        let action = agg
+            .check_rebalance(now())
+            .expect("delta range should rebalance when greeks narrow the set");
+        assert!(action.add.is_empty());
+        assert!(!action.remove.is_empty());
+
+        agg.apply_rebalance(&action, now());
+        assert_eq!(agg.instrument_ids().len(), 2); // narrowed to the 55000 legs
+        assert!(
+            agg.active_ids()
+                .contains(&option_id(55000, OptionKind::Call))
+        );
+    }
+
+    #[rstest]
+    fn test_delta_no_op_rebalance_returns_none() {
+        let strikes = [45000, 50000, 55000];
+        let mut agg = make_delta_aggregator(&strikes, 0.30, 0.03);
+        set_atm_via_greeks(&mut agg, 50000.0);
+        agg.recompute_active_set();
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Call, 0.55);
+        feed_quote_and_greeks(&mut agg, 45000, OptionKind::Put, -0.55);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Call, 0.45);
+        feed_quote_and_greeks(&mut agg, 50000, OptionKind::Put, -0.45);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Call, 0.30);
+        feed_quote_and_greeks(&mut agg, 55000, OptionKind::Put, -0.12);
+
+        // First rebalance narrows to the 55000 legs.
+        let action = agg.check_rebalance(now()).unwrap();
+        agg.apply_rebalance(&action, now());
+        assert_eq!(agg.instrument_ids().len(), 2);
+
+        // Greeks unchanged -> stable set -> no-op suppressed (cooldown disabled).
+        assert!(agg.check_rebalance(now()).is_none());
     }
 }

@@ -17,7 +17,9 @@
 //!
 //! These models represent Binance venue-specific response types decoded from SBE.
 
-use nautilus_core::{UUID4, nanos::UnixNanos};
+use std::fmt::Debug;
+
+use nautilus_core::{UUID4, nanos::UnixNanos, string::secret::SecretString};
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
@@ -25,10 +27,21 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Money},
 };
 use rust_decimal::Decimal;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::spot::sbe::spot::{
-    order_side::OrderSide, order_status::OrderStatus, order_type::OrderType,
-    self_trade_prevention_mode::SelfTradePreventionMode, time_in_force::TimeInForce,
+use crate::{
+    common::{
+        enums::{
+            BinanceOrderStatus, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+        },
+        parse::parse_micros_or_init,
+    },
+    spot::sbe::spot::{
+        contingency_type::ContingencyType, list_order_status::ListOrderStatus,
+        list_status_type::ListStatusType, order_side::OrderSide, order_status::OrderStatus,
+        order_type::OrderType, self_trade_prevention_mode::SelfTradePreventionMode,
+        time_in_force::TimeInForce,
+    },
 };
 
 /// Price/quantity level in an order book.
@@ -83,6 +96,38 @@ pub struct BinanceTrades {
     pub qty_exponent: i8,
     /// List of trades.
     pub trades: Vec<BinanceTrade>,
+}
+
+/// A single aggregate trade from Binance Spot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceAggTrade {
+    /// Aggregate trade ID.
+    pub id: i64,
+    /// Price mantissa.
+    pub price_mantissa: i64,
+    /// Quantity mantissa.
+    pub qty_mantissa: i64,
+    /// First raw trade ID represented by this aggregate.
+    pub first_trade_id: i64,
+    /// Last raw trade ID represented by this aggregate.
+    pub last_trade_id: i64,
+    /// Trade timestamp in microseconds.
+    pub time: i64,
+    /// Whether the buyer is the maker.
+    pub is_buyer_maker: bool,
+    /// Whether this trade was the best price match.
+    pub is_best_match: bool,
+}
+
+/// Binance Spot aggregate trades response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceAggTrades {
+    /// Price exponent for all trades.
+    pub price_exponent: i8,
+    /// Quantity exponent for all trades.
+    pub qty_exponent: i8,
+    /// Aggregate trades in chronological order.
+    pub trades: Vec<BinanceAggTrade>,
 }
 
 /// A fill from an order execution.
@@ -143,6 +188,8 @@ pub struct BinanceNewOrderResponse {
     pub symbol: String,
     /// Order fills.
     pub fills: Vec<BinanceOrderFill>,
+    /// Expiry reason (schema 3:4; `None` when null/absent).
+    pub expiry_reason: Option<u8>,
 }
 
 /// Cancel order response.
@@ -182,6 +229,49 @@ pub struct BinanceCancelOrderResponse {
     pub orig_client_order_id: String,
     /// Symbol.
     pub symbol: String,
+}
+
+/// One order identity in a canceled order list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceCancelOrderListOrder {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Exchange order ID.
+    pub order_id: i64,
+    /// Original client order ID.
+    pub client_order_id: String,
+}
+
+/// Cancel order-list response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceCancelOrderListResponse {
+    /// Exchange order-list ID.
+    pub order_list_id: i64,
+    /// Contingency type.
+    pub contingency_type: ContingencyType,
+    /// List status type.
+    pub list_status_type: ListStatusType,
+    /// Aggregate list order status.
+    pub list_order_status: ListOrderStatus,
+    /// Transaction time in microseconds.
+    pub transaction_time: i64,
+    /// Client order ID for the order list.
+    pub list_client_order_id: String,
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Orders in the list.
+    pub orders: Vec<BinanceCancelOrderListOrder>,
+    /// Canceled child order reports.
+    pub order_reports: Vec<BinanceCancelOrderResponse>,
+}
+
+/// One item returned by canceling all open orders.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinanceCancelOpenOrdersResponse {
+    /// An ordinary canceled order.
+    Order(BinanceCancelOrderResponse),
+    /// A canceled order list and its child reports.
+    OrderList(BinanceCancelOrderListResponse),
 }
 
 /// Query order response.
@@ -231,6 +321,8 @@ pub struct BinanceOrderResponse {
     pub client_order_id: String,
     /// Symbol.
     pub symbol: String,
+    /// Expiry reason (schema 3:4; `None` when null/absent).
+    pub expiry_reason: Option<u8>,
 }
 
 /// Account balance for a single asset.
@@ -294,27 +386,22 @@ impl BinanceAccountInfo {
             let locked = Decimal::new(asset.locked_mantissa, 0) * multiplier;
             let total = free + locked;
 
-            let total_money = Money::from_decimal(total, currency)
-                .unwrap_or_else(|_| Money::new(total.to_string().parse().unwrap_or(0.0), currency));
-            let locked_money = Money::from_decimal(locked, currency).unwrap_or_else(|_| {
-                Money::new(locked.to_string().parse().unwrap_or(0.0), currency)
-            });
-            let free_money = Money::from_decimal(free, currency)
-                .unwrap_or_else(|_| Money::new(free.to_string().parse().unwrap_or(0.0), currency));
-
-            let balance = AccountBalance::new(total_money, locked_money, free_money);
-            balances.push(balance);
+            match AccountBalance::from_total_and_locked(total, locked, currency) {
+                Ok(balance) => balances.push(balance),
+                Err(e) => log::warn!("Skipping spot balance for {}: {e}", currency.code),
+            }
         }
 
         // Ensure at least one balance exists
         if balances.is_empty() {
             let zero_currency = Currency::USDT();
-            let zero_money = Money::new(0.0, zero_currency);
+            let zero_money = Money::zero(zero_currency);
             let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
             balances.push(zero_balance);
         }
 
-        let ts_event = UnixNanos::from((self.update_time * 1_000) as u64);
+        let ts_event =
+            parse_micros_or_init(self.update_time, "Spot SBE account update time", ts_init);
 
         AccountState::new(
             account_id,
@@ -356,6 +443,21 @@ pub struct BinanceLotSizeFilterSbe {
     pub step_size: i64,
 }
 
+/// Decoded Binance Spot notional filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceNotionalFilter {
+    /// Minimum quote-currency amount.
+    pub min: Decimal,
+    /// Maximum quote-currency amount, when specified.
+    pub max: Option<Decimal>,
+    /// Whether the minimum applies to market orders.
+    pub apply_min_to_market: bool,
+    /// Whether the maximum applies to market orders.
+    pub apply_max_to_market: bool,
+    /// Venue average-price window in minutes.
+    pub avg_price_mins: u32,
+}
+
 /// Symbol filters from SBE response.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BinanceSymbolFiltersSbe {
@@ -363,6 +465,8 @@ pub struct BinanceSymbolFiltersSbe {
     pub price_filter: Option<BinancePriceFilterSbe>,
     /// Lot size filter (required for trading).
     pub lot_size_filter: Option<BinanceLotSizeFilterSbe>,
+    /// Exact notional rules and their market applicability.
+    pub notional_filters: Vec<BinanceNotionalFilter>,
 }
 
 /// Symbol information from SBE exchange info response.
@@ -411,6 +515,92 @@ pub struct BinanceSymbolSbe {
 pub struct BinanceExchangeInfoSbe {
     /// List of symbols.
     pub symbols: Vec<BinanceSymbolSbe>,
+}
+
+/// Exchange information returned as JSON by Binance US.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct BinanceExchangeInfoJson {
+    /// Symbol definitions.
+    pub symbols: Vec<BinanceSymbolJson>,
+}
+
+/// Spot symbol definition returned by JSON exchange info.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceSymbolJson {
+    /// Raw venue symbol.
+    pub symbol: String,
+    /// Venue trading status.
+    pub status: String,
+    /// Base asset code.
+    pub base_asset: String,
+    /// Quote asset code.
+    pub quote_asset: String,
+    /// Base asset precision.
+    pub base_asset_precision: u8,
+    /// Quote asset precision.
+    pub quote_asset_precision: u8,
+    /// Symbol filters.
+    pub filters: Vec<BinanceSymbolFilterJson>,
+}
+
+/// Spot JSON symbol filter fields used for instrument construction.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceSymbolFilterJson {
+    /// Venue filter type.
+    pub filter_type: String,
+    /// Minimum price.
+    pub min_price: Option<String>,
+    /// Maximum price.
+    pub max_price: Option<String>,
+    /// Tick size.
+    pub tick_size: Option<String>,
+    /// Minimum quantity.
+    pub min_qty: Option<String>,
+    /// Maximum quantity.
+    pub max_qty: Option<String>,
+    /// Quantity step size.
+    pub step_size: Option<String>,
+    /// Minimum quote notional.
+    pub min_notional: Option<String>,
+    /// Maximum quote notional.
+    pub max_notional: Option<String>,
+    /// Legacy minimum market applicability.
+    pub apply_to_market: Option<bool>,
+    /// Range minimum market applicability.
+    pub apply_min_to_market: Option<bool>,
+    /// Range maximum market applicability.
+    pub apply_max_to_market: Option<bool>,
+    /// Venue average-price window in minutes.
+    pub avg_price_mins: Option<u32>,
+}
+
+/// Account-specific Spot commission response.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAccountCommission {
+    /// Venue symbol.
+    pub symbol: String,
+    /// Standard maker and taker commission rates from the venue.
+    pub standard_commission: BinanceCommissionRates,
+}
+
+/// Maker and taker commission rates.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct BinanceCommissionRates {
+    /// Maker rate.
+    pub maker: String,
+    /// Taker rate.
+    pub taker: String,
+}
+
+/// Minimal JSON account response used for Binance US commission fallback.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAccountRatesJson {
+    /// Account-wide commission rates.
+    pub commission_rates: BinanceCommissionRates,
 }
 
 /// Account trade history entry.
@@ -462,11 +652,19 @@ pub struct BinanceKlines {
 }
 
 /// Listen key response for user data stream.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenKeyResponse {
     /// The listen key for WebSocket user data stream.
-    pub listen_key: String,
+    pub listen_key: SecretString,
+}
+
+impl ListenKeyResponse {
+    /// Consumes the response and returns the listen key.
+    #[must_use]
+    pub fn into_listen_key(mut self) -> SecretString {
+        std::mem::take(&mut self.listen_key)
+    }
 }
 
 /// 24-hour ticker statistics response.
@@ -566,6 +764,40 @@ pub struct TradeFee {
     pub taker_commission: String,
 }
 
+/// Response from a new OCO order-list request.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewOcoOrderListResponse {
+    /// Exchange order list ID.
+    pub order_list_id: i64,
+    /// Contingency type.
+    pub contingency_type: String,
+    /// List status type.
+    pub list_status_type: String,
+    /// List order status.
+    pub list_order_status: String,
+    /// Client order ID for the order list.
+    pub list_client_order_id: String,
+    /// Transaction time in milliseconds.
+    pub transaction_time: i64,
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Orders in the list.
+    pub orders: Vec<OrderListOrder>,
+}
+
+/// Order summary inside an order-list response.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderListOrder {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Exchange order ID.
+    pub order_id: i64,
+    /// Client order ID.
+    pub client_order_id: String,
+}
+
 /// Result of a single order in a batch operation.
 ///
 /// Each item in a batch response can be either a success or an error.
@@ -603,20 +835,20 @@ pub struct BatchOrderSuccess {
     #[serde(rename = "cummulativeQuoteQty")]
     pub cummulative_quote_qty: String,
     /// Order status.
-    pub status: String,
+    pub status: BinanceOrderStatus,
     /// Time in force.
-    pub time_in_force: String,
+    pub time_in_force: BinanceTimeInForce,
     /// Order type.
     #[serde(rename = "type")]
     pub order_type: String,
     /// Order side.
-    pub side: String,
+    pub side: BinanceSide,
     /// Working time in milliseconds.
     #[serde(default)]
     pub working_time: Option<i64>,
     /// Self-trade prevention mode.
     #[serde(default)]
-    pub self_trade_prevention_mode: Option<String>,
+    pub self_trade_prevention_mode: Option<BinanceSelfTradePreventionMode>,
 }
 
 /// Error in a batch order response.
@@ -666,23 +898,23 @@ pub struct BatchCancelSuccess {
     #[serde(rename = "cummulativeQuoteQty")]
     pub cummulative_quote_qty: String,
     /// Order status.
-    pub status: String,
+    pub status: BinanceOrderStatus,
     /// Time in force.
-    pub time_in_force: String,
+    pub time_in_force: BinanceTimeInForce,
     /// Order type.
     #[serde(rename = "type")]
     pub order_type: String,
     /// Order side.
-    pub side: String,
+    pub side: BinanceSide,
     /// Self-trade prevention mode.
     #[serde(default)]
-    pub self_trade_prevention_mode: Option<String>,
+    pub self_trade_prevention_mode: Option<BinanceSelfTradePreventionMode>,
 }
 
 /// A single kline (candlestick) from Binance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinanceKline {
-    /// Kline open time in milliseconds.
+    /// Kline open time in microseconds.
     pub open_time: i64,
     /// Open price mantissa.
     pub open_price: i64,
@@ -694,7 +926,7 @@ pub struct BinanceKline {
     pub close_price: i64,
     /// Volume (base asset) as 128-bit bytes.
     pub volume: [u8; 16],
-    /// Kline close time in milliseconds.
+    /// Kline close time in microseconds.
     pub close_time: i64,
     /// Quote volume as 128-bit bytes.
     pub quote_volume: [u8; 16],
@@ -709,15 +941,27 @@ pub struct BinanceKline {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use zeroize::Zeroize;
 
     use super::*;
     use crate::common::testing::load_fixture_string;
 
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
     #[rstest]
     fn test_listen_key_response_deserialize() {
+        assert_zeroize_on_drop::<ListenKeyResponse>();
+
         let json = r#"{"listenKey": "abc123xyz"}"#;
-        let response: ListenKeyResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.listen_key, "abc123xyz");
+        let mut response: ListenKeyResponse = serde_json::from_str(json).unwrap();
+
+        let debug = format!("{response:?}");
+        assert_eq!(response.listen_key.expose_secret(), "abc123xyz");
+        assert_eq!(debug, "ListenKeyResponse { listen_key: <redacted> }");
+        assert!(!debug.contains(response.listen_key.expose_secret()));
+
+        response.zeroize();
+        assert!(response.listen_key.expose_secret().is_empty());
     }
 
     #[rstest]
@@ -767,6 +1011,14 @@ mod tests {
             BatchOrderResult::Success(order) => {
                 assert_eq!(order.symbol, "BTCUSDT");
                 assert_eq!(order.order_id, 28);
+                assert_eq!(order.status, BinanceOrderStatus::Filled);
+                assert_eq!(order.time_in_force, BinanceTimeInForce::Gtc);
+                assert_eq!(order.order_type, "MARKET");
+                assert_eq!(order.side, BinanceSide::Sell);
+                assert_eq!(
+                    order.self_trade_prevention_mode,
+                    Some(BinanceSelfTradePreventionMode::None)
+                );
             }
             BatchOrderResult::Error(_) => panic!("Expected Success"),
         }
@@ -793,6 +1045,14 @@ mod tests {
             BatchCancelResult::Success(cancel) => {
                 assert_eq!(cancel.symbol, "LTCBTC");
                 assert_eq!(cancel.order_id, 4);
+                assert_eq!(cancel.status, BinanceOrderStatus::Canceled);
+                assert_eq!(cancel.time_in_force, BinanceTimeInForce::Gtc);
+                assert_eq!(cancel.order_type, "LIMIT");
+                assert_eq!(cancel.side, BinanceSide::Buy);
+                assert_eq!(
+                    cancel.self_trade_prevention_mode,
+                    Some(BinanceSelfTradePreventionMode::None)
+                );
             }
             BatchCancelResult::Error(_) => panic!("Expected Success"),
         }

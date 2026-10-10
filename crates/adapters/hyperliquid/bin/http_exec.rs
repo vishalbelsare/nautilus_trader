@@ -13,20 +13,20 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{env, str::FromStr};
+use std::env;
 
 use nautilus_hyperliquid::{
-    common::credential::Secrets,
+    common::{credential::Secrets, enums::HyperliquidEnvironment},
     http::{
         client::HyperliquidHttpClient,
         models::{
-            Cloid, HyperliquidExecAction, HyperliquidExecGrouping, HyperliquidExecLimitParams,
-            HyperliquidExecOrderKind, HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+            Cloid, HyperliquidExchangeAction, HyperliquidExchangeGrouping,
+            HyperliquidExchangeLimitParams, HyperliquidExchangeOrderKind,
+            HyperliquidExchangePlaceOrderRequest, HyperliquidExchangeTif,
         },
     },
 };
 use nautilus_model::identifiers::ClientOrderId;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 #[tokio::main]
@@ -34,21 +34,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     nautilus_common::logging::ensure_logging_initialized();
 
     // Check for testnet flag from environment (default to mainnet)
-    let is_testnet =
-        env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true" || v == "1");
+    let environment =
+        if env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true" || v == "1") {
+            HyperliquidEnvironment::Testnet
+        } else {
+            HyperliquidEnvironment::Mainnet
+        };
 
-    let network_name = if is_testnet { "TESTNET" } else { "MAINNET" };
-    log::info!("Starting Hyperliquid {network_name} Order Placer");
+    log::info!("Starting Hyperliquid {environment:?} Order Placer");
 
-    let client = match HyperliquidHttpClient::from_env(is_testnet) {
+    let client = match HyperliquidHttpClient::from_env(environment) {
         Ok(client) => {
-            let is_testnet = client.is_testnet();
-            log::info!("Client created (testnet: {is_testnet})");
+            log::info!("Client created (environment: {environment:?})");
             client
         }
         Err(e) => {
             log::error!("Failed to create client: {e}");
-            let (pk_var, _) = Secrets::env_vars(is_testnet);
+            let (pk_var, _) = Secrets::env_vars(environment);
             log::error!("Make sure {pk_var} environment variable is set");
             return Err(e.into());
         }
@@ -100,8 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Fetching BTC order book...");
     let book = client.info_l2_book("BTC").await?;
 
-    let best_bid_str = &book.levels[0][0].px;
-    let best_bid = Decimal::from_str(best_bid_str)?;
+    let best_bid = book.levels[0][0].px;
 
     log::info!("Best bid: ${best_bid}");
 
@@ -109,22 +110,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit_price = (best_bid * dec!(0.95)).round();
     log::info!("Limit order price: ${limit_price}");
 
-    // Create cloid from a test ClientOrderId (production-like)
     let client_order_id = ClientOrderId::from("O-20241210-TEST-001-001-1");
     let cloid = Cloid::from_client_order_id(client_order_id);
     log::info!("ClientOrderId: {client_order_id}");
     let cloid_hex = cloid.to_hex();
     log::info!("Cloid: {cloid_hex}");
 
-    let order = HyperliquidExecPlaceOrderRequest {
+    let order = HyperliquidExchangePlaceOrderRequest {
         asset: btc_asset_id as u32,
         is_buy: true,
         price: limit_price,
         size: dec!(0.001),
         reduce_only: false,
-        kind: HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Gtc,
+        kind: HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Gtc,
             },
         },
         cloid: Some(cloid),
@@ -140,10 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Placing order...");
 
-    // Create the action using the typed HyperliquidExecAction enum
-    let action = HyperliquidExecAction::Order {
+    // Create the action using the typed HyperliquidExchangeAction enum
+    let action = HyperliquidExchangeAction::Order {
         orders: vec![order],
-        grouping: HyperliquidExecGrouping::Na,
+        grouping: HyperliquidExchangeGrouping::Na,
         builder: None,
     };
 

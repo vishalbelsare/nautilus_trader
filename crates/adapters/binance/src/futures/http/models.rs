@@ -15,12 +15,24 @@
 
 //! Binance Futures HTTP response models.
 
+use std::fmt::Debug;
+
 use anyhow::Context;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    serialization::{
+        deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
+        serialize_decimal_as_str, serialize_optional_decimal_as_str,
+    },
+    string::secret::SecretString,
+};
 use nautilus_model::{
-    enums::{AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{
+        AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce,
+        TrailingOffsetType, TriggerType,
+    },
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, Venue, VenueOrderId},
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
@@ -28,17 +40,22 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ustr::Ustr;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::common::{
-    consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    encoder::decode_broker_id,
-    enums::{
-        BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
-        BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
-        BinancePriceMatch, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
-        BinanceTradingStatus, BinanceWorkingType,
+use crate::{
+    common::{
+        consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+        encoder::decode_client_order_id,
+        enums::{
+            BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
+            BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
+            BinancePriceMatch, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+            BinanceTradingStatus, BinanceWorkingType,
+        },
+        models::BinanceRateLimit,
+        parse::{parse_millis, parse_required_decimal},
     },
-    models::BinanceRateLimit,
+    futures::conversions::{normalize_futures_asset, parse_good_till_date},
 };
 
 /// Server time response from `GET /fapi/v1/time`.
@@ -64,6 +81,32 @@ pub struct BinanceFuturesTrade {
     /// Trade timestamp in milliseconds.
     pub time: i64,
     /// Whether the buyer is the maker.
+    pub is_buyer_maker: bool,
+}
+
+/// Aggregate public trade from `GET /fapi/v1/aggTrades` or `GET /dapi/v1/aggTrades`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinanceFuturesAggTrade {
+    /// Aggregate trade ID.
+    #[serde(rename = "a")]
+    pub id: i64,
+    /// Trade price.
+    #[serde(rename = "p")]
+    pub price: String,
+    /// Trade quantity.
+    #[serde(rename = "q")]
+    pub qty: String,
+    /// First raw trade ID represented by this aggregate.
+    #[serde(rename = "f")]
+    pub first_trade_id: i64,
+    /// Last raw trade ID represented by this aggregate.
+    #[serde(rename = "l")]
+    pub last_trade_id: i64,
+    /// Trade timestamp in milliseconds.
+    #[serde(rename = "T")]
+    pub time: i64,
+    /// Whether the buyer is the maker.
+    #[serde(rename = "m")]
     pub is_buyer_maker: bool,
 }
 
@@ -105,19 +148,46 @@ impl<'de> Deserialize<'de> for BinanceFuturesKline {
         }
 
         Ok(Self {
-            open_time: arr[0].as_i64().unwrap_or(0),
-            open: arr[1].as_str().unwrap_or("0").to_string(),
-            high: arr[2].as_str().unwrap_or("0").to_string(),
-            low: arr[3].as_str().unwrap_or("0").to_string(),
-            close: arr[4].as_str().unwrap_or("0").to_string(),
-            volume: arr[5].as_str().unwrap_or("0").to_string(),
-            close_time: arr[6].as_i64().unwrap_or(0),
-            quote_volume: arr[7].as_str().unwrap_or("0").to_string(),
-            num_trades: arr[8].as_i64().unwrap_or(0),
-            taker_buy_base_volume: arr[9].as_str().unwrap_or("0").to_string(),
-            taker_buy_quote_volume: arr[10].as_str().unwrap_or("0").to_string(),
+            open_time: required_kline_i64::<D::Error>(&arr, 0, "open_time")?,
+            open: required_kline_string::<D::Error>(&arr, 1, "open")?,
+            high: required_kline_string::<D::Error>(&arr, 2, "high")?,
+            low: required_kline_string::<D::Error>(&arr, 3, "low")?,
+            close: required_kline_string::<D::Error>(&arr, 4, "close")?,
+            volume: required_kline_string::<D::Error>(&arr, 5, "volume")?,
+            close_time: required_kline_i64::<D::Error>(&arr, 6, "close_time")?,
+            quote_volume: required_kline_string::<D::Error>(&arr, 7, "quote_volume")?,
+            num_trades: required_kline_i64::<D::Error>(&arr, 8, "num_trades")?,
+            taker_buy_base_volume: required_kline_string::<D::Error>(
+                &arr,
+                9,
+                "taker_buy_base_volume",
+            )?,
+            taker_buy_quote_volume: required_kline_string::<D::Error>(
+                &arr,
+                10,
+                "taker_buy_quote_volume",
+            )?,
         })
     }
+}
+
+fn required_kline_i64<E>(arr: &[Value], index: usize, field: &str) -> Result<i64, E>
+where
+    E: serde::de::Error,
+{
+    arr[index]
+        .as_i64()
+        .ok_or_else(|| E::custom(format!("invalid kline {field}")))
+}
+
+fn required_kline_string<E>(arr: &[Value], index: usize, field: &str) -> Result<String, E>
+where
+    E: serde::de::Error,
+{
+    arr[index]
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| E::custom(format!("invalid kline {field}")))
 }
 
 /// USD-M Futures exchange information response from `GET /fapi/v1/exchangeInfo`.
@@ -161,7 +231,8 @@ pub struct BinanceFuturesUsdSymbol {
     pub symbol: Ustr,
     /// Trading pair (e.g., "BTCUSDT").
     pub pair: Ustr,
-    /// Contract type (PERPETUAL, CURRENT_QUARTER, NEXT_QUARTER).
+    /// Contract type (PERPETUAL, TRADIFI_PERPETUAL, CURRENT_MONTH, NEXT_MONTH,
+    /// CURRENT_QUARTER, NEXT_QUARTER).
     pub contract_type: String,
     /// Delivery date timestamp.
     pub delivery_date: i64,
@@ -436,6 +507,30 @@ pub struct BinanceOpenInterest {
     pub time: i64,
 }
 
+/// Historical open interest record from `GET /futures/data/openInterestHist`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceOpenInterestHistRecord {
+    /// Symbol name for USD-M responses.
+    #[serde(default)]
+    pub symbol: Option<Ustr>,
+    /// Trading pair for COIN-M responses.
+    #[serde(default)]
+    pub pair: Option<Ustr>,
+    /// Contract type for COIN-M responses.
+    #[serde(default)]
+    pub contract_type: Option<String>,
+    /// Total open interest for the bucket.
+    pub sum_open_interest: String,
+    /// Total open interest notional value for the bucket.
+    pub sum_open_interest_value: String,
+    /// Bucket timestamp in milliseconds.
+    pub timestamp: i64,
+    /// USD-M-specific optional circulating supply field.
+    #[serde(default, rename = "CMCCirculatingSupply")]
+    pub cmc_circulating_supply: Option<String>,
+}
+
 /// Futures account balance entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,45 +541,93 @@ pub struct BinanceFuturesBalance {
     /// Asset code (e.g., "USDT").
     pub asset: Ustr,
     /// Wallet balance (v2 uses walletBalance, v1 uses balance).
-    #[serde(alias = "balance")]
-    pub wallet_balance: String,
+    #[serde(
+        alias = "balance",
+        deserialize_with = "deserialize_decimal_or_zero",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub wallet_balance: Decimal,
     /// Unrealized profit.
-    #[serde(default)]
-    pub unrealized_profit: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub unrealized_profit: Option<Decimal>,
     /// Margin balance.
-    #[serde(default)]
-    pub margin_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub margin_balance: Option<Decimal>,
     /// Maintenance margin required.
-    #[serde(default)]
-    pub maint_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub maint_margin: Option<Decimal>,
     /// Initial margin required.
-    #[serde(default)]
-    pub initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub initial_margin: Option<Decimal>,
     /// Position initial margin.
-    #[serde(default)]
-    pub position_initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub position_initial_margin: Option<Decimal>,
     /// Open order initial margin.
-    #[serde(default)]
-    pub open_order_initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub open_order_initial_margin: Option<Decimal>,
     /// Cross wallet balance.
-    #[serde(default)]
-    pub cross_wallet_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub cross_wallet_balance: Option<Decimal>,
     /// Unrealized PnL for cross positions.
-    #[serde(default)]
-    pub cross_un_pnl: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub cross_un_pnl: Option<Decimal>,
     /// Available balance.
-    pub available_balance: String,
+    #[serde(
+        deserialize_with = "deserialize_decimal_or_zero",
+        serialize_with = "serialize_decimal_as_str"
+    )]
+    pub available_balance: Decimal,
     /// Maximum withdrawable amount.
-    #[serde(default)]
-    pub max_withdraw_amount: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub max_withdraw_amount: Option<Decimal>,
     /// Whether margin trading is available.
     #[serde(default)]
     pub margin_available: Option<bool>,
     /// Timestamp of last update in milliseconds.
     pub update_time: i64,
     /// Withdrawable amount (COIN-M specific).
-    #[serde(default)]
-    pub withdraw_available: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub withdraw_available: Option<Decimal>,
 }
 
 /// Account position from `GET /fapi/v2/account` positions array.
@@ -663,39 +806,86 @@ pub struct BinanceUserTrade {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinanceFuturesAccountInfo {
+    /// Futures VIP fee tier.
+    #[serde(default)]
+    pub fee_tier: u8,
     /// Total initial margin required.
-    #[serde(default)]
-    pub total_initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_initial_margin: Option<Decimal>,
     /// Total maintenance margin required.
-    #[serde(default)]
-    pub total_maint_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_maint_margin: Option<Decimal>,
     /// Total wallet balance.
-    #[serde(default)]
-    pub total_wallet_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_wallet_balance: Option<Decimal>,
     /// Total unrealized profit.
-    #[serde(default)]
-    pub total_unrealized_profit: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_unrealized_profit: Option<Decimal>,
     /// Total margin balance.
-    #[serde(default)]
-    pub total_margin_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_margin_balance: Option<Decimal>,
     /// Total position initial margin.
-    #[serde(default)]
-    pub total_position_initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_position_initial_margin: Option<Decimal>,
     /// Total open order initial margin.
-    #[serde(default)]
-    pub total_open_order_initial_margin: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_open_order_initial_margin: Option<Decimal>,
     /// Total cross wallet balance.
-    #[serde(default)]
-    pub total_cross_wallet_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_cross_wallet_balance: Option<Decimal>,
     /// Total cross unrealized PnL.
-    #[serde(default)]
-    pub total_cross_un_pnl: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub total_cross_un_pnl: Option<Decimal>,
     /// Available balance.
-    #[serde(default)]
-    pub available_balance: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub available_balance: Option<Decimal>,
     /// Max withdraw amount.
-    #[serde(default)]
-    pub max_withdraw_amount: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_str",
+        serialize_with = "serialize_optional_decimal_as_str"
+    )]
+    pub max_withdraw_amount: Option<Decimal>,
     /// Can deposit.
     #[serde(default)]
     pub can_deposit: Option<bool>,
@@ -719,6 +909,18 @@ pub struct BinanceFuturesAccountInfo {
     pub positions: Vec<BinanceAccountPosition>,
 }
 
+/// Account-specific Futures commission rates for one symbol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFuturesCommissionRate {
+    /// Venue symbol.
+    pub symbol: Ustr,
+    /// Maker commission rate.
+    pub maker_commission_rate: String,
+    /// Taker commission rate.
+    pub taker_commission_rate: String,
+}
+
 impl BinanceFuturesAccountInfo {
     /// Converts this Binance account info to a Nautilus [`AccountState`].
     ///
@@ -738,69 +940,53 @@ impl BinanceFuturesAccountInfo {
                 Some("futures balance"),
             );
 
-            let total: Decimal = asset.wallet_balance.parse().context("invalid balance")?;
-            let available: Decimal = asset
-                .available_balance
-                .parse()
-                .context("invalid available_balance")?;
-            let locked = total - available;
-
-            let total_money = Money::from_decimal(total, currency)
-                .unwrap_or_else(|_| Money::new(total.to_string().parse().unwrap_or(0.0), currency));
-            let locked_money = Money::from_decimal(locked, currency).unwrap_or_else(|_| {
-                Money::new(locked.to_string().parse().unwrap_or(0.0), currency)
-            });
-            let free_money = Money::from_decimal(available, currency).unwrap_or_else(|_| {
-                Money::new(available.to_string().parse().unwrap_or(0.0), currency)
-            });
-
-            let balance = AccountBalance::new(total_money, locked_money, free_money);
+            let balance = AccountBalance::from_total_and_free(
+                asset.wallet_balance,
+                asset.available_balance,
+                currency,
+            )
+            .context("failed to build account balance")?;
             balances.push(balance);
         }
 
         // Ensure at least one balance exists
         if balances.is_empty() {
             let zero_currency = Currency::USDT();
-            let zero_money = Money::new(0.0, zero_currency);
+            let zero_money = Money::zero(zero_currency);
             let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
             balances.push(zero_balance);
         }
 
-        // Parse margin requirements
+        // Emit account-wide (cross-margin) margin balances per collateral asset.
+        // Binance reports per-asset `initialMargin` / `maintMargin` which covers both
+        // USDT-M (single collateral, typically USDT or BNB under multi-assets mode) and
+        // COIN-M (one entry per base coin, e.g. BTC / ETH).
         let mut margins = Vec::new();
 
-        let initial_margin_dec = self
-            .total_initial_margin
-            .as_ref()
-            .and_then(|s| Decimal::from_str_exact(s).ok());
-        let maint_margin_dec = self
-            .total_maint_margin
-            .as_ref()
-            .and_then(|s| Decimal::from_str_exact(s).ok());
+        for asset in &self.assets {
+            let initial_dec = asset.initial_margin.unwrap_or_default();
+            let maint_dec = asset.maint_margin.unwrap_or_default();
 
-        if let (Some(initial_margin_dec), Some(maint_margin_dec)) =
-            (initial_margin_dec, maint_margin_dec)
-        {
-            let has_margin = !initial_margin_dec.is_zero() || !maint_margin_dec.is_zero();
-            if has_margin {
-                let margin_currency = Currency::USDT();
-                let margin_instrument_id =
-                    InstrumentId::new(Symbol::new("ACCOUNT"), Venue::new("BINANCE"));
-
-                let initial_margin = Money::from_decimal(initial_margin_dec, margin_currency)
-                    .unwrap_or_else(|_| Money::zero(margin_currency));
-                let maintenance_margin = Money::from_decimal(maint_margin_dec, margin_currency)
-                    .unwrap_or_else(|_| Money::zero(margin_currency));
-
-                let margin_balance =
-                    MarginBalance::new(initial_margin, maintenance_margin, margin_instrument_id);
-                margins.push(margin_balance);
+            if initial_dec.is_zero() && maint_dec.is_zero() {
+                continue;
             }
+
+            let currency = Currency::get_or_create_crypto_with_context(
+                asset.asset.as_str(),
+                Some("futures margin"),
+            );
+            let initial = Money::from_decimal(initial_dec, currency)
+                .unwrap_or_else(|_| Money::zero(currency));
+            let maintenance =
+                Money::from_decimal(maint_dec, currency).unwrap_or_else(|_| Money::zero(currency));
+            margins.push(MarginBalance::new(initial, maintenance, None));
         }
 
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map(|value| parse_millis(value, "Futures account update time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
         Ok(AccountState::new(
             account_id,
@@ -862,6 +1048,7 @@ pub struct BinanceFuturesOrder {
     /// Executed quantity.
     pub executed_qty: String,
     /// Cumulative quote asset transacted.
+    #[serde(default = "zero_decimal_string")]
     pub cum_quote: String,
     /// Original limit price.
     pub price: String,
@@ -924,27 +1111,33 @@ pub struct BinanceFuturesOrder {
     pub working_type_id: Option<i64>,
 }
 
+fn zero_decimal_string() -> String {
+    "0".to_string()
+}
+
 impl BinanceFuturesOrder {
     /// Converts this Binance order to a Nautilus [`OrderStatusReport`].
     ///
     /// # Errors
     ///
-    /// Returns an error if quantity parsing fails.
+    /// Returns an error if client order ID, quantity, or price parsing fails.
     pub fn to_order_status_report(
         &self,
         account_id: AccountId,
         instrument_id: InstrumentId,
+        price_precision: u8,
         size_precision: u8,
+        treat_expired_as_canceled: bool,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map(|value| parse_millis(value, "Futures order update time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
-        let client_order_id = ClientOrderId::new(decode_broker_id(
-            &self.client_order_id,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        ));
+        let client_order_id =
+            decode_client_order_id(&self.client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
         let venue_order_id = VenueOrderId::new(self.order_id.to_string());
 
         let order_side = match self.side {
@@ -952,29 +1145,65 @@ impl BinanceFuturesOrder {
             BinanceSide::Sell => OrderSide::Sell,
         };
 
-        let order_type = self.order_type.to_nautilus_order_type();
-        let time_in_force = self.time_in_force.to_nautilus_time_in_force();
-        let order_status = self.status.to_nautilus_order_status();
+        let order_type = self.order_type.to_nautilus_order_type()?;
+        let time_in_force = self.time_in_force.to_nautilus_time_in_force()?;
+        let order_status = self
+            .status
+            .to_nautilus_order_status(treat_expired_as_canceled)?;
 
         let quantity: Decimal = self.orig_qty.parse().context("invalid orig_qty")?;
         let filled_qty: Decimal = self.executed_qty.parse().context("invalid executed_qty")?;
+        let price = if self.price.is_empty() {
+            None
+        } else {
+            let price: Decimal = self.price.parse().context("invalid price")?;
+            if price == Decimal::ZERO {
+                None
+            } else {
+                Some(
+                    Price::from_decimal_dp(price, price_precision)
+                        .context("invalid price precision")?,
+                )
+            }
+        };
+        let avg_px = parse_avg_px(self.avg_price.as_deref(), filled_qty, price_precision)?;
 
-        Ok(OrderStatusReport::new(
+        let mut report = OrderStatusReport::new(
             account_id,
             instrument_id,
             Some(client_order_id),
             venue_order_id,
-            order_side,
+            order_side.into(),
             order_type,
             time_in_force,
             order_status,
-            Quantity::new(quantity.to_string().parse()?, size_precision),
-            Quantity::new(filled_qty.to_string().parse()?, size_precision),
+            Quantity::from_decimal_dp(quantity, size_precision)
+                .context("invalid orig_qty precision")?,
+            Quantity::from_decimal_dp(filled_qty, size_precision)
+                .context("invalid executed_qty precision")?,
             ts_event,
             ts_event,
             ts_init,
             Some(UUID4::new()),
-        ))
+        );
+
+        report.post_only = self.order_type == BinanceFuturesOrderType::Limit
+            && matches!(
+                self.time_in_force,
+                BinanceTimeInForce::Gtx | BinanceTimeInForce::Rpi
+            );
+
+        if let Some(price) = price {
+            report = report.with_price(price);
+        }
+
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
+        }
+
+        report.avg_px = avg_px;
+
+        Ok(report)
     }
 }
 
@@ -986,52 +1215,60 @@ impl BinanceFuturesOrderType {
     }
 
     /// Converts to Nautilus order type.
-    #[must_use]
-    pub fn to_nautilus_order_type(&self) -> OrderType {
-        match self {
-            Self::Market => OrderType::Market,
-            Self::Limit => OrderType::Limit,
-            Self::Stop => OrderType::StopLimit,
-            Self::StopMarket => OrderType::StopMarket,
-            Self::TakeProfit => OrderType::LimitIfTouched,
-            Self::TakeProfitMarket => OrderType::MarketIfTouched,
-            Self::TrailingStopMarket => OrderType::TrailingStopMarket,
-            Self::Liquidation | Self::Adl => OrderType::Market, // Forced closes
-            Self::Unknown => OrderType::Market,
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown order type.
+    pub fn to_nautilus_order_type(&self) -> anyhow::Result<OrderType> {
+        (*self).try_into()
     }
 }
 
 impl BinanceTimeInForce {
     /// Converts to Nautilus time in force.
-    #[must_use]
-    pub fn to_nautilus_time_in_force(&self) -> TimeInForce {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown time in force.
+    pub fn to_nautilus_time_in_force(&self) -> anyhow::Result<TimeInForce> {
+        Ok(match self {
             Self::Gtc => TimeInForce::Gtc,
             Self::Ioc => TimeInForce::Ioc,
             Self::Fok => TimeInForce::Fok,
             Self::Gtx => TimeInForce::Gtc, // GTX is GTC with post-only
             Self::Gtd => TimeInForce::Gtd,
-            Self::Unknown => TimeInForce::Gtc, // default
-        }
+            Self::Rpi => TimeInForce::Gtc,
+            Self::Unknown => anyhow::bail!("unknown Binance time in force"),
+        })
     }
 }
 
 impl BinanceOrderStatus {
     /// Converts to Nautilus order status.
-    #[must_use]
-    pub fn to_nautilus_order_status(&self) -> OrderStatus {
-        match self {
-            Self::New => OrderStatus::Accepted,
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown order status.
+    pub fn to_nautilus_order_status(
+        &self,
+        treat_expired_as_canceled: bool,
+    ) -> anyhow::Result<OrderStatus> {
+        Ok(match self {
+            Self::New | Self::PendingNew => OrderStatus::Accepted,
             Self::PartiallyFilled => OrderStatus::PartiallyFilled,
-            Self::Filled => OrderStatus::Filled,
+            Self::Filled | Self::NewAdl | Self::NewInsurance => OrderStatus::Filled,
             Self::Canceled => OrderStatus::Canceled,
             Self::PendingCancel => OrderStatus::PendingCancel,
             Self::Rejected => OrderStatus::Rejected,
-            Self::Expired => OrderStatus::Expired,
-            Self::ExpiredInMatch => OrderStatus::Expired,
-            Self::Unknown => OrderStatus::Initialized,
-        }
+            Self::Expired | Self::ExpiredInMatch => {
+                if treat_expired_as_canceled {
+                    OrderStatus::Canceled
+                } else {
+                    OrderStatus::Expired
+                }
+            }
+            Self::Unknown => anyhow::bail!("unknown Binance order status"),
+        })
     }
 }
 
@@ -1047,9 +1284,10 @@ impl BinanceUserTrade {
         instrument_id: InstrumentId,
         price_precision: u8,
         size_precision: u8,
+        bnfcr_currency: Currency,
         ts_init: UnixNanos,
     ) -> anyhow::Result<FillReport> {
-        let ts_event = UnixNanos::from((self.time * 1_000_000) as u64);
+        let ts_event = parse_millis(self.time, "Futures user trade time")?;
 
         let venue_order_id = VenueOrderId::new(self.order_id.to_string());
         let trade_id = TradeId::new(self.id.to_string());
@@ -1068,17 +1306,18 @@ impl BinanceUserTrade {
         let last_qty: Decimal = self.qty.parse().context("invalid qty")?;
         let last_px: Decimal = self.price.parse().context("invalid price")?;
 
-        let commission = {
-            let comm_val: f64 = self
-                .commission
-                .as_ref()
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(0.0);
-            let comm_asset = self
-                .commission_asset
-                .as_ref()
-                .map_or_else(Currency::USDT, Currency::from);
-            Money::new(comm_val, comm_asset)
+        let commission_currency = self
+            .commission_asset
+            .as_ref()
+            .map_or(bnfcr_currency, |asset| {
+                normalize_futures_asset(asset, bnfcr_currency)
+            });
+        let commission = match self.commission.as_ref() {
+            Some(raw) => {
+                let decimal = parse_required_decimal(raw, "commission")?;
+                Money::from_decimal(decimal, commission_currency)?
+            }
+            None => Money::zero(commission_currency),
         };
 
         Ok(FillReport::new(
@@ -1087,8 +1326,8 @@ impl BinanceUserTrade {
             venue_order_id,
             trade_id,
             order_side,
-            Quantity::new(last_qty.to_string().parse()?, size_precision),
-            Price::new(last_px.to_string().parse()?, price_precision),
+            Quantity::from_decimal_dp(last_qty, size_precision).context("invalid qty precision")?,
+            Price::from_decimal_dp(last_px, price_precision).context("invalid price precision")?,
             commission,
             liquidity_side,
             None, // client_order_id
@@ -1122,11 +1361,19 @@ pub struct BatchOrderError {
 }
 
 /// Listen key response from user data stream endpoints.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenKeyResponse {
     /// The listen key for WebSocket user data stream.
-    pub listen_key: String,
+    pub listen_key: SecretString,
+}
+
+impl ListenKeyResponse {
+    /// Consumes the response and returns the listen key.
+    #[must_use]
+    pub fn into_listen_key(mut self) -> SecretString {
+        std::mem::take(&mut self.listen_key)
+    }
 }
 
 /// Algo order response from Binance Futures Algo Service API.
@@ -1190,6 +1437,9 @@ pub struct BinanceFuturesAlgoOrder {
     /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
     #[serde(default)]
     pub callback_rate: Option<String>,
+    /// Good till date in milliseconds.
+    #[serde(default)]
+    pub good_till_date: Option<i64>,
     /// Order creation time in milliseconds.
     #[serde(default)]
     pub create_time: Option<i64>,
@@ -1203,10 +1453,10 @@ pub struct BinanceFuturesAlgoOrder {
     #[serde(default)]
     pub actual_order_id: Option<String>,
     /// Executed quantity in matching engine (populated when algo order is triggered).
-    #[serde(default)]
+    #[serde(default, rename = "actualQty", alias = "executedQty")]
     pub executed_qty: Option<String>,
     /// Average fill price in matching engine (populated when algo order is triggered).
-    #[serde(default)]
+    #[serde(default, rename = "actualPrice", alias = "avgPrice")]
     pub avg_price: Option<String>,
 }
 
@@ -1215,39 +1465,47 @@ impl BinanceFuturesAlgoOrder {
     ///
     /// # Errors
     ///
-    /// Returns an error if quantity parsing fails.
+    /// Returns an error if client order ID, quantity, price, trigger, or trailing fields cannot be
+    /// parsed.
     pub fn to_order_status_report(
         &self,
         account_id: AccountId,
         instrument_id: InstrumentId,
+        price_precision: u8,
         size_precision: u8,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
         let ts_event = self
             .update_time
             .or(self.create_time)
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map(|value| parse_millis(value, "Futures algo order time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
-        let client_order_id = ClientOrderId::new(decode_broker_id(
-            &self.client_algo_id,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        ));
-        let venue_order_id = self.actual_order_id.as_ref().map_or_else(
-            || VenueOrderId::new(self.algo_id.to_string()),
-            |id| VenueOrderId::new(id.clone()),
-        );
+        let client_order_id =
+            decode_client_order_id(&self.client_algo_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
+        let venue_order_id = self
+            .actual_order_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .map_or_else(
+                || VenueOrderId::new(self.algo_id.to_string()),
+                |id| VenueOrderId::new(id.clone()),
+            );
 
         let order_side = match self.side {
             BinanceSide::Buy => OrderSide::Buy,
             BinanceSide::Sell => OrderSide::Sell,
         };
 
-        let order_type = self.parse_order_type();
+        let order_type = self.order_type.to_nautilus_order_type()?;
         let time_in_force = self
             .time_in_force
             .as_ref()
-            .map_or(TimeInForce::Gtc, |tif| tif.to_nautilus_time_in_force());
-        let order_status = self.parse_order_status();
+            .map(BinanceTimeInForce::to_nautilus_time_in_force)
+            .transpose()?
+            .unwrap_or(TimeInForce::Gtc);
+        let order_status = self.parse_order_status()?;
 
         let quantity: Decimal = self
             .quantity
@@ -1259,50 +1517,292 @@ impl BinanceFuturesAlgoOrder {
             .as_ref()
             .map_or(Ok(Decimal::ZERO), |q| q.parse())
             .context("invalid executed_qty")?;
+        let price = if let Some(price) = self.price.as_ref().filter(|price| !price.is_empty()) {
+            let price: Decimal = price.parse().context("invalid price")?;
+            if price == Decimal::ZERO {
+                None
+            } else {
+                Some(
+                    Price::from_decimal_dp(price, price_precision)
+                        .context("invalid price precision")?,
+                )
+            }
+        } else {
+            None
+        };
+        let avg_px = parse_avg_px(self.avg_price.as_deref(), filled_qty, price_precision)?;
+        let trigger_price = self.parse_trigger_price(price_precision)?;
+        let trailing_offset = self.parse_trailing_offset()?;
 
-        Ok(OrderStatusReport::new(
+        let mut report = OrderStatusReport::new(
             account_id,
             instrument_id,
             Some(client_order_id),
             venue_order_id,
-            order_side,
+            order_side.into(),
             order_type,
             time_in_force,
             order_status,
-            Quantity::new(quantity.to_string().parse()?, size_precision),
-            Quantity::new(filled_qty.to_string().parse()?, size_precision),
+            Quantity::from_decimal_dp(quantity, size_precision)
+                .context("invalid quantity precision")?,
+            Quantity::from_decimal_dp(filled_qty, size_precision)
+                .context("invalid executed_qty precision")?,
             ts_event,
             ts_event,
             ts_init,
             Some(UUID4::new()),
-        ))
+        );
+
+        if let Some(price) = price {
+            report = report.with_price(price);
+        }
+
+        report.avg_px = avg_px;
+
+        if let Some(trigger_price) = trigger_price {
+            report = report
+                .with_trigger_price(trigger_price)
+                .with_trigger_type(parse_working_type(self.working_type));
+        }
+
+        if let Some(trailing_offset) = trailing_offset {
+            report = report
+                .with_trailing_offset(trailing_offset)
+                .with_trailing_offset_type(TrailingOffsetType::BasisPoints);
+        }
+
+        if let Some(activation_price) = self
+            .activate_price
+            .as_deref()
+            .map(|price| {
+                parse_positive_price_at_precision(price, price_precision, "activate_price")
+            })
+            .transpose()?
+            .flatten()
+        {
+            report = report.with_activation_price(activation_price);
+        }
+
+        if self.reduce_only == Some(true) || self.close_position == Some(true) {
+            report = report.with_reduce_only(true);
+        }
+
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
+        }
+
+        if let Some(trigger_time) = self.trigger_time {
+            report =
+                report.with_ts_triggered(parse_millis(trigger_time, "Futures algo trigger time")?);
+        }
+
+        Ok(report)
     }
 
-    fn parse_order_type(&self) -> OrderType {
-        self.order_type.into()
+    /// Converts this algo order to a report enriched with matching-engine execution details.
+    ///
+    /// The algo order remains the source of client identity and conditional-order metadata.
+    /// The matching-engine order is authoritative for status, quantity, fills, average price,
+    /// venue order identity, and the last update time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the matching-engine order does not match this algo order or either
+    /// response contains invalid report data.
+    #[expect(clippy::too_many_arguments)]
+    pub fn to_order_status_report_with_actual(
+        &self,
+        actual: &BinanceFuturesOrder,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        price_precision: u8,
+        size_precision: u8,
+        treat_expired_as_canceled: bool,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let expected_actual_order_id = self
+            .actual_order_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .context("algo order has no actual_order_id")?;
+
+        if expected_actual_order_id != actual.order_id.to_string() {
+            anyhow::bail!(
+                "actual order ID mismatch: expected {expected_actual_order_id}, was {}",
+                actual.order_id
+            );
+        }
+
+        if self.symbol != actual.symbol {
+            anyhow::bail!(
+                "actual order symbol mismatch: expected {}, was {}",
+                self.symbol,
+                actual.symbol
+            );
+        }
+
+        if self.side != actual.side {
+            anyhow::bail!(
+                "actual order side mismatch: expected {:?}, was {:?}",
+                self.side,
+                actual.side
+            );
+        }
+
+        let mut report = self.to_order_status_report(
+            account_id,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_init,
+        )?;
+        let actual_report = actual.to_order_status_report(
+            account_id,
+            instrument_id,
+            price_precision,
+            size_precision,
+            treat_expired_as_canceled,
+            ts_init,
+        )?;
+        report.venue_order_id = actual_report.venue_order_id;
+        report.order_status = actual_report.order_status;
+        report.quantity = actual_report.quantity;
+        report.filled_qty = actual_report.filled_qty;
+        report.avg_px = actual_report.avg_px.or(report.avg_px);
+        report.expire_time = report.expire_time.or(actual_report.expire_time);
+        report.ts_last = actual_report.ts_last;
+
+        Ok(report)
     }
 
-    fn parse_order_status(&self) -> OrderStatus {
-        match self.algo_status {
+    fn parse_trigger_price(&self, price_precision: u8) -> anyhow::Result<Option<Price>> {
+        let raw_trigger_price = match self.order_type {
+            BinanceFuturesOrderType::TrailingStopMarket => self
+                .trigger_price
+                .as_deref()
+                .or(self.activate_price.as_deref()),
+            _ => self.trigger_price.as_deref(),
+        };
+        let trigger_price = raw_trigger_price
+            .map(|price| parse_positive_price_at_precision(price, price_precision, "trigger_price"))
+            .transpose()?
+            .flatten();
+
+        if trigger_price.is_none() && requires_algo_trigger_price(self.order_type) {
+            anyhow::bail!(
+                "missing positive trigger_price for Binance algo order type {:?}",
+                self.order_type
+            );
+        }
+
+        Ok(trigger_price)
+    }
+
+    fn parse_trailing_offset(&self) -> anyhow::Result<Option<Decimal>> {
+        if self.order_type != BinanceFuturesOrderType::TrailingStopMarket {
+            return Ok(None);
+        }
+
+        self.callback_rate
+            .as_deref()
+            .map(parse_callback_rate_basis_points)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn parse_order_status(&self) -> anyhow::Result<OrderStatus> {
+        Ok(match self.algo_status {
             Some(BinanceAlgoStatus::New) => OrderStatus::Accepted,
             Some(BinanceAlgoStatus::Triggering) => OrderStatus::Accepted,
-            Some(BinanceAlgoStatus::Triggered) => OrderStatus::Accepted,
+            Some(BinanceAlgoStatus::Triggered) => self
+                .executed_qty
+                .as_deref()
+                .and_then(|qty| qty.parse::<Decimal>().ok())
+                .filter(|qty| *qty > Decimal::ZERO)
+                .map_or(OrderStatus::Accepted, |_| OrderStatus::PartiallyFilled),
             Some(BinanceAlgoStatus::Finished) => {
-                // Check executed_qty to determine if filled or canceled
-                if let Some(qty) = &self.executed_qty
-                    && let Ok(dec) = qty.parse::<Decimal>()
-                    && !dec.is_zero()
-                {
-                    return OrderStatus::Filled;
+                let executed_qty = self
+                    .executed_qty
+                    .as_deref()
+                    .and_then(|qty| qty.parse::<Decimal>().ok());
+                let quantity = self
+                    .quantity
+                    .as_deref()
+                    .and_then(|qty| qty.parse::<Decimal>().ok());
+                match (executed_qty, quantity) {
+                    (Some(actual), Some(total)) if total > Decimal::ZERO && actual >= total => {
+                        OrderStatus::Filled
+                    }
+                    _ => OrderStatus::Canceled,
                 }
-                OrderStatus::Canceled
             }
             Some(BinanceAlgoStatus::Canceled) => OrderStatus::Canceled,
             Some(BinanceAlgoStatus::Expired) => OrderStatus::Expired,
             Some(BinanceAlgoStatus::Rejected) => OrderStatus::Rejected,
-            Some(BinanceAlgoStatus::Unknown) | None => OrderStatus::Initialized,
-        }
+            Some(BinanceAlgoStatus::Unknown) => anyhow::bail!("unknown Binance algo order status"),
+            None => OrderStatus::Initialized,
+        })
     }
+}
+
+fn parse_avg_px(
+    raw: Option<&str>,
+    filled_qty: Decimal,
+    price_precision: u8,
+) -> anyhow::Result<Option<Decimal>> {
+    if filled_qty <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    raw.filter(|price| !price.is_empty())
+        .map(|price| parse_positive_price_at_precision(price, price_precision, "avg_price"))
+        .transpose()
+        .map(|price| price.flatten().map(|price| price.as_decimal()))
+}
+
+fn parse_positive_price_at_precision(
+    raw: &str,
+    precision: u8,
+    field: &str,
+) -> anyhow::Result<Option<Price>> {
+    let decimal = parse_required_decimal(raw, field)?;
+    if decimal <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    Price::from_decimal_dp(decimal, precision)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("invalid {field} precision: {e}"))
+}
+
+fn parse_callback_rate_basis_points(raw: &str) -> anyhow::Result<Option<Decimal>> {
+    let rate = parse_required_decimal(raw, "callback_rate")?;
+    if rate <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    rate.checked_mul(Decimal::from(100))
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("invalid callback_rate='{raw}': multiplication overflow"))
+}
+
+fn parse_working_type(working_type: Option<BinanceWorkingType>) -> TriggerType {
+    match working_type {
+        Some(BinanceWorkingType::ContractPrice) => TriggerType::LastPrice,
+        Some(BinanceWorkingType::MarkPrice) => TriggerType::MarkPrice,
+        Some(BinanceWorkingType::Unknown) | None => TriggerType::Default,
+    }
+}
+
+fn requires_algo_trigger_price(order_type: BinanceFuturesOrderType) -> bool {
+    matches!(
+        order_type,
+        BinanceFuturesOrderType::Stop
+            | BinanceFuturesOrderType::StopMarket
+            | BinanceFuturesOrderType::TakeProfit
+            | BinanceFuturesOrderType::TakeProfitMarket
+            | BinanceFuturesOrderType::TrailingStopMarket
+    )
 }
 
 /// Cancel response for algo orders from Binance Futures Algo Service API.
@@ -1321,10 +1821,40 @@ pub struct BinanceFuturesAlgoOrderCancelResponse {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::identifiers::ClientOrderId;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use zeroize::Zeroize;
 
     use super::*;
     use crate::common::testing::load_fixture_string;
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    #[rstest]
+    fn test_unknown_order_enums_reject_conversion() {
+        assert_eq!(
+            BinanceFuturesOrderType::Unknown
+                .to_nautilus_order_type()
+                .unwrap_err()
+                .to_string(),
+            "unknown Binance Futures order type",
+        );
+        assert_eq!(
+            BinanceTimeInForce::Unknown
+                .to_nautilus_time_in_force()
+                .unwrap_err()
+                .to_string(),
+            "unknown Binance time in force",
+        );
+        assert_eq!(
+            BinanceOrderStatus::Unknown
+                .to_nautilus_order_status(false)
+                .unwrap_err()
+                .to_string(),
+            "unknown Binance order status",
+        );
+    }
 
     #[rstest]
     fn test_parse_account_info_v2() {
@@ -1334,14 +1864,185 @@ mod tests {
 
         assert_eq!(
             account.total_wallet_balance,
-            Some("23.72469206".to_string())
+            Some(Decimal::from_str_exact("23.72469206").unwrap())
         );
         assert_eq!(account.assets.len(), 1);
         assert_eq!(account.assets[0].asset.as_str(), "USDT");
-        assert_eq!(account.assets[0].wallet_balance, "23.72469206");
+        assert_eq!(
+            account.assets[0].wallet_balance,
+            Decimal::from_str_exact("23.72469206").unwrap()
+        );
         assert_eq!(account.positions.len(), 1);
         assert_eq!(account.positions[0].symbol.as_str(), "BTCUSDT");
         assert_eq!(account.positions[0].leverage, Some("100".to_string()));
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_zero_margins() {
+        let json = load_fixture_string("futures/http_json/account_info_v2.json");
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(&json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.account_id, account_id);
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert!(!state.balances.is_empty());
+        assert_eq!(state.margins.len(), 0);
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_with_margins() {
+        let json = r#"{
+            "totalInitialMargin": "500.25000000",
+            "totalMaintMargin": "250.75000000",
+            "totalWalletBalance": "10000.00000000",
+            "assets": [{
+                "asset": "USDT",
+                "walletBalance": "10000.00000000",
+                "availableBalance": "9500.00000000",
+                "initialMargin": "500.25000000",
+                "maintMargin": "250.75000000",
+                "updateTime": 1617939110373
+            }],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.margins.len(), 1);
+        let margin = &state.margins[0];
+        assert!(margin.instrument_id.is_none());
+        assert_eq!(margin.currency.code, "USDT");
+        assert_eq!(margin.initial.as_f64(), 500.25);
+        assert_eq!(margin.maintenance.as_f64(), 250.75);
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_coin_margined_per_base_coin() {
+        let json = r#"{
+            "totalWalletBalance": "0.00000000",
+            "assets": [
+                {
+                    "asset": "BTC",
+                    "walletBalance": "1.50000000",
+                    "availableBalance": "1.40000000",
+                    "initialMargin": "0.05000000",
+                    "maintMargin": "0.02500000",
+                    "updateTime": 1617939110373
+                },
+                {
+                    "asset": "ETH",
+                    "walletBalance": "10.00000000",
+                    "availableBalance": "9.00000000",
+                    "initialMargin": "0.80000000",
+                    "maintMargin": "0.40000000",
+                    "updateTime": 1617939110373
+                }
+            ],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.margins.len(), 2);
+        assert!(state.margins.iter().all(|m| m.instrument_id.is_none()));
+        let btc = state
+            .margins
+            .iter()
+            .find(|m| m.currency.code == "BTC")
+            .expect("BTC margin missing");
+        assert_eq!(btc.initial.as_f64(), 0.05);
+        assert_eq!(btc.maintenance.as_f64(), 0.025);
+        let eth = state
+            .margins
+            .iter()
+            .find(|m| m.currency.code == "ETH")
+            .expect("ETH margin missing");
+        assert_eq!(eth.initial.as_f64(), 0.8);
+        assert_eq!(eth.maintenance.as_f64(), 0.4);
+    }
+
+    // Regression for the #3867 bug class: wire values with more decimal places
+    // than the currency precision (USDT=8) previously tripped the
+    // `total == locked + free` invariant when Money::new rounded each side
+    // independently. The `from_total_and_free` constructor must keep the invariant.
+    #[rstest]
+    fn test_account_info_to_account_state_precision_drift() {
+        let json = r#"{
+            "assets": [{
+                "asset": "USDT",
+                "walletBalance": "10.000000034999",
+                "availableBalance": "9.999999994999",
+                "updateTime": 1617939110373
+            }],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.balances.len(), 1);
+        let balance = &state.balances[0];
+        assert_eq!(balance.total, balance.locked + balance.free);
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_empty_balance() {
+        // Empty strings for balance fields (inactive/zero-balance accounts)
+        let json = r#"{
+            "assets": [{
+                "asset": "USDT",
+                "walletBalance": "",
+                "availableBalance": "",
+                "updateTime": 0
+            }],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.balances.len(), 1);
+        let balance = &state.balances[0];
+        assert_eq!(balance.total, Money::new(0.0, Currency::USDT()));
+        assert_eq!(balance.free, Money::new(0.0, Currency::USDT()));
+        assert_eq!(balance.locked, Money::new(0.0, Currency::USDT()));
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_empty_assets() {
+        // No assets at all (completely empty account)
+        let json = r#"{
+            "assets": [],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.balances.len(), 1);
+        let balance = &state.balances[0];
+        assert_eq!(balance.total, Money::new(0.0, Currency::USDT()));
     }
 
     #[rstest]
@@ -1367,8 +2068,14 @@ mod tests {
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.as_str(), "USDT");
         // Uses alias to parse 'balance' into wallet_balance
-        assert_eq!(balances[0].wallet_balance, "122.12345678");
-        assert_eq!(balances[0].available_balance, "122.12345678");
+        assert_eq!(
+            balances[0].wallet_balance,
+            Decimal::from_str_exact("122.12345678").unwrap()
+        );
+        assert_eq!(
+            balances[0].available_balance,
+            Decimal::from_str_exact("122.12345678").unwrap()
+        );
     }
 
     #[rstest]
@@ -1385,7 +2092,10 @@ mod tests {
             serde_json::from_str(json).expect("Failed to parse balance");
 
         assert_eq!(balance.asset.as_str(), "USDT");
-        assert_eq!(balance.wallet_balance, "100.00000000");
+        assert_eq!(
+            balance.wallet_balance,
+            Decimal::from_str_exact("100.00000000").unwrap()
+        );
     }
 
     #[rstest]
@@ -1397,8 +2107,74 @@ mod tests {
         assert_eq!(order.order_id, 12345678);
         assert_eq!(order.symbol.as_str(), "BTCUSDT");
         assert_eq!(order.status, BinanceOrderStatus::New);
+        assert_eq!(order.time_in_force, BinanceTimeInForce::Gtc);
         assert_eq!(order.side, BinanceSide::Buy);
         assert_eq!(order.order_type, BinanceFuturesOrderType::Limit);
+        assert_eq!(order.price_match, Some(BinancePriceMatch::None));
+        assert_eq!(
+            order.self_trade_prevention_mode,
+            Some(BinanceSelfTradePreventionMode::None)
+        );
+    }
+
+    #[rstest]
+    fn test_order_to_report_maps_rpi_to_gtc_post_only() {
+        let mut order = order_with_price("50000.00");
+        order.order_type = BinanceFuturesOrderType::Limit;
+        order.time_in_force = BinanceTimeInForce::Rpi;
+
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                false,
+                UnixNanos::from(1_000_000_000u64),
+            )
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtc);
+        assert!(report.post_only);
+    }
+
+    #[rstest]
+    fn test_parse_order_defaults_missing_cum_quote_to_zero() {
+        let json = load_fixture_string("futures/http_json/order_response.json");
+        let mut value: Value = serde_json::from_str(&json).expect("Failed to parse order fixture");
+
+        value
+            .as_object_mut()
+            .expect("Order fixture should be a JSON object")
+            .remove("cumQuote");
+
+        let order: BinanceFuturesOrder =
+            serde_json::from_value(value).expect("Failed to parse order");
+
+        assert_eq!(order.cum_quote, "0");
+    }
+
+    #[rstest]
+    fn test_parse_kline_rejects_non_string_price() {
+        let value = serde_json::json!([
+            1_625_474_304_000_i64,
+            50000.00,
+            "51000.00",
+            "49000.00",
+            "50500.00",
+            "12.5",
+            1_625_474_364_000_i64,
+            "631250.00",
+            100_i64,
+            "6.2",
+            "313100.00"
+        ]);
+
+        let error = serde_json::from_value::<BinanceFuturesKline>(value)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("open"));
     }
 
     #[rstest]
@@ -1420,11 +2196,23 @@ mod tests {
 
     #[rstest]
     fn test_parse_listen_key_response() {
+        assert_zeroize_on_drop::<ListenKeyResponse>();
+
         let json =
             r#"{"listenKey": "pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"}"#;
-        let response: ListenKeyResponse =
+        let mut response: ListenKeyResponse =
             serde_json::from_str(json).expect("Failed to parse listen key");
-        assert!(!response.listen_key.is_empty());
+
+        let debug = format!("{response:?}");
+        assert_eq!(
+            response.listen_key.expose_secret(),
+            "pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"
+        );
+        assert_eq!(debug, "ListenKeyResponse { listen_key: <redacted> }");
+        assert!(!debug.contains(response.listen_key.expose_secret()));
+
+        response.zeroize();
+        assert!(response.listen_key.expose_secret().is_empty());
     }
 
     #[rstest]
@@ -1490,29 +2278,21 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_algo_order_triggered() {
-        let json = r#"{
-            "algoId": 123456789,
-            "clientAlgoId": "test-algo-order-2",
-            "algoType": "CONDITIONAL",
-            "type": "TAKE_PROFIT",
-            "symbol": "ETHUSDT",
-            "side": "SELL",
-            "algoStatus": "TRIGGERED",
-            "triggerPrice": "2500.00",
-            "price": "2500.00",
-            "actualOrderId": "987654321",
-            "executedQty": "0.5",
-            "avgPrice": "2499.50"
-        }"#;
+    #[case("actualQty", "actualPrice")]
+    #[case("executedQty", "avgPrice")]
+    fn test_parse_algo_order_finished(#[case] quantity_field: &str, #[case] price_field: &str) {
+        let json = load_fixture_string("futures/http_json/algo_order_response.json")
+            .replace("actualQty", quantity_field)
+            .replace("actualPrice", price_field);
 
         let order: BinanceFuturesAlgoOrder =
-            serde_json::from_str(json).expect("Failed to parse triggered algo order");
+            serde_json::from_str(&json).expect("Failed to parse finished algo order");
 
-        assert_eq!(order.algo_status, Some(BinanceAlgoStatus::Triggered));
-        assert_eq!(order.order_type, BinanceFuturesOrderType::TakeProfit);
+        assert_eq!(order.algo_status, Some(BinanceAlgoStatus::Finished));
+        assert_eq!(order.order_type, BinanceFuturesOrderType::StopMarket);
         assert_eq!(order.actual_order_id, Some("987654321".to_string()));
-        assert_eq!(order.executed_qty, Some("0.5".to_string()));
+        assert_eq!(order.executed_qty, Some("0.001".to_string()));
+        assert_eq!(order.avg_price, Some("50000.00".to_string()));
     }
 
     #[rstest]
@@ -1568,13 +2348,499 @@ mod tests {
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let report = order
-            .to_order_status_report(account_id, instrument_id, 3, ts_init)
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
             .unwrap();
 
         assert_eq!(
             report.client_order_id,
             Some(ClientOrderId::from("O-20200101-000000-000-000-0")),
         );
+        assert_eq!(report.price, Some(Price::from("50000.00")));
+    }
+
+    #[rstest]
+    fn test_order_to_report_rejects_invalid_client_order_id() {
+        let mut order = order_with_price("50000.00");
+        order.client_order_id = String::new();
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            false,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid Binance client order ID ''"
+        );
+    }
+
+    #[rstest]
+    #[case("0")]
+    #[case("")]
+    fn test_order_to_report_omits_missing_price(#[case] price: &str) {
+        let order = order_with_price(price);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.price, None);
+    }
+
+    #[rstest]
+    fn test_order_to_report_sets_avg_px_for_filled_market_order() {
+        let mut order = order_with_price("0");
+        order.status = BinanceOrderStatus::Filled;
+        order.executed_qty = "0.001".to_string();
+        order.cum_quote = "50.00".to_string();
+        order.avg_price = Some("50000.00".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.price, None);
+        assert_eq!(
+            report.avg_px,
+            Some(Decimal::from_str_exact("50000.00").unwrap())
+        );
+    }
+
+    #[rstest]
+    fn test_order_to_report_omits_avg_px_without_fills() {
+        let mut order = order_with_price("0");
+        order.avg_price = Some("50000.00".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.avg_px, None);
+    }
+
+    #[rstest]
+    fn test_order_to_report_rejects_invalid_avg_px_for_filled_order() {
+        let mut order = order_with_price("0");
+        order.executed_qty = "0.001".to_string();
+        order.avg_price = Some("not-a-number".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("avg_price"));
+    }
+
+    #[rstest]
+    fn test_close_all_algo_report_with_actual_uses_matching_engine_quantity() {
+        let mut algo = algo_order_with_price(None);
+        algo.order_type = BinanceFuturesOrderType::StopMarket;
+        algo.quantity = None;
+        algo.close_position = Some(true);
+        algo.algo_status = Some(BinanceAlgoStatus::Finished);
+        algo.actual_order_id = Some("987654321".to_string());
+        algo.executed_qty = Some("0.002".to_string());
+        algo.avg_price = Some("49000.00".to_string());
+        algo.reduce_only = Some(true);
+        algo.trigger_time = Some(1_625_474_305_000);
+        algo.time_in_force = Some(BinanceTimeInForce::Gtd);
+        algo.good_till_date = Some(1_700_000_601_000);
+
+        let mut actual = order_with_price("0");
+        actual.order_id = 987654321;
+        actual.orig_qty = "0.002".to_string();
+        actual.executed_qty = "0.001".to_string();
+        actual.avg_price = Some("50000.00".to_string());
+        actual.status = BinanceOrderStatus::PartiallyFilled;
+        actual.order_type = BinanceFuturesOrderType::Market;
+        actual.side = BinanceSide::Sell;
+        actual.update_time = Some(1_625_474_306_000);
+
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let report = algo
+            .to_order_status_report_with_actual(
+                &actual,
+                account_id,
+                instrument_id,
+                2,
+                3,
+                false,
+                ts_init,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("my-algo-order-1"))
+        );
+        assert_eq!(report.venue_order_id, VenueOrderId::from("987654321"));
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.quantity, Quantity::from("0.002"));
+        assert_eq!(report.filled_qty, Quantity::from("0.001"));
+        assert_eq!(report.avg_px, Some(Decimal::from(50000)));
+        assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
+        assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
+        assert!(report.reduce_only);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+        assert_eq!(
+            report.ts_triggered,
+            Some(UnixNanos::from_millis(1_625_474_305_000))
+        );
+        assert_eq!(report.ts_last, UnixNanos::from_millis(1_625_474_306_000));
+    }
+
+    #[rstest]
+    #[case(BinanceAlgoStatus::Finished, Some("0.001"), OrderStatus::Filled)]
+    #[case(BinanceAlgoStatus::Finished, Some("0.0005"), OrderStatus::Canceled)]
+    #[case(
+        BinanceAlgoStatus::Triggered,
+        Some("0.0005"),
+        OrderStatus::PartiallyFilled
+    )]
+    #[case(BinanceAlgoStatus::Triggered, None, OrderStatus::Accepted)]
+    fn test_algo_order_status_uses_actual_quantity_conservatively(
+        #[case] algo_status: BinanceAlgoStatus,
+        #[case] executed_qty: Option<&str>,
+        #[case] expected: OrderStatus,
+    ) {
+        let mut order = algo_order_with_price(None);
+        order.algo_status = Some(algo_status);
+        order.executed_qty = executed_qty.map(str::to_string);
+
+        assert_eq!(order.parse_order_status().unwrap(), expected);
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_sets_price() {
+        let order = algo_order_with_price(Some("50000.00"));
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.price, Some(Price::from("50000.00")));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_sets_actual_fill_fields() {
+        let json = load_fixture_string("futures/http_json/algo_order_response.json");
+        let order: BinanceFuturesAlgoOrder = serde_json::from_str(&json).unwrap();
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.filled_qty.as_decimal(), dec!(0.001));
+        assert_eq!(report.price, None);
+        assert_eq!(report.avg_px, Some(dec!(50000.00)));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_omits_avg_price_without_fills() {
+        let mut order = algo_order_with_price(None);
+        order.executed_qty = Some("0".to_string());
+        order.avg_price = Some("not-a-number".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.filled_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(report.avg_px, None);
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_sets_trigger_fields() {
+        let order = algo_order_with_price(Some("44000.00"));
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
+        assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_sets_trailing_fields() {
+        let mut order = algo_order_with_price(None);
+        order.order_type = BinanceFuturesOrderType::TrailingStopMarket;
+        order.trigger_price = None;
+        order.activate_price = Some("45000.00".to_string());
+        order.callback_rate = Some("0.25".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
+        assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
+        assert_eq!(report.trailing_offset, Some(Decimal::from(25)));
+        assert_eq!(
+            report.trailing_offset_type,
+            Some(TrailingOffsetType::BasisPoints),
+        );
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some("0"))]
+    #[case(Some(""))]
+    fn test_algo_order_to_report_omits_missing_price(#[case] price: Option<&str>) {
+        let order = algo_order_with_price(price);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.price, None);
+    }
+
+    #[rstest]
+    fn test_order_to_report_rejects_invalid_price() {
+        let order = order_with_price("not-a-number");
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid price"));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_rejects_invalid_trigger_price() {
+        let mut order = algo_order_with_price(Some("50000.00"));
+        order.trigger_price = Some("not-a-number".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("trigger_price"));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_rejects_missing_trigger_price() {
+        let mut order = algo_order_with_price(None);
+        order.order_type = BinanceFuturesOrderType::StopMarket;
+        order.trigger_price = None;
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("missing positive trigger_price"));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_rejects_invalid_callback_rate() {
+        let mut order = algo_order_with_price(None);
+        order.order_type = BinanceFuturesOrderType::TrailingStopMarket;
+        order.trigger_price = None;
+        order.activate_price = Some("45000.00".to_string());
+        order.callback_rate = Some("not-a-number".to_string());
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("callback_rate"));
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_rejects_invalid_price() {
+        let order = algo_order_with_price(Some("not-a-number"));
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = order.to_order_status_report(account_id, instrument_id, 2, 3, ts_init);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid price"));
+    }
+
+    #[rstest]
+    fn test_order_to_report_preserves_good_till_date() {
+        let mut order = order_with_price("50000.00");
+        order.time_in_force = BinanceTimeInForce::Gtd;
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_preserves_good_till_date() {
+        let mut order = algo_order_with_price(Some("50000.00"));
+        order.time_in_force = Some(BinanceTimeInForce::Gtd);
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
+    fn order_with_price(price: &str) -> BinanceFuturesOrder {
+        BinanceFuturesOrder {
+            symbol: Ustr::from("BTCUSDT"),
+            order_id: 12345678,
+            client_order_id: "external-order".to_string(),
+            orig_qty: "0.001".to_string(),
+            executed_qty: "0.000".to_string(),
+            cum_quote: "0.00".to_string(),
+            price: price.to_string(),
+            avg_price: Some("0.00".to_string()),
+            stop_price: Some("0.00".to_string()),
+            status: BinanceOrderStatus::New,
+            time_in_force: BinanceTimeInForce::Gtc,
+            order_type: BinanceFuturesOrderType::Market,
+            orig_type: Some(BinanceFuturesOrderType::Market),
+            side: BinanceSide::Buy,
+            position_side: Some(BinancePositionSide::Both),
+            reduce_only: Some(false),
+            close_position: Some(false),
+            activate_price: None,
+            price_rate: None,
+            working_type: Some(BinanceWorkingType::ContractPrice),
+            price_protect: Some(false),
+            is_isolated: None,
+            good_till_date: Some(0),
+            price_match: Some(BinancePriceMatch::None),
+            self_trade_prevention_mode: Some(BinanceSelfTradePreventionMode::None),
+            update_time: Some(1_625_474_304_765),
+            working_type_id: None,
+        }
+    }
+
+    fn algo_order_with_price(price: Option<&str>) -> BinanceFuturesAlgoOrder {
+        BinanceFuturesAlgoOrder {
+            algo_id: 123456789,
+            client_algo_id: "x-aHRE4BCj-Rmy-algo-order-1".to_string(),
+            algo_type: BinanceAlgoType::Conditional,
+            order_type: BinanceFuturesOrderType::TakeProfit,
+            symbol: Ustr::from("BTCUSDT"),
+            side: BinanceSide::Sell,
+            position_side: Some(BinancePositionSide::Both),
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            algo_status: Some(BinanceAlgoStatus::New),
+            trigger_price: Some("45000.00".to_string()),
+            price: price.map(str::to_string),
+            working_type: Some(BinanceWorkingType::MarkPrice),
+            close_position: Some(false),
+            price_protect: None,
+            reduce_only: Some(false),
+            activate_price: None,
+            callback_rate: None,
+            good_till_date: Some(0),
+            create_time: Some(1_625_474_304_765),
+            update_time: Some(1_625_474_304_765),
+            trigger_time: None,
+            actual_order_id: None,
+            executed_qty: None,
+            avg_price: None,
+        }
+    }
+
+    #[rstest]
+    fn test_user_trade_to_fill_report_rejects_invalid_commission() {
+        let trade = BinanceUserTrade {
+            symbol: Ustr::from("BTCUSDT"),
+            id: 100,
+            order_id: 200,
+            price: "50000.00".to_string(),
+            qty: "0.001".to_string(),
+            quote_qty: None,
+            realized_pnl: "0".to_string(),
+            side: BinanceSide::Buy,
+            position_side: None,
+            time: 1_625_474_304_000,
+            buyer: true,
+            maker: false,
+            commission: Some("not-a-number".to_string()),
+            commission_asset: Some(Ustr::from("USDT")),
+            margin_asset: None,
+        };
+
+        let result = trade.to_fill_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            Currency::USDT(),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("commission"));
     }
 
     #[rstest]
@@ -1603,12 +2869,96 @@ mod tests {
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let report = order
-            .to_order_status_report(account_id, instrument_id, 3, ts_init)
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
             .unwrap();
 
         assert_eq!(
             report.client_order_id,
             Some(ClientOrderId::from("my-algo-order-1")),
         );
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_rejects_invalid_client_order_id() {
+        let mut order = algo_order_with_price(None);
+        order.client_algo_id = "x-aHRE4BCj-R".to_string();
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "missing raw broker client order ID payload"
+        );
+    }
+
+    #[rstest]
+    #[case(None, "123456789")]
+    #[case(Some(""), "123456789")]
+    #[case(Some("987654321"), "987654321")]
+    fn test_algo_order_to_report_selects_valid_venue_order_id(
+        #[case] actual_order_id: Option<&str>,
+        #[case] expected_venue_order_id: &str,
+    ) {
+        let order = BinanceFuturesAlgoOrder {
+            algo_id: 123456789,
+            client_algo_id: "x-aHRE4BCj-Rmy-algo-order-1".to_string(),
+            algo_type: BinanceAlgoType::Conditional,
+            order_type: BinanceFuturesOrderType::StopMarket,
+            symbol: Ustr::from("BTCUSDT"),
+            side: BinanceSide::Buy,
+            position_side: Some(BinancePositionSide::Both),
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            algo_status: Some(BinanceAlgoStatus::New),
+            trigger_price: Some("45000.00".to_string()),
+            price: None,
+            working_type: Some(BinanceWorkingType::MarkPrice),
+            close_position: Some(false),
+            price_protect: None,
+            reduce_only: Some(false),
+            activate_price: None,
+            callback_rate: None,
+            good_till_date: Some(0),
+            create_time: Some(1_625_474_304_765),
+            update_time: Some(1_625_474_304_765),
+            trigger_time: None,
+            actual_order_id: actual_order_id.map(str::to_string),
+            executed_qty: None,
+            avg_price: None,
+        };
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(
+            report.venue_order_id,
+            VenueOrderId::new(expected_venue_order_id)
+        );
+    }
+
+    #[rstest]
+    #[case(BinanceOrderStatus::Expired, false, OrderStatus::Expired)]
+    #[case(BinanceOrderStatus::Expired, true, OrderStatus::Canceled)]
+    #[case(BinanceOrderStatus::ExpiredInMatch, false, OrderStatus::Expired)]
+    #[case(BinanceOrderStatus::ExpiredInMatch, true, OrderStatus::Canceled)]
+    fn test_to_nautilus_order_status_expired_respects_treat_as_canceled(
+        #[case] status: BinanceOrderStatus,
+        #[case] treat_expired_as_canceled: bool,
+        #[case] expected: OrderStatus,
+    ) {
+        let result = status
+            .to_nautilus_order_status(treat_expired_as_canceled)
+            .unwrap();
+        assert_eq!(result, expected);
     }
 }

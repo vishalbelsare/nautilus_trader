@@ -15,80 +15,119 @@
 
 //! Example demonstrating live execution testing with the AX Exchange adapter.
 //!
-//! Run with: `cargo run --example ax-exec-tester --package nautilus-architect-ax`
+//! Edit the constants below to change the environment, target symbol, and order size.
 //!
-//! Environment variables:
-//! - `AX_API_KEY`: Your API key
-//! - `AX_API_SECRET`: Your API secret
+//! Run with: `cargo run --example ax-exec-tester --package nautilus-architect-ax --features examples`
+//!
+//! Example instruments across asset classes:
+//! - `XAU-PERP` (metals, qty=1, ~$4600)
+//! - `NVDA-PERP` (equities, qty=1, ~$167)
+//! - `XAG-PERP` (metals, qty=1, ~$73)
+//! - `UNG-PERP` (energy ETFs, qty=1, ~$12)
+//! - `OCPI-H100-PERP` (compute, qty=100, ~$1.60)
+//! - `EURUSD-PERP` (fx, qty=100, ~$1.15)
+//!
+//! Required credential environment variables:
+//! - `AX_API_KEY`
+//! - `AX_API_SECRET`
 
 use nautilus_architect_ax::{
-    config::{AxDataClientConfig, AxExecClientConfig},
+    common::{consts::AX_CLIENT_ID, enums::AxEnvironment},
+    config::{AxDataClientConfig, AxExecutionClientConfig},
     factories::{AxDataClientFactory, AxExecutionClientFactory},
 };
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    enums::TimeInForce,
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
+use nautilus_trading::strategy::StrategyConfig;
+
+// WARNING: With `DRY_RUN = false`, this tester submits orders to the configured
+// environment and may use real funds. Set `DRY_RUN = true` to connect without
+// submitting orders or sending shutdown cancel/close commands.
+const DRY_RUN: bool = false;
+const AX_ENVIRONMENT: AxEnvironment = AxEnvironment::Sandbox;
+const TRADER_ID: &str = "TESTER-001";
+const ACCOUNT_ID: &str = "AX-001";
+const NODE_NAME: &str = "AX-EXEC-TESTER-001";
+const STRATEGY_ID: &str = "EXEC_TESTER-001";
+const SYMBOL: &str = "XAG-PERP";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let account_id = AccountId::from("AX-001");
-    let node_name = "AX-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("AX");
-    let instrument_id = InstrumentId::from("XAU-PERP.AX");
+    let trader_id = TraderId::from(TRADER_ID);
+    let account_id = AccountId::from(ACCOUNT_ID);
+    let node_name = NODE_NAME.to_string();
+    let client_id = *AX_CLIENT_ID;
+    let instrument_id = InstrumentId::from(format!("{SYMBOL}.AX"));
 
     let data_config = AxDataClientConfig {
-        api_key: None,    // Will use 'AX_API_KEY' env var
-        api_secret: None, // Will use 'AX_API_SECRET' env var
-        is_sandbox: true, // Use sandbox environment for testing
+        environment: AX_ENVIRONMENT,
         ..Default::default()
     };
 
-    let exec_config = AxExecClientConfig {
-        trader_id,
+    let exec_config = AxExecutionClientConfig {
         account_id,
-        api_key: None,    // Will use 'AX_API_KEY' env var
-        api_secret: None, // Will use 'AX_API_SECRET' env var
-        is_sandbox: true, // Use sandbox environment for testing
+        environment: AX_ENVIRONMENT,
         ..Default::default()
     };
 
     let data_factory = AxDataClientFactory::new();
     let exec_factory = AxExecutionClientFactory::new();
+    let exec_engine_config = LiveExecutionEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
+        // Unbounded replay pulls the account's full order history into the cache
+        .with_reconciliation_lookback_mins(3 * 24 * 60)
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let order_qty = Quantity::from(1);
+    // Use minimum order size per instrument category
+    let order_qty = match SYMBOL {
+        s if s.starts_with("OCPI") => Quantity::from(100),
+        "EURUSD-PERP" | "GBPUSD-PERP" | "BRLUSD-PERP" => Quantity::from(100),
+        "MXNUSD-PERP" => Quantity::from(1000),
+        "JPYUSD-PERP" => Quantity::from(10000),
+        _ => Quantity::from(1),
+    };
 
-    let mut tester_config = ExecTesterConfig::new(
-        StrategyId::from("EXEC_TESTER-001"),
-        instrument_id,
-        client_id,
-        order_qty,
-    )
-    .with_open_position_on_start(order_qty.as_decimal())
-    .with_log_data(false)
-    .with_use_post_only(true)
-    .with_cancel_orders_on_stop(true)
-    .with_close_positions_on_stop(true);
-
-    tester_config.base.external_order_claims = Some(vec![instrument_id]);
-
-    // Use UUIDs for unique client order IDs
-    tester_config.base.use_uuid_client_order_ids = true;
+    let tester_config = ExecTesterConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from(STRATEGY_ID)),
+            external_order_instrument_ids: Some(vec![instrument_id]),
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .client_id(client_id)
+        .order_qty(order_qty)
+        .dry_run(DRY_RUN)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .open_position_time_in_force(TimeInForce::Ioc)
+        .tob_offset_ticks(1)
+        .use_post_only(true)
+        .subscribe_book(true)
+        .modify_orders_to_maintain_tob_offset(true)
+        .cancel_orders_on_stop(true)
+        .close_positions_on_stop(true)
+        .reduce_only_on_stop(false)
+        // .log_data(true)
+        .build()?;
 
     let tester = ExecTester::new(tester_config);
 

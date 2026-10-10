@@ -12,6 +12,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Domain model for instruments, orders, positions, and accounts.
+"""
 
 from __future__ import annotations
 
@@ -43,16 +46,8 @@ else:
     Dex = _Dex
     DexType = _DexType
 
-
-def _reassign_module_names() -> None:
-    for _name, _obj in list(globals().items()):
-        module = getattr(_obj, "__module__", "")
-        if module.startswith("nautilus_trader.core.nautilus_pyo3.model"):
-            try:
-                _obj.__module__ = __name__
-            except (AttributeError, TypeError):
-                continue
+from nautilus_trader._fixup import fixup_module_names
 
 
-_reassign_module_names()
-del _reassign_module_names
+fixup_module_names(globals(), __name__)
+del fixup_module_names

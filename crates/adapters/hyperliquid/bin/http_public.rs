@@ -15,19 +15,25 @@
 
 use std::env;
 
-use nautilus_hyperliquid::http::client::HyperliquidHttpClient;
+use nautilus_hyperliquid::{
+    common::enums::HyperliquidEnvironment, http::client::HyperliquidHttpClient,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     nautilus_common::logging::ensure_logging_initialized();
 
     let args: Vec<String> = env::args().collect();
-    let testnet = args.get(1).is_some_and(|s| s == "testnet");
+    let environment = if args.get(1).is_some_and(|s| s == "testnet") {
+        HyperliquidEnvironment::Testnet
+    } else {
+        HyperliquidEnvironment::Mainnet
+    };
 
     log::info!("Starting Hyperliquid HTTP public example");
-    log::info!("Testnet: {testnet}");
+    log::info!("Environment: {environment:?}");
 
-    let client = HyperliquidHttpClient::new(testnet, Some(60), None)?;
+    let client = HyperliquidHttpClient::new(environment, 60, None)?;
 
     // Fetch metadata
     let meta = client.info_meta().await?;
@@ -39,13 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .levels
             .first()
             .and_then(|bids| bids.first())
-            .map(|l| l.px.clone())
+            .map(|l| l.px)
             .unwrap_or_default();
         let best_ask = book
             .levels
             .get(1)
             .and_then(|asks| asks.first())
-            .map(|l| l.px.clone())
+            .map(|l| l.px)
             .unwrap_or_default();
 
         log::info!("BTC best bid: {best_bid}, best ask: {best_ask}");

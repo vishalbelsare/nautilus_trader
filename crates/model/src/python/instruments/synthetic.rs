@@ -19,7 +19,7 @@ use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 
 use crate::{
-    identifiers::{InstrumentId, Symbol},
+    identifiers::{InstrumentId, Symbol, Venue},
     instruments::SyntheticInstrument,
     types::Price,
 };
@@ -41,15 +41,15 @@ impl SyntheticInstrument {
         ts_event: u64,
         ts_init: u64,
     ) -> PyResult<Self> {
-        Self::new_checked(
-            symbol,
-            price_precision,
-            components,
-            formula,
-            ts_event.into(),
-            ts_init.into(),
-        )
-        .map_err(to_pyvalue_err)
+        Self::builder()
+            .symbol(symbol)
+            .price_precision(price_precision)
+            .components(components)
+            .formula(formula)
+            .ts_event(ts_event.into())
+            .ts_init(ts_init.into())
+            .build()
+            .map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -64,6 +64,18 @@ impl SyntheticInstrument {
     #[pyo3(name = "id")]
     fn py_id(&self) -> InstrumentId {
         self.id
+    }
+
+    #[getter]
+    #[pyo3(name = "symbol")]
+    fn py_symbol(&self) -> Symbol {
+        self.id.symbol
+    }
+
+    #[getter]
+    #[pyo3(name = "venue")]
+    fn py_venue(&self) -> Venue {
+        self.id.venue
     }
 
     #[getter]
@@ -102,11 +114,14 @@ impl SyntheticInstrument {
         self.ts_init.as_u64()
     }
 
+    /// Returns whether the given formula compiles against this instrument's components.
     #[pyo3(name = "is_valid_formula")]
     fn py_is_valid_formula(&self, formula: &str) -> bool {
         self.is_valid_formula(formula)
     }
 
+    /// Replaces the derivation formula, recompiling it against the existing components.
+    ///
     /// # Errors
     ///
     /// Returns an error if parsing the new formula fails.
@@ -117,11 +132,13 @@ impl SyntheticInstrument {
 
     /// Calculates the price of the synthetic instrument based on the given component input prices
     /// provided as an array of `f64` values.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the input length does not match or formula evaluation fails.
+    /// Returns an error if the input length does not match, any input is non-finite, or formula
+    /// evaluation fails.
     #[pyo3(name = "calculate")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_calculate(&mut self, inputs: Vec<f64>) -> PyResult<Price> {
         self.calculate(&inputs).map_err(to_pyvalue_err)
     }
@@ -130,8 +147,8 @@ impl SyntheticInstrument {
     ///
     /// # Errors
     ///
-    /// Returns an error if formula evaluation fails, a required component price is missing
-    /// from the input map, or if setting the value in the evaluation context fails.
+    /// Returns an error if formula evaluation fails or a required component price is missing from
+    /// the input map.
     #[pyo3(name = "calculate_from_map")]
     fn py_calculate_from_map(
         &mut self,

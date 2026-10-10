@@ -15,65 +15,99 @@
 
 //! Configuration structures for the Deribit adapter.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     common::{
         credential::credential_env_vars,
+        enums::DeribitEnvironment,
         urls::{get_http_base_url, get_ws_url},
     },
     http::models::DeribitProductType,
 };
 
 /// Configuration for the Deribit data client.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
 )]
 pub struct DeribitDataClientConfig {
     /// Optional API key for authenticated endpoints.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret for authenticated endpoints.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Product types to load (e.g., Future, Option, Spot).
+    #[builder(default = vec![DeribitProductType::Future])]
     pub product_types: Vec<DeribitProductType>,
+    /// The Deribit environment (mainnet or testnet).
+    #[builder(default)]
+    pub environment: DeribitEnvironment,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
-    /// When true the client will use Deribit testnet endpoints.
-    pub use_testnet: bool,
-    /// Optional HTTP timeout in seconds.
-    pub http_timeout_secs: Option<u64>,
-    /// Optional maximum retry attempts for requests.
-    pub max_retries: Option<u32>,
-    /// Optional initial retry delay in milliseconds.
-    pub retry_delay_initial_ms: Option<u64>,
-    /// Optional maximum retry delay in milliseconds.
-    pub retry_delay_max_ms: Option<u64>,
-    /// Optional heartbeat interval in seconds for WebSocket connection.
-    pub heartbeat_interval_secs: Option<u64>,
-    /// Optional interval for refreshing instruments (in minutes).
-    pub update_instruments_interval_mins: Option<u64>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
+    /// HTTP timeout in seconds.
+    #[builder(default = 60)]
+    pub http_timeout_secs: u64,
+    /// Maximum retry attempts for requests.
+    #[builder(default = 3)]
+    pub max_retries: u32,
+    /// Initial retry delay in milliseconds.
+    #[builder(default = 1_000)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum retry delay in milliseconds.
+    #[builder(default = 10_000)]
+    pub retry_delay_max_ms: u64,
+    /// Heartbeat interval in seconds for WebSocket connection.
+    #[builder(default = 30)]
+    pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
+    /// Interval for refreshing instruments (in minutes).
+    #[builder(default = 60)]
+    pub update_instruments_interval_mins: u64,
+    /// If `true`, subscribes for uncached instruments lazy-load via HTTP; otherwise fail fast.
+    #[builder(default = false)]
+    pub auto_load_missing_instruments: bool,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitDataClientConfig {
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    update_instruments_interval_mins: u64,
+    auto_load_missing_instruments: bool,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeribitDataClientConfig {
     fn default() -> Self {
-        Self {
-            api_key: None,
-            api_secret: None,
-            product_types: vec![DeribitProductType::Future],
-            base_url_http: None,
-            base_url_ws: None,
-            use_testnet: false,
-            http_timeout_secs: Some(60),
-            max_retries: Some(3),
-            retry_delay_initial_ms: Some(1_000),
-            retry_delay_max_ms: Some(10_000),
-            heartbeat_interval_secs: Some(30),
-            update_instruments_interval_mins: Some(60),
-        }
+        Self::builder().build()
     }
 }
 
@@ -87,7 +121,7 @@ impl DeribitDataClientConfig {
     /// Returns `true` when API credentials are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        let (key_env, secret_env) = credential_env_vars(self.use_testnet);
+        let (key_env, secret_env) = credential_env_vars(self.environment);
         let has_key = self.api_key.is_some() || std::env::var(key_env).is_ok();
         let has_secret = self.api_secret.is_some() || std::env::var(secret_env).is_ok();
         has_key && has_secret
@@ -98,85 +132,95 @@ impl DeribitDataClientConfig {
     pub fn http_base_url(&self) -> String {
         self.base_url_http
             .clone()
-            .unwrap_or_else(|| get_http_base_url(self.use_testnet).to_string())
+            .unwrap_or_else(|| get_http_base_url(self.environment).to_string())
     }
 
-    /// Returns the WebSocket URL, respecting the testnet flag and overrides.
+    /// Returns the WebSocket URL, respecting the environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| get_ws_url(self.use_testnet).to_string())
+            .unwrap_or_else(|| get_ws_url(self.environment).to_string())
     }
 }
 
 /// Configuration for the Deribit execution client.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.deribit", from_py_object)
 )]
-pub struct DeribitExecClientConfig {
-    /// The trader ID for this client.
-    pub trader_id: TraderId,
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
+)]
+pub struct DeribitExecutionClientConfig {
     /// The account ID for this client.
+    #[builder(default = AccountId::from("DERIBIT-001"))]
     pub account_id: AccountId,
     /// Optional API key for authenticated endpoints.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret for authenticated endpoints.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Product types to load (e.g., Future, Option, Spot).
+    #[builder(default = vec![DeribitProductType::Future])]
     pub product_types: Vec<DeribitProductType>,
+    /// The Deribit environment (mainnet or testnet).
+    #[builder(default)]
+    pub environment: DeribitEnvironment,
     /// Optional override for the HTTP base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
-    /// When true the client will use Deribit testnet endpoints.
-    pub use_testnet: bool,
-    /// Optional HTTP timeout in seconds.
-    pub http_timeout_secs: Option<u64>,
-    /// Optional maximum retry attempts for requests.
-    pub max_retries: Option<u32>,
-    /// Optional initial retry delay in milliseconds.
-    pub retry_delay_initial_ms: Option<u64>,
-    /// Optional maximum retry delay in milliseconds.
-    pub retry_delay_max_ms: Option<u64>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
+    /// HTTP timeout in seconds.
+    #[builder(default = 60)]
+    pub http_timeout_secs: u64,
+    /// Maximum retry attempts for requests.
+    #[builder(default = 3)]
+    pub max_retries: u32,
+    /// Initial retry delay in milliseconds.
+    #[builder(default = 1_000)]
+    pub retry_delay_initial_ms: u64,
+    /// Maximum retry delay in milliseconds.
+    #[builder(default = 10_000)]
+    pub retry_delay_max_ms: u64,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
-impl Default for DeribitExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeribitExecutionClientConfig {
+    account_id: AccountId,
+    product_types: Vec<DeribitProductType>,
+    environment: DeribitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    auth_timeout_secs: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for DeribitExecutionClientConfig {
     fn default() -> Self {
-        Self {
-            trader_id: TraderId::default(),
-            account_id: AccountId::from("DERIBIT-001"),
-            api_key: None,
-            api_secret: None,
-            product_types: vec![DeribitProductType::Future],
-            base_url_http: None,
-            base_url_ws: None,
-            use_testnet: false,
-            http_timeout_secs: Some(60),
-            max_retries: Some(3),
-            retry_delay_initial_ms: Some(1_000),
-            retry_delay_max_ms: Some(10_000),
-        }
+        Self::builder().build()
     }
 }
 
-impl DeribitExecClientConfig {
-    /// Creates a new configuration with default settings.
-    #[must_use]
-    pub fn new(trader_id: TraderId, account_id: AccountId) -> Self {
-        Self {
-            trader_id,
-            account_id,
-            ..Default::default()
-        }
-    }
-
+impl DeribitExecutionClientConfig {
     /// Returns `true` when API credentials are available (in config or env vars).
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        let (key_env, secret_env) = credential_env_vars(self.use_testnet);
+        let (key_env, secret_env) = credential_env_vars(self.environment);
         let has_key = self.api_key.is_some() || std::env::var(key_env).is_ok();
         let has_secret = self.api_secret.is_some() || std::env::var(secret_env).is_ok();
         has_key && has_secret
@@ -187,15 +231,15 @@ impl DeribitExecClientConfig {
     pub fn http_base_url(&self) -> String {
         self.base_url_http
             .clone()
-            .unwrap_or_else(|| get_http_base_url(self.use_testnet).to_string())
+            .unwrap_or_else(|| get_http_base_url(self.environment).to_string())
     }
 
-    /// Returns the WebSocket URL, respecting the testnet flag and overrides.
+    /// Returns the WebSocket URL, respecting the environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| get_ws_url(self.use_testnet).to_string())
+            .unwrap_or_else(|| get_ws_url(self.environment).to_string())
     }
 }
 
@@ -206,11 +250,42 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let data = DeribitDataClientConfig {
+            api_key: Some("data-api-key".into()),
+            api_secret: Some("data-api-secret".into()),
+            proxy_url: Some("http://user:data-proxy@localhost".into()),
+            ..Default::default()
+        };
+        let execution = DeribitExecutionClientConfig {
+            api_key: Some("exec-api-key".into()),
+            api_secret: Some("exec-api-secret".into()),
+            proxy_url: Some("http://user:exec-proxy@localhost".into()),
+            ..Default::default()
+        };
+
+        let formatted = format!("{data:?} {execution:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 6);
+
+        for secret in [
+            "data-api-key",
+            "data-api-secret",
+            "data-proxy",
+            "exec-api-key",
+            "exec-api-secret",
+            "exec-proxy",
+        ] {
+            assert!(!formatted.contains(secret));
+        }
+    }
+
+    #[rstest]
     fn test_default_config() {
         let config = DeribitDataClientConfig::default();
-        assert!(!config.use_testnet);
+        assert_eq!(config.environment, DeribitEnvironment::Mainnet);
         assert_eq!(config.product_types.len(), 1);
-        assert_eq!(config.http_timeout_secs, Some(60));
+        assert_eq!(config.http_timeout_secs, 60);
     }
 
     #[rstest]
@@ -222,7 +297,7 @@ mod tests {
     #[rstest]
     fn test_http_base_url_testnet() {
         let config = DeribitDataClientConfig {
-            use_testnet: true,
+            environment: DeribitEnvironment::Testnet,
             ..Default::default()
         };
         assert_eq!(config.http_base_url(), "https://test.deribit.com");
@@ -237,7 +312,7 @@ mod tests {
     #[rstest]
     fn test_ws_url_testnet() {
         let config = DeribitDataClientConfig {
-            use_testnet: true,
+            environment: DeribitEnvironment::Testnet,
             ..Default::default()
         };
         assert_eq!(config.ws_url(), "wss://test.deribit.com/ws/api/v2");
@@ -246,10 +321,43 @@ mod tests {
     #[rstest]
     fn test_has_api_credentials_in_config() {
         let config = DeribitDataClientConfig {
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
             ..Default::default()
         };
         assert!(config.has_api_credentials());
+    }
+
+    #[rstest]
+    fn test_data_config_toml_minimal() {
+        let config: DeribitDataClientConfig = toml::from_str(
+            r#"
+environment = "testnet"
+product_types = ["future", "option"]
+heartbeat_interval_secs = 15
+auto_load_missing_instruments = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.environment, DeribitEnvironment::Testnet);
+        assert_eq!(
+            config.product_types,
+            vec![DeribitProductType::Future, DeribitProductType::Option]
+        );
+        assert_eq!(config.heartbeat_interval_secs, 15);
+        assert!(config.auto_load_missing_instruments);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_empty_uses_defaults() {
+        let config: DeribitExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = DeribitExecutionClientConfig::default();
+        assert_eq!(config.account_id, expected.account_id);
+        assert_eq!(config.environment, expected.environment);
+        assert_eq!(config.product_types, expected.product_types);
+        assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
+        assert_eq!(config.max_retries, expected.max_retries);
+        assert_eq!(config.transport_backend, expected.transport_backend);
     }
 }

@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use super::transform_returns;
@@ -30,6 +31,14 @@ impl MaxDrawdown {
     /// a specified time period.
     ///
     /// Formula: Max((Peak - Trough) / Peak) for all peak-trough sequences
+    ///
+    /// The equity curve compounds returns from a starting value of `1.0`, and the
+    /// result is reported as a negative fraction (e.g. `-0.20` is a 20% drawdown).
+    ///
+    /// # References
+    ///
+    /// - Bacon, C. R. (2008). *Practical Portfolio Performance Measurement and Attribution*
+    ///   (2nd ed.). Wiley.
     #[new]
     fn py_new() -> Self {
         Self::new()
@@ -42,9 +51,19 @@ impl MaxDrawdown {
     }
 
     #[pyo3(name = "calculate_from_returns")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_calculate_from_returns(&self, raw_returns: BTreeMap<u64, f64>) -> Option<f64> {
         self.calculate_from_returns(&transform_returns(&raw_returns))
+    }
+
+    #[pyo3(name = "calculate_from_realized_pnls")]
+    fn py_calculate_from_realized_pnls(&self, _realized_pnls: Vec<f64>) -> Option<f64> {
+        None
+    }
+
+    #[pyo3(name = "calculate_from_positions")]
+    fn py_calculate_from_positions(&self, _positions: Vec<Position>) -> Option<f64> {
+        None
     }
 
     fn __repr__(&self) -> String {

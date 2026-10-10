@@ -15,17 +15,19 @@
 
 //! Data transfer objects for deserializing Bybit HTTP API payloads.
 
+use nautilus_core::string::secret::SecretString;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use crate::common::{
     enums::{
-        BybitAccountType, BybitCancelType, BybitContractType, BybitExecType, BybitInnovationFlag,
-        BybitInstrumentStatus, BybitMarginTrading, BybitOptionType, BybitOrderSide,
-        BybitOrderStatus, BybitOrderType, BybitPositionIdx, BybitPositionSide, BybitProductType,
-        BybitStopOrderType, BybitTimeInForce, BybitTpSlMode, BybitTriggerDirection,
-        BybitTriggerType,
+        BybitAccountType, BybitApiKeyType, BybitCancelType, BybitContractType, BybitCreateType,
+        BybitExecType, BybitInnovationFlag, BybitInstrumentStatus, BybitMarginMode,
+        BybitMarginTrading, BybitOptionType, BybitOrderSide, BybitOrderStatus, BybitOrderType,
+        BybitPositionIdx, BybitPositionSide, BybitPositionStatus, BybitProductType,
+        BybitRepayStatus, BybitSmpType, BybitStopOrderType, BybitSymbolType, BybitTimeInForce,
+        BybitTpSlMode, BybitTriggerDirection, BybitTriggerType, BybitUnifiedMarginStatus,
     },
     models::{
         BybitCursorList, BybitCursorListResponse, BybitListResponse, BybitResponse, LeverageFilter,
@@ -33,7 +35,8 @@ use crate::common::{
         SpotPriceFilter,
     },
     parse::{
-        deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero, deserialize_string_to_u8,
+        bool_or_int, deserialize_decimal_or_zero, deserialize_i32_or_string,
+        deserialize_optional_decimal_or_zero, deserialize_string_to_u8, masked_secret, on_off_bool,
     },
 };
 
@@ -41,7 +44,11 @@ use crate::common::{
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitOrderCursorList {
     /// Collection of orders returned by the endpoint.
@@ -92,7 +99,11 @@ impl BybitOrderCursorList {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BybitServerTime {
@@ -238,7 +249,11 @@ pub type BybitTickersOptionResponse = BybitListResponse<BybitTickerOption>;
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitTickerData {
     pub symbol: Ustr,
@@ -590,6 +605,12 @@ pub struct BybitInstrumentSpot {
     pub margin_trading: BybitMarginTrading,
     pub lot_size_filter: SpotLotSizeFilter,
     pub price_filter: SpotPriceFilter,
+    #[serde(default)]
+    pub symbol_id: Option<i64>,
+    #[serde(default)]
+    pub symbol_type: Option<BybitSymbolType>,
+    #[serde(default)]
+    pub xstock_multiplier: Option<String>,
 }
 
 /// Instrument definition for linear contracts.
@@ -614,6 +635,10 @@ pub struct BybitInstrumentLinear {
     pub unified_margin_trade: bool,
     pub funding_interval: i64,
     pub settle_coin: Ustr,
+    #[serde(default)]
+    pub symbol_id: Option<i64>,
+    #[serde(default)]
+    pub symbol_type: Option<BybitSymbolType>,
 }
 
 /// Instrument definition for inverse contracts.
@@ -638,6 +663,10 @@ pub struct BybitInstrumentInverse {
     pub unified_margin_trade: bool,
     pub funding_interval: i64,
     pub settle_coin: Ustr,
+    #[serde(default)]
+    pub symbol_id: Option<i64>,
+    #[serde(default)]
+    pub symbol_type: Option<BybitSymbolType>,
 }
 
 /// Instrument definition for option contracts.
@@ -658,6 +687,8 @@ pub struct BybitInstrumentOption {
     pub delivery_fee_rate: String,
     pub price_filter: LinearPriceFilter,
     pub lot_size_filter: OptionLotSizeFilter,
+    #[serde(default)]
+    pub symbol_id: Option<i64>,
 }
 
 /// Response alias for instrument info requests that return spot instruments.
@@ -689,7 +720,11 @@ pub type BybitInstrumentOptionResponse = BybitCursorListResponse<BybitInstrument
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitFeeRate {
     pub symbol: Ustr,
@@ -799,6 +834,35 @@ pub struct BybitWalletBalance {
 /// - <https://bybit-exchange.github.io/docs/v5/account/wallet-balance>
 pub type BybitWalletBalanceResponse = BybitListResponse<BybitWalletBalance>;
 
+/// Account-level configuration returned by `GET /v5/account/info`.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/account/account-info>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitAccountInfo {
+    pub unified_margin_status: BybitUnifiedMarginStatus,
+    pub margin_mode: BybitMarginMode,
+    pub is_master_trader: bool,
+    #[serde(with = "on_off_bool")]
+    pub spot_hedging_status: bool,
+    pub updated_time: String,
+    // `dcp_status`, `time_window`, and `smp_group` are absent from responses
+    // for accounts that predate the disconnection-protection feature.
+    #[serde(default, with = "on_off_bool")]
+    pub dcp_status: bool,
+    #[serde(default, deserialize_with = "deserialize_i32_or_string")]
+    pub time_window: i32,
+    #[serde(default, deserialize_with = "deserialize_i32_or_string")]
+    pub smp_group: i32,
+}
+
+/// Response alias for account info requests.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/account/account-info>
+pub type BybitAccountInfoResponse = BybitResponse<BybitAccountInfo>;
+
 /// Order representation as returned by order-related endpoints.
 ///
 /// # References
@@ -806,7 +870,11 @@ pub type BybitWalletBalanceResponse = BybitListResponse<BybitWalletBalance>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BybitOrder {
@@ -818,6 +886,7 @@ pub struct BybitOrder {
     pub qty: String,
     pub side: BybitOrderSide,
     pub is_leverage: String,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub position_idx: i32,
     pub order_status: BybitOrderStatus,
     pub cancel_type: BybitCancelType,
@@ -842,7 +911,8 @@ pub struct BybitOrder {
     pub last_price_on_created: String,
     pub reduce_only: bool,
     pub close_on_trigger: bool,
-    pub smp_type: Ustr,
+    pub smp_type: BybitSmpType,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub smp_group: i32,
     pub smp_order_id: Ustr,
     pub tpsl_mode: Option<BybitTpSlMode>,
@@ -1050,8 +1120,15 @@ impl BybitOrder {
 
     #[getter]
     #[must_use]
-    pub fn smp_type(&self) -> &str {
-        self.smp_type.as_str()
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "serialization of a simple enum cannot fail"
+    )]
+    pub fn smp_type(&self) -> String {
+        serde_json::to_string(&self.smp_type)
+            .expect("Failed to serialize BybitSmpType")
+            .trim_matches('"')
+            .to_string()
     }
 
     #[getter]
@@ -1162,7 +1239,7 @@ pub struct BybitExecution {
     pub order_price: String,
     pub order_qty: String,
     pub leaves_qty: String,
-    pub create_type: Option<String>,
+    pub create_type: Option<BybitCreateType>,
     pub order_type: BybitOrderType,
     pub stop_order_type: Option<BybitStopOrderType>,
     pub exec_fee: String,
@@ -1199,6 +1276,7 @@ pub type BybitTradeHistoryResponse = BybitCursorListResponse<BybitExecution>;
 #[serde(rename_all = "camelCase")]
 pub struct BybitPosition {
     pub position_idx: BybitPositionIdx,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub risk_id: i32,
     pub risk_limit_value: String,
     pub symbol: Ustr,
@@ -1206,9 +1284,12 @@ pub struct BybitPosition {
     pub size: String,
     pub avg_price: String,
     pub position_value: String,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub trade_mode: i32,
-    pub position_status: String,
+    pub position_status: BybitPositionStatus,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub auto_add_margin: i32,
+    #[serde(deserialize_with = "deserialize_i32_or_string")]
     pub adl_rank_indicator: i32,
     pub leverage: String,
     pub position_balance: String,
@@ -1219,19 +1300,29 @@ pub struct BybitPosition {
     pub position_mm: String,
     #[serde(rename = "positionIM")]
     pub position_im: String,
-    pub tpsl_mode: String,
+    pub tpsl_mode: BybitTpSlMode,
     pub take_profit: String,
     pub stop_loss: String,
     pub trailing_stop: String,
     pub unrealised_pnl: String,
     pub cur_realised_pnl: String,
     pub cum_realised_pnl: String,
+    #[serde(default = "default_position_seq")]
     pub seq: i64,
+    #[serde(default)]
     pub is_reduce_only: bool,
+    #[serde(default)]
     pub mmr_sys_updated_time: String,
+    #[serde(default)]
     pub leverage_sys_updated_time: String,
     pub created_time: String,
     pub updated_time: String,
+    #[serde(default)]
+    pub open_time: i64,
+}
+
+const fn default_position_seq() -> i64 {
+    -1
 }
 
 /// Response alias for position list requests.
@@ -1302,7 +1393,7 @@ pub type BybitSetTradingStopResponse = BybitResponse<BybitSetTradingStopResult>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitBorrowResult {
-    pub coin: String,
+    pub coin: Ustr,
     pub amount: String,
 }
 
@@ -1317,7 +1408,7 @@ pub type BybitBorrowResponse = BybitResponse<BybitBorrowResult>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BybitNoConvertRepayResult {
-    pub result_status: String,
+    pub result_status: BybitRepayStatus,
 }
 
 /// Response alias for no-convert repay requests.
@@ -1327,11 +1418,29 @@ pub struct BybitNoConvertRepayResult {
 /// - <https://bybit-exchange.github.io/docs/v5/account/no-convert-repay>
 pub type BybitNoConvertRepayResponse = BybitResponse<BybitNoConvertRepayResult>;
 
+/// Result from a manual repay (with conversion) operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitRepayResult {
+    pub result_status: BybitRepayStatus,
+}
+
+/// Response alias for manual repay requests.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/account/repay>
+pub type BybitRepayResponse = BybitResponse<BybitRepayResult>;
+
 /// API key permissions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 #[serde(rename_all = "PascalCase")]
 pub struct BybitApiKeyPermissions {
@@ -1351,25 +1460,52 @@ pub struct BybitApiKeyPermissions {
     pub copy_trading: Vec<String>,
     #[serde(default)]
     pub block_trade: Vec<String>,
-    #[serde(default)]
+    // Bybit ships this key uppercase (`"NFT"`); the struct-level PascalCase
+    // rule would otherwise serialize it as `"Nft"` and silently drop values.
+    #[serde(rename = "NFT", default)]
     pub nft: Vec<String>,
     #[serde(default)]
     pub affiliate: Vec<String>,
+    // Newer permission buckets. Master-account responses populate them, sub-key
+    // responses typically omit or return empty arrays - both cases deserialize
+    // to an empty `Vec` via `serde(default)`.
+    #[serde(default)]
+    pub earn: Vec<String>,
+    // Bybit uses `"FiatP2P"` - PascalCase rename would emit `"FiatP2p"`.
+    #[serde(rename = "FiatP2P", default)]
+    pub fiat_p2p: Vec<String>,
+    #[serde(default)]
+    pub fiat_bybit_pay: Vec<String>,
+    #[serde(default)]
+    pub fiat_bit_pay: Vec<String>,
+    #[serde(default)]
+    pub fiat_global_pay: Vec<String>,
+    #[serde(default)]
+    pub fiat_convert_broker: Vec<String>,
+    #[serde(default)]
+    pub bit_card: Vec<String>,
+    // Bybit uses `"ByXPost"` - PascalCase rename would emit `"ByxPost"`.
+    #[serde(rename = "ByXPost", default)]
+    pub byx_post: Vec<String>,
 }
 
 /// Account details from API key info.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BybitAccountDetails {
     pub id: String,
     pub note: String,
-    pub api_key: String,
+    pub api_key: SecretString,
     pub read_only: u8,
-    pub secret: String,
+    pub secret: SecretString,
     #[serde(rename = "type")]
     pub key_type: u8,
     pub permissions: BybitApiKeyPermissions,
@@ -1389,6 +1525,8 @@ pub struct BybitAccountDetails {
     pub uta: u8,
     pub kyc_level: String,
     pub kyc_region: String,
+    #[serde(default)]
+    pub unified: Option<i32>,
     #[serde(default)]
     pub deadline_day: i64,
     #[serde(default)]
@@ -1414,7 +1552,7 @@ impl BybitAccountDetails {
     #[getter]
     #[must_use]
     pub fn api_key(&self) -> &str {
-        &self.api_key
+        self.api_key.expose_secret()
     }
 
     #[getter]
@@ -1521,6 +1659,209 @@ impl BybitAccountDetails {
 /// - <https://bybit-exchange.github.io/docs/v5/user/apikey-info>
 pub type BybitAccountDetailsResponse = BybitResponse<BybitAccountDetails>;
 
+/// Basic information about a sub-account member.
+///
+/// `member_type`, `status`, and `account_mode` use raw integer codes whose valid
+/// ranges differ per endpoint; values are kept as-is rather than mapped to Rust
+/// enums, consistent with other venue-raw fields in this module.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/subuid-list>
+/// - <https://bybit-exchange.github.io/docs/v5/user/page-subuid>
+/// - <https://bybit-exchange.github.io/docs/v5/user/fund-subuid-list>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitSubMember {
+    pub uid: String,
+    pub username: String,
+    pub member_type: i32,
+    pub status: i32,
+    pub account_mode: i32,
+    #[serde(default)]
+    pub remark: String,
+}
+
+/// Result payload for `GET /v5/user/query-sub-members`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitSubMembersResult {
+    #[serde(default)]
+    pub sub_members: Vec<BybitSubMember>,
+}
+
+/// Response alias for the non-paginated sub-UID list.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/subuid-list>
+pub type BybitSubMembersResponse = BybitResponse<BybitSubMembersResult>;
+
+/// Result payload for cursor-paginated sub-account listings.
+///
+/// The inner array is named `subMembers` and the cursor field is `nextCursor`
+/// (with `"0"` as the end-of-pages sentinel), so the standard
+/// `BybitCursorListResponse<T>` (which expects `list` / `nextPageCursor`)
+/// cannot be reused here. Callers treat `"0"` or an empty string as the
+/// termination sentinel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitSubMembersPagedResult {
+    #[serde(default)]
+    pub sub_members: Vec<BybitSubMember>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+impl BybitSubMembersPagedResult {
+    /// Returns the cursor to use for the next page, or `None` when the final
+    /// page has been fetched.
+    ///
+    /// Bybit signals end-of-pages either by omitting the cursor or returning
+    /// `"0"`/`""`; both cases collapse to `None` here so callers can treat any
+    /// non-`None` return value as a live cursor.
+    #[must_use]
+    pub fn continuation_cursor(&self) -> Option<&str> {
+        match self.next_cursor.as_deref() {
+            None | Some("" | "0") => None,
+            Some(cursor) => Some(cursor),
+        }
+    }
+
+    /// Returns `true` when the result has more pages to fetch.
+    #[must_use]
+    pub fn has_more_pages(&self) -> bool {
+        self.continuation_cursor().is_some()
+    }
+}
+
+/// Response alias for paginated sub-UID list (`/v5/user/submembers`).
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/page-subuid>
+pub type BybitSubMembersPagedResponse = BybitResponse<BybitSubMembersPagedResult>;
+
+/// Response alias for the escrow (fund-custodial) sub-account list
+/// (`/v5/user/escrow_sub_members`); shares the paginated sub-member shape.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/fund-subuid-list>
+pub type BybitEscrowSubMembersResponse = BybitResponse<BybitSubMembersPagedResult>;
+
+/// Information about a single sub-account API key.
+///
+/// Deliberately not shared with [`BybitAccountDetails`]: master-level fields
+/// such as `is_master`, `parent_uid`, `uta`, and the KYC block are absent.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/list-sub-apikeys>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitSubApiKeyInfo {
+    pub id: String,
+    #[serde(default)]
+    pub ips: Vec<String>,
+    pub api_key: SecretString,
+    #[serde(default)]
+    pub note: String,
+    pub status: i32,
+    #[serde(default)]
+    pub expired_at: Option<String>,
+    pub created_at: String,
+    #[serde(rename = "type")]
+    pub key_type: BybitApiKeyType,
+    #[serde(with = "masked_secret")]
+    pub secret: Option<SecretString>,
+    #[serde(with = "bool_or_int")]
+    pub read_only: bool,
+    #[serde(default)]
+    pub deadline_day: Option<i64>,
+    #[serde(default)]
+    pub flag: String,
+    pub permissions: BybitApiKeyPermissions,
+}
+
+/// Result payload for `GET /v5/user/sub-apikeys`.
+///
+/// The inner array field is named `result` (nested inside the outer
+/// `retCode/retMsg/result` envelope) rather than the usual `list`, so the
+/// standard `BybitCursorListResponse<T>` cannot be reused here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitSubApiKeysResult {
+    #[serde(rename = "result", default)]
+    pub keys: Vec<BybitSubApiKeyInfo>,
+    #[serde(default)]
+    pub next_page_cursor: Option<String>,
+}
+
+impl BybitSubApiKeysResult {
+    /// Returns the cursor to use for the next page, or `None` when the final
+    /// page has been fetched.
+    ///
+    /// The end-of-pages sentinel on this endpoint is an empty string rather
+    /// than `"0"`; both that and a missing cursor collapse to `None`.
+    #[must_use]
+    pub fn continuation_cursor(&self) -> Option<&str> {
+        match self.next_page_cursor.as_deref() {
+            None | Some("") => None,
+            Some(cursor) => Some(cursor),
+        }
+    }
+
+    /// Returns `true` when the result has more pages to fetch.
+    #[must_use]
+    pub fn has_more_pages(&self) -> bool {
+        self.continuation_cursor().is_some()
+    }
+}
+
+/// Response alias for sub-account API keys list.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/list-sub-apikeys>
+pub type BybitSubApiKeysResponse = BybitResponse<BybitSubApiKeysResult>;
+
+/// Shared result payload for API-key update endpoints (sub or master).
+///
+/// `/v5/user/update-sub-api` and `/v5/user/update-api` return the same field
+/// set; only the number of permission buckets populated inside `permissions`
+/// differs. Because [`BybitApiKeyPermissions`] covers the superset of both,
+/// the two endpoints reuse a single DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitApiKeyUpdateResult {
+    pub id: String,
+    #[serde(default)]
+    pub note: String,
+    pub api_key: SecretString,
+    #[serde(with = "bool_or_int")]
+    pub read_only: bool,
+    #[serde(with = "masked_secret")]
+    pub secret: Option<SecretString>,
+    pub permissions: BybitApiKeyPermissions,
+    #[serde(default)]
+    pub ips: Vec<String>,
+}
+
+/// Response alias for `POST /v5/user/update-sub-api`.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/modify-sub-apikey>
+pub type BybitUpdateSubApiResponse = BybitResponse<BybitApiKeyUpdateResult>;
+
+/// Response alias for `POST /v5/user/update-api`.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/user/modify-master-apikey>
+pub type BybitUpdateMasterApiResponse = BybitResponse<BybitApiKeyUpdateResult>;
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::UnixNanos;
@@ -1554,6 +1895,100 @@ mod tests {
     }
 
     #[rstest]
+    fn deserialize_spot_instrument_with_xstock_fields() {
+        let json = load_test_json("http_get_instruments_spot_xstocks.json");
+        let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+
+        assert_eq!(instrument.symbol_id, Some(42));
+        assert_eq!(instrument.symbol_type, Some(BybitSymbolType::Xstocks));
+        assert_eq!(instrument.xstock_multiplier.as_deref(), Some("0.1"));
+    }
+
+    #[rstest]
+    fn deserialize_linear_instrument_with_symbol_type_and_id() {
+        let json = load_test_json("http_get_instruments_linear_symbol_type.json");
+        let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+
+        assert_eq!(instrument.symbol_id, Some(7));
+        assert_eq!(instrument.symbol_type, Some(BybitSymbolType::Stock));
+    }
+
+    #[derive(Deserialize)]
+    struct SymbolTypeWrap {
+        #[serde(rename = "symbolType")]
+        t: BybitSymbolType,
+    }
+
+    #[rstest]
+    fn deserialize_symbol_type_falls_back_to_other_for_unknown() {
+        let json = r#"{"symbolType": "newthing"}"#;
+        let parsed: SymbolTypeWrap = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.t, BybitSymbolType::Other);
+    }
+
+    #[rstest]
+    fn deserialize_account_info_response() {
+        let json = load_test_json("http_get_account_info.json");
+        let response: BybitAccountInfoResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(response.result.margin_mode, BybitMarginMode::RegularMargin);
+        assert_eq!(
+            response.result.unified_margin_status,
+            BybitUnifiedMarginStatus::UnifiedTradingAccount10Pro
+        );
+        assert!(!response.result.is_master_trader);
+        assert!(!response.result.spot_hedging_status);
+        assert!(!response.result.dcp_status);
+        assert_eq!(response.result.time_window, 10);
+        assert_eq!(response.result.smp_group, 0);
+    }
+
+    #[rstest]
+    fn deserialize_account_info_without_deprecated_fields() {
+        let json = r#"{
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "marginMode": "PORTFOLIO_MARGIN",
+                "updatedTime": "1697078946000",
+                "unifiedMarginStatus": 5,
+                "isMasterTrader": true,
+                "spotHedgingStatus": "ON"
+            }
+        }"#;
+        let response: BybitAccountInfoResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            response.result.margin_mode,
+            BybitMarginMode::PortfolioMargin
+        );
+        assert_eq!(
+            response.result.unified_margin_status,
+            BybitUnifiedMarginStatus::UnifiedTradingAccount20
+        );
+        assert!(response.result.is_master_trader);
+        assert!(response.result.spot_hedging_status);
+        assert!(!response.result.dcp_status);
+        assert_eq!(response.result.time_window, 0);
+        assert_eq!(response.result.smp_group, 0);
+    }
+
+    #[rstest]
+    fn deserialize_account_info_accepts_string_time_window_and_smp_group() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_account_info.json")).unwrap();
+        json["result"]["timeWindow"] = serde_json::Value::String("10".to_string());
+        json["result"]["smpGroup"] = serde_json::Value::String("1234".to_string());
+
+        let response: BybitAccountInfoResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.result.time_window, 10);
+        assert_eq!(response.result.smp_group, 1234);
+    }
+
+    #[rstest]
     fn deserialize_order_response_maps_enums() {
         let json = load_test_json("http_get_orders_history.json");
         let response: BybitOrderHistoryResponse = serde_json::from_str(&json).unwrap();
@@ -1564,6 +1999,52 @@ mod tests {
         assert_eq!(order.sl_trigger_by, BybitTriggerType::LastPrice);
         assert_eq!(order.tpsl_mode, Some(BybitTpSlMode::Full));
         assert_eq!(order.order_type, BybitOrderType::Limit);
+        assert_eq!(order.smp_type, BybitSmpType::None);
+        assert_eq!(order.smp_group, 0);
+    }
+
+    #[rstest]
+    fn deserialize_order_response_accepts_string_smp_group() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        json["result"]["list"][0]["smpGroup"] = serde_json::Value::String("123456789".to_string());
+
+        let response: BybitOrderHistoryResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.result.list[0].smp_group, 123_456_789);
+    }
+
+    #[rstest]
+    fn deserialize_order_response_accepts_string_position_idx() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        json["result"]["list"][0]["positionIdx"] = serde_json::Value::String("1".to_string());
+
+        let response: BybitOrderHistoryResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(response.result.list[0].position_idx, 1);
+    }
+
+    #[rstest]
+    #[case::malformed(
+        "invalid",
+        "expected i32, received \"invalid\": invalid digit found in string"
+    )]
+    #[case::out_of_range(
+        "2147483648",
+        "expected i32, received \"2147483648\": number too large to fit in target type"
+    )]
+    fn deserialize_order_response_rejects_invalid_string_smp_group(
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        json["result"]["list"][0]["smpGroup"] = serde_json::Value::String(value.to_string());
+
+        let result: Result<BybitOrderHistoryResponse, _> = serde_json::from_value(json);
+
+        assert_eq!(result.unwrap_err().to_string(), expected);
     }
 
     #[rstest]
@@ -1632,7 +2113,7 @@ mod tests {
 
         // Check BTC coin
         let btc = &wallet.coin[0];
-        assert_eq!(btc.coin.as_str(), "BTC");
+        assert_eq!(btc.coin, "BTC");
         assert_eq!(btc.available_to_borrow, "3");
         assert_eq!(btc.total_order_im, Some("0".to_string()));
         assert_eq!(btc.total_position_mm, Some("0".to_string()));
@@ -1640,7 +2121,7 @@ mod tests {
 
         // Check USDT coin (without optional IM/MM fields)
         let usdt = &wallet.coin[1];
-        assert_eq!(usdt.coin.as_str(), "USDT");
+        assert_eq!(usdt.coin, "USDT");
         assert_eq!(usdt.wallet_balance, dec!(1000.50));
         assert_eq!(usdt.total_order_im, None);
         assert_eq!(usdt.total_position_mm, None);
@@ -1658,7 +2139,7 @@ mod tests {
         let wallet = &response.result.list[0];
         let usdt = &wallet.coin[0];
 
-        assert_eq!(usdt.coin.as_str(), "USDT");
+        assert_eq!(usdt.coin, "USDT");
         assert_eq!(usdt.wallet_balance, dec!(1200.00));
         assert_eq!(usdt.spot_borrow, dec!(200.00));
         assert_eq!(usdt.borrow_amount, "200.00");
@@ -1684,7 +2165,7 @@ mod tests {
         let wallet = &response.result.list[0];
         let eth = &wallet.coin[0];
 
-        assert_eq!(eth.coin.as_str(), "ETH");
+        assert_eq!(eth.coin, "ETH");
         assert_eq!(eth.wallet_balance, dec!(0));
         assert_eq!(eth.spot_borrow, dec!(0.06142));
         assert_eq!(eth.borrow_amount, "0.06142");
@@ -1699,7 +2180,7 @@ mod tests {
         let eth_balance = account_state
             .balances
             .iter()
-            .find(|b| b.currency.code.as_str() == "ETH")
+            .find(|b| b.currency.code == "ETH")
             .expect("ETH balance not found");
 
         // Negative balance represents SHORT position (borrowed ETH)
@@ -1743,6 +2224,286 @@ mod tests {
 
         assert_eq!(response.ret_code, 0);
         assert_eq!(response.ret_msg, "OK");
-        assert_eq!(response.result.result_status, "SU");
+        assert_eq!(response.result.result_status, BybitRepayStatus::Success);
+    }
+
+    #[rstest]
+    fn deserialize_repay_response() {
+        let json = r#"{
+            "retCode": 0,
+            "retMsg": "success",
+            "result": {
+                "resultStatus": "P"
+            },
+            "retExtInfo": {},
+            "time": 1756295680801
+        }"#;
+
+        let response: BybitRepayResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.ret_code, 0);
+        assert_eq!(response.ret_msg, "success");
+        assert_eq!(response.result.result_status, BybitRepayStatus::Processing);
+    }
+
+    #[rstest]
+    fn deserialize_position_without_conditional_fields() {
+        // Bybit v5 docs mark `isReduceOnly`, `mmrSysUpdatedTime`, `leverageSysUpdatedTime`
+        // and `seq` as conditional fields that may be absent, e.g. once a position has been
+        // closed through the UI (see issue #3836).
+        let json = r#"{
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "list": [{
+                    "positionIdx": 0,
+                    "riskId": 1,
+                    "riskLimitValue": "150",
+                    "symbol": "LTCUSDT",
+                    "side": "",
+                    "size": "0",
+                    "avgPrice": "0",
+                    "positionValue": "0",
+                    "tradeMode": 0,
+                    "positionStatus": "Normal",
+                    "autoAddMargin": 0,
+                    "adlRankIndicator": 0,
+                    "leverage": "10",
+                    "positionBalance": "0",
+                    "markPrice": "70.00",
+                    "liqPrice": "",
+                    "bustPrice": "",
+                    "positionMM": "0",
+                    "positionIM": "0",
+                    "tpslMode": "Full",
+                    "takeProfit": "0",
+                    "stopLoss": "0",
+                    "trailingStop": "0",
+                    "unrealisedPnl": "0",
+                    "curRealisedPnl": "0",
+                    "cumRealisedPnl": "0",
+                    "createdTime": "1676538056258",
+                    "updatedTime": "1697673600012"
+                }],
+                "nextPageCursor": "",
+                "category": "linear"
+            },
+            "retExtInfo": {},
+            "time": 1697673900000
+        }"#;
+
+        let response: BybitPositionListResponse = serde_json::from_str(json)
+            .expect("Failed to parse position list with missing conditional fields");
+
+        let position = &response.result.list[0];
+        assert!(!position.is_reduce_only);
+        assert_eq!(position.seq, -1);
+        assert_eq!(position.mmr_sys_updated_time, "");
+        assert_eq!(position.leverage_sys_updated_time, "");
+        assert_eq!(position.open_time, 0);
+    }
+
+    #[rstest]
+    #[case(0_i64)]
+    #[case(1_700_000_000_123_i64)]
+    fn deserialize_position_with_open_time_integer(#[case] expected: i64) {
+        // Bybit position info added `openTime` (integer, ms; default 0) effective 2026-04-21.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_positions_with_open_time.json"))
+                .unwrap();
+        value["result"]["list"][0]["openTime"] = serde_json::json!(expected);
+
+        let response: BybitPositionListResponse = serde_json::from_value(value)
+            .expect("Failed to parse position list with integer openTime");
+
+        assert_eq!(response.result.list[0].open_time, expected);
+    }
+
+    #[rstest]
+    fn deserialize_position_response_accepts_string_integer_fields() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_get_positions.json")).unwrap();
+        let position = &mut json["result"]["list"][0];
+        position["riskId"] = serde_json::Value::String("1234".to_string());
+        position["tradeMode"] = serde_json::Value::String("1".to_string());
+        position["autoAddMargin"] = serde_json::Value::String("2".to_string());
+        position["adlRankIndicator"] = serde_json::Value::String("35".to_string());
+
+        let response: BybitPositionListResponse = serde_json::from_value(json).unwrap();
+
+        let position = &response.result.list[0];
+        assert_eq!(position.risk_id, 1234);
+        assert_eq!(position.trade_mode, 1);
+        assert_eq!(position.auto_add_margin, 2);
+        assert_eq!(position.adl_rank_indicator, 35);
+    }
+
+    #[rstest]
+    fn deserialize_inverse_instrument_with_symbol_type_and_id() {
+        let json = load_test_json("http_get_instruments_inverse_symbol_type.json");
+        let response: BybitInstrumentInverseResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+
+        assert_eq!(instrument.symbol_id, Some(11));
+        assert_eq!(instrument.symbol_type, Some(BybitSymbolType::Commodity));
+    }
+
+    #[rstest]
+    fn deserialize_option_instrument_with_symbol_id() {
+        let json = load_test_json("http_get_instruments_option_symbol_id.json");
+        let response: BybitInstrumentOptionResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+
+        assert_eq!(instrument.symbol_id, Some(99));
+    }
+
+    #[rstest]
+    fn deserialize_sub_members_response() {
+        let json = load_test_json("http_get_user_sub_members.json");
+        let response: BybitSubMembersResponse =
+            serde_json::from_str(&json).expect("parse sub members");
+        assert_eq!(response.ret_code, 0);
+        assert_eq!(response.result.sub_members.len(), 2);
+        let first = &response.result.sub_members[0];
+        assert_eq!(first.uid, "106314365");
+        assert_eq!(first.username, "xxxx02");
+        assert_eq!(first.member_type, 1);
+        assert_eq!(first.status, 1);
+        assert_eq!(first.account_mode, 5);
+        assert_eq!(first.remark, "");
+        let second = &response.result.sub_members[1];
+        assert_eq!(second.uid, "106279879");
+        assert_eq!(second.account_mode, 6);
+    }
+
+    #[rstest]
+    fn deserialize_sub_members_paged_response() {
+        // The final-page sentinel is `"0"`; both `"0"` and `None` collapse to
+        // `continuation_cursor() == None` through the method.
+        let json = load_test_json("http_get_user_sub_members_paged.json");
+        let response: BybitSubMembersPagedResponse =
+            serde_json::from_str(&json).expect("parse paged sub members");
+        assert_eq!(response.result.sub_members.len(), 2);
+        assert_eq!(response.result.next_cursor.as_deref(), Some("0"));
+        assert!(!response.result.has_more_pages());
+        assert_eq!(response.result.continuation_cursor(), None);
+    }
+
+    #[rstest]
+    fn deserialize_escrow_sub_members_response_uses_same_shape() {
+        // The escrow alias must decode into the same shape as the paginated
+        // sub-member list; a non-`"0"` cursor indicates more pages to fetch.
+        let json = load_test_json("http_get_user_escrow_sub_members.json");
+        let response: BybitEscrowSubMembersResponse =
+            serde_json::from_str(&json).expect("parse escrow sub members");
+        assert_eq!(response.result.sub_members.len(), 2);
+        assert_eq!(response.result.sub_members[0].member_type, 12);
+        assert_eq!(response.result.sub_members[0].remark, "earn fund");
+        assert_eq!(response.result.next_cursor.as_deref(), Some("344"));
+        assert!(response.result.has_more_pages());
+        assert_eq!(response.result.continuation_cursor(), Some("344"));
+    }
+
+    #[rstest]
+    fn deserialize_sub_api_keys_response() {
+        // `readOnly` arrives as a bool here; the masked `"******"` secret
+        // collapses to `None` through the `masked_secret` Serde adapter.
+        let json = load_test_json("http_get_user_sub_apikeys.json");
+        let response: BybitSubApiKeysResponse =
+            serde_json::from_str(&json).expect("parse sub apikeys");
+        assert_eq!(response.result.keys.len(), 1);
+        let key = &response.result.keys[0];
+        let debug = format!("{key:?}");
+
+        assert!(!key.read_only);
+        assert_eq!(key.secret, None);
+        assert_eq!(key.key_type, BybitApiKeyType::Hmac);
+        assert_eq!(key.flag, "hmac");
+        assert_eq!(key.deadline_day, Some(21));
+        assert_eq!(key.permissions.contract_trade, vec!["Order", "Position"]);
+        assert_eq!(key.permissions.spot, vec!["SpotTrade"]);
+        assert!(key.permissions.earn.is_empty());
+        assert_eq!(response.result.next_page_cursor.as_deref(), Some(""));
+        assert!(!response.result.has_more_pages());
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: None"));
+        assert!(!debug.contains("XXXXXX"));
+    }
+
+    #[rstest]
+    fn deserialize_update_sub_api_response() {
+        let json = load_test_json("http_post_user_update_sub_api.json");
+        let response: BybitUpdateSubApiResponse =
+            serde_json::from_str(&json).expect("parse update sub api");
+        let debug = format!("{:?}", response.result);
+
+        assert!(!response.result.read_only);
+        assert_eq!(response.result.secret, None);
+        assert_eq!(response.result.ips, vec!["*"]);
+        assert_eq!(response.result.permissions.spot, vec!["SpotTrade"]);
+        assert_eq!(response.result.permissions.wallet, vec!["AccountTransfer"]);
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: None"));
+        assert!(!debug.contains("xxxxxx"));
+    }
+
+    #[rstest]
+    fn deserialize_update_master_api_response() {
+        // Asserts on non-empty permission buckets so the test actually verifies
+        // deserialisation (an empty `Vec` would be indistinguishable from a
+        // `#[serde(default)]` fallback). In particular, `nft` exercises the
+        // explicit `#[serde(rename = "NFT")]` attribute.
+        let json = load_test_json("http_post_user_update_master_api.json");
+        let response: BybitUpdateMasterApiResponse =
+            serde_json::from_str(&json).expect("parse update master api");
+        assert!(!response.result.read_only);
+        assert_eq!(response.result.ips, vec!["*"]);
+        let perms = &response.result.permissions;
+        assert_eq!(perms.contract_trade, vec!["Order", "Position"]);
+        assert_eq!(perms.copy_trading, vec!["CopyTrading"]);
+        assert!(perms.earn.is_empty());
+        assert_eq!(perms.nft, vec!["NFTQueryProductList"]);
+    }
+
+    #[rstest]
+    fn deserialize_permissions_renamed_buckets_preserve_values() {
+        // Regression guard for `#[serde(rename = ...)]` on permission keys
+        // whose Bybit casing (`NFT`, `FiatP2P`, `ByXPost`) differs from
+        // serde's `PascalCase` default (`Nft`, `FiatP2p`, `ByxPost`). Using
+        // non-empty values ensures a rename regression causes a failure
+        // rather than silently falling through to `serde(default)`.
+        let json = r#"{
+            "NFT": ["NFTQueryProductList"],
+            "FiatP2P": ["P2PDeposit"],
+            "ByXPost": ["PostContent"]
+        }"#;
+        let perms: BybitApiKeyPermissions =
+            serde_json::from_str(json).expect("parse renamed buckets");
+        assert_eq!(perms.nft, vec!["NFTQueryProductList"]);
+        assert_eq!(perms.fiat_p2p, vec!["P2PDeposit"]);
+        assert_eq!(perms.byx_post, vec!["PostContent"]);
+    }
+
+    #[rstest]
+    fn deserialize_account_details_response_with_current_docs_example() {
+        let json = load_test_json("http_get_user_query_api.json");
+        let response: BybitAccountDetailsResponse =
+            serde_json::from_str(&json).expect("parse account details");
+        let debug = format!("{:?}", response.result);
+
+        assert_eq!(
+            response.result.permissions.fiat_global_pay,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            response.result.permissions.fiat_bit_pay,
+            vec!["FaitPayOrder"]
+        );
+        assert_eq!(response.result.permissions.bit_card, vec!["BitCard"]);
+        assert_eq!(response.result.permissions.byx_post, vec!["ByXPost"]);
+        assert_eq!(response.result.unified, Some(0));
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("secret: <redacted>"));
+        assert!(!debug.contains("api_key: \"XXXXXXXX\""));
     }
 }

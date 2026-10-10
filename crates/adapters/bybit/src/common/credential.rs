@@ -13,15 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Bybit API credential storage and signing helpers.
+//! Bybit API credential resolution, storage, and request signing.
 
 #![allow(unused_assignments)] // Fields are used in methods, false positive from nightly
 
 use std::fmt::Debug;
 
 use aws_lc_rs::hmac;
-use hex;
-use nautilus_core::{env::resolve_env_var_pair, string::REDACTED};
+use nautilus_core::{env::resolve_env_var_pair, hex, string::secret::REDACTED};
 use zeroize::ZeroizeOnDrop;
 
 use crate::common::enums::BybitEnvironment;
@@ -47,7 +46,7 @@ pub struct Credential {
 impl Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(Credential))
-            .field("api_key", &self.api_key)
+            .field("api_key", &REDACTED)
             .field("api_secret", &REDACTED)
             .finish()
     }
@@ -90,7 +89,7 @@ impl Credential {
     /// For keys shorter than 8 characters, shows asterisks only.
     #[must_use]
     pub fn api_key_masked(&self) -> String {
-        nautilus_core::string::mask_api_key(&self.api_key)
+        nautilus_core::string::secret::mask_api_key(&self.api_key)
     }
 
     /// Produces the Bybit WebSocket authentication signature for the provided expiry timestamp.
@@ -201,7 +200,8 @@ mod tests {
         let credential = Credential::new(API_KEY, API_SECRET);
         let dbg_out = format!("{credential:?}");
 
-        assert!(dbg_out.contains(REDACTED));
+        assert_eq!(dbg_out.matches(REDACTED).count(), 2);
+        assert!(!dbg_out.contains(API_KEY));
         assert!(!dbg_out.contains(API_SECRET));
     }
 

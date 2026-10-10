@@ -119,17 +119,7 @@ impl AxHttpError {
     /// Retries on network errors, rate limiting (429), and server errors (5xx).
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::NetworkError(_) => true,
-            Self::UnexpectedStatus { status, .. } => *status == 429 || *status >= 500,
-            Self::MissingCredentials
-            | Self::MissingSessionToken
-            | Self::ApiError { .. }
-            | Self::JsonError(_)
-            | Self::ValidationError(_)
-            | Self::BuildError(_)
-            | Self::Canceled(_) => false,
-        }
+        crate::common::retry::should_retry_http(self)
     }
 }
 
@@ -188,5 +178,29 @@ mod tests {
             http_error.to_string(),
             "AX Exchange API error: Invalid parameter"
         );
+    }
+
+    #[rstest]
+    #[case(AxHttpError::NetworkError("boom".to_string()), true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 500, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 502, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 503, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 599, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 600, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 429, body: String::new() }, true)]
+    #[case(AxHttpError::UnexpectedStatus { status: 408, body: String::new() }, false)]
+    #[case(AxHttpError::UnexpectedStatus { status: 425, body: String::new() }, false)]
+    #[case(AxHttpError::UnexpectedStatus { status: 400, body: String::new() }, false)]
+    #[case(AxHttpError::UnexpectedStatus { status: 401, body: String::new() }, false)]
+    #[case(AxHttpError::UnexpectedStatus { status: 404, body: String::new() }, false)]
+    #[case(AxHttpError::MissingCredentials, false)]
+    #[case(AxHttpError::MissingSessionToken, false)]
+    #[case(AxHttpError::ApiError { message: "bad".to_string() }, false)]
+    #[case(AxHttpError::JsonError("bad".to_string()), false)]
+    #[case(AxHttpError::ValidationError("bad".to_string()), false)]
+    #[case(AxHttpError::BuildError(AxBuildError::MissingSymbol), false)]
+    #[case(AxHttpError::Canceled("shutdown".to_string()), false)]
+    fn test_is_retryable(#[case] error: AxHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_retryable(), expected);
     }
 }

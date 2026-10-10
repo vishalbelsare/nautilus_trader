@@ -23,15 +23,13 @@
 //! - `NautilusKernelConfig` - Configuration for kernel initialization.
 //! - System builders and factories for component creation.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -40,14 +38,15 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `streaming`: Enables `persistence` dependency for streaming configuration.
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `streaming`).
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `extension-module`: Builds as a Python extension module.
 //! - `live`: Enables live trading mode dependencies.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `streaming`.
+//! - `streaming`: Enables the `nautilus-persistence` dependency for streaming configuration.
 //! - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.
-//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -55,20 +54,37 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 
 pub mod builder;
+pub mod clock_factory;
 pub mod config;
-pub mod factories;
+pub mod controller;
+pub mod event_store;
 pub mod kernel;
+pub mod messages;
 pub mod trader;
+
+mod registration;
 
 #[cfg(feature = "python")]
 pub mod python;
 
 // Re-exports
 pub use builder::NautilusKernelBuilder;
-pub use config::{NautilusKernelConfig, RotationConfig, StreamingConfig};
-pub use factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
+pub use clock_factory::ClockFactory;
+pub use config::NautilusKernelConfig;
+#[cfg(feature = "streaming")]
+pub use config::{RotationConfig, StreamingConfig};
+pub use controller::Controller;
+pub use event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents};
 pub use kernel::NautilusKernel;
+pub use messages::{
+    ControllerCommand, CreateActor, CreateStrategy, RemoveActor, RemoveStrategy, StartActor,
+    StartStrategy, StopActor, StopStrategy,
+};
 #[cfg(feature = "python")]
 pub use python::{FactoryRegistry, get_global_pyo3_registry};

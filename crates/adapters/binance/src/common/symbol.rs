@@ -22,19 +22,24 @@ use super::{consts::BINANCE_VENUE, enums::BinanceProductType};
 
 /// Converts a Binance symbol to a Nautilus instrument ID.
 ///
-/// For USD-M futures, appends "-PERP" suffix to match Nautilus symbology.
+/// For USD-M perpetuals, appends "-PERP" to match Nautilus symbology.
+/// Dated USD-M delivery symbols are preserved.
 /// For COIN-M futures, keeps the symbol as-is (uses "_PERP" format).
 ///
 /// # Examples
 ///
-/// - ("BTCUSDT", UsdM) → "BTCUSDT-PERP.BINANCE"
-/// - ("ETHUSD_PERP", CoinM) → "ETHUSD_PERP.BINANCE"
+/// - ("BTCUSDT", UsdM) -> "BTCUSDT-PERP.BINANCE"
+/// - ("BTCUSDT_260925", UsdM) -> "BTCUSDT_260925.BINANCE"
+/// - ("ETHUSD_PERP", CoinM) -> "ETHUSD_PERP.BINANCE"
 #[must_use]
 pub fn format_instrument_id(symbol: &Ustr, product_type: BinanceProductType) -> InstrumentId {
     let nautilus_symbol = match product_type {
         BinanceProductType::UsdM => {
-            // USD-M symbols don't have _PERP suffix from Binance, we add -PERP
-            format!("{symbol}-PERP")
+            if is_delivery_symbol(symbol.as_str()) {
+                symbol.to_string()
+            } else {
+                format!("{symbol}-PERP")
+            }
         }
         BinanceProductType::CoinM => {
             // COIN-M symbols already have _PERP suffix from Binance
@@ -74,6 +79,12 @@ pub fn format_binance_stream_symbol(instrument_id: &InstrumentId) -> String {
     format_binance_symbol(instrument_id).to_lowercase()
 }
 
+fn is_delivery_symbol(symbol: &str) -> bool {
+    symbol
+        .rsplit_once('_')
+        .is_some_and(|(_, expiry)| expiry.len() == 6 && expiry.bytes().all(|b| b.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -98,5 +109,30 @@ mod tests {
     fn test_format_binance_stream_symbol(#[case] input: &str, #[case] expected: &str) {
         let instrument_id = InstrumentId::from(input);
         assert_eq!(format_binance_stream_symbol(&instrument_id), expected);
+    }
+
+    #[rstest]
+    #[case::usdm_perp("BTCUSDT", BinanceProductType::UsdM, "BTCUSDT-PERP.BINANCE")]
+    #[case::usdm_eth("ETHUSDT", BinanceProductType::UsdM, "ETHUSDT-PERP.BINANCE")]
+    #[case::usdm_delivery("BTCUSDT_260925", BinanceProductType::UsdM, "BTCUSDT_260925.BINANCE")]
+    #[case::usdm_digit_quote("SPCXUSD1", BinanceProductType::UsdM, "SPCXUSD1-PERP.BINANCE")]
+    #[case::coinm_perp("BTCUSD_PERP", BinanceProductType::CoinM, "BTCUSD_PERP.BINANCE")]
+    #[case::coinm_eth("ETHUSD_PERP", BinanceProductType::CoinM, "ETHUSD_PERP.BINANCE")]
+    #[case::spot("BTCUSDT", BinanceProductType::Spot, "BTCUSDT.BINANCE")]
+    #[case::spot_eth("ETHBTC", BinanceProductType::Spot, "ETHBTC.BINANCE")]
+    #[case::margin("BTCUSDT", BinanceProductType::Margin, "BTCUSDT.BINANCE")]
+    #[case::options(
+        "BTC-240329-70000-C",
+        BinanceProductType::Options,
+        "BTC-240329-70000-C.BINANCE"
+    )]
+    fn test_format_instrument_id(
+        #[case] raw_symbol: &str,
+        #[case] product_type: BinanceProductType,
+        #[case] expected: &str,
+    ) {
+        let symbol = Ustr::from(raw_symbol);
+        let instrument_id = format_instrument_id(&symbol, product_type);
+        assert_eq!(instrument_id.to_string(), expected);
     }
 }

@@ -1,7 +1,7 @@
-ARG GIT_TAG=develop
-FROM ghcr.io/nautechsystems/nautilus_trader:$GIT_TAG
+ARG BASE_IMAGE_REPOSITORY=ghcr.io/nautechsystems/nautilus_trader:latest
+ARG BASE_IMAGE_DIGEST=ffaf4104402164d483371ecb27e21b16231293c416adb9771f9bd97a04f27673
+FROM ${BASE_IMAGE_REPOSITORY}@sha256:${BASE_IMAGE_DIGEST}
 
-COPY --from=ghcr.io/nautechsystems/nautilus_data:main /opt/pysetup/catalog /catalog
 COPY docs/tutorials /opt/pysetup/tutorials
 
 ENV PATH="/root/.local/bin:$PATH"
@@ -12,9 +12,25 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+RUN curl -fsSL --retry 3 \
+      -o /tmp/eurusd_quotes.parquet \
+      "https://test-data.nautechsystems.io/large/histdata_EURUSD.SIM_2020-01_quotes.parquet" && \
+    printf '%s  %s\n' \
+      "9c610a233b8408562ea9024df0bd3192608f16ed00fce6f5d761a321a3d897c2" \
+      "/tmp/eurusd_quotes.parquet" | sha256sum -c - && \
+    curl -fsSL --retry 3 \
+      -o /tmp/eurusd_instrument.parquet \
+      "https://test-data.nautechsystems.io/large/histdata_EURUSD.SIM_2020-01_instrument.parquet" && \
+    printf '%s  %s\n' \
+      "2088959dc15eecfebb7d4c45054d6a74d1000078daa1153388fe19c3b1468bac" \
+      "/tmp/eurusd_instrument.parquet" | sha256sum -c - && \
+    mkdir -p /catalog/data/quote_tick/EURUSD.SIM /catalog/data/currency_pair/EURUSD.SIM && \
+    mv /tmp/eurusd_quotes.parquet /catalog/data/quote_tick/EURUSD.SIM/part-0.parquet && \
+    mv /tmp/eurusd_instrument.parquet /catalog/data/currency_pair/EURUSD.SIM/part-0.parquet
+
 # Install UV
-COPY uv-version ./
-RUN UV_VERSION=$(cat uv-version) && curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+COPY --from=ghcr.io/astral-sh/uv:0.12.22@sha256:f513a91fc62fe7c17567eee97230dd198e43edb8a9fbecca843714a4358fe1bc \
+  /uv /uvx /root/.local/bin/
 
 RUN uv pip install --system jupyterlab datafusion
 

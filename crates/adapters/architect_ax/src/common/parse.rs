@@ -18,16 +18,19 @@
 use std::sync::LazyLock;
 
 use ahash::RandomState;
+use anyhow::Context;
 use nautilus_core::nanos::UnixNanos;
 pub use nautilus_core::serialization::{
-    deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
-    deserialize_optional_decimal_or_zero, deserialize_optional_decimal_str, parse_decimal,
-    parse_optional_decimal, serialize_decimal_as_str, serialize_optional_decimal_as_str,
+    deserialize_decimal_or_zero, deserialize_optional_decimal,
+    deserialize_optional_decimal_from_str, deserialize_optional_decimal_or_zero,
+    deserialize_optional_decimal_str, parse_decimal, parse_optional_decimal,
+    serialize_decimal_as_str, serialize_optional_decimal_as_str,
 };
 use nautilus_model::{
     data::BarSpecification,
-    identifiers::ClientOrderId,
-    types::{Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw},
+    enums::AggressorSide,
+    identifiers::{ClientOrderId, TradeId},
+    types::{Price, Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw},
 };
 
 use super::enums::AxCandleWidth;
@@ -47,6 +50,22 @@ pub fn ax_timestamp_s_to_unix_nanos(seconds: i64) -> anyhow::Result<UnixNanos> {
     Ok(UnixNanos::from(seconds as u64 * NANOSECONDS_IN_SECOND))
 }
 
+/// Converts AX `ts` (seconds) + `tn` (nanoseconds) fields to [`UnixNanos`].
+///
+/// # Errors
+///
+/// Returns an error if `seconds` is negative (malformed data from AX).
+pub fn ax_timestamp_stn_to_unix_nanos(seconds: i64, nanos: i64) -> anyhow::Result<UnixNanos> {
+    anyhow::ensure!(
+        seconds >= 0,
+        "AX timestamp must be non-negative, was {seconds}"
+    );
+    let nanos_part = nanos.max(0) as u64;
+    Ok(UnixNanos::from(
+        seconds as u64 * NANOSECONDS_IN_SECOND + nanos_part,
+    ))
+}
+
 /// Converts an AX nanosecond timestamp to [`UnixNanos`].
 ///
 /// # Errors
@@ -58,6 +77,85 @@ pub fn ax_timestamp_ns_to_unix_nanos(nanos: i64) -> anyhow::Result<UnixNanos> {
         "AX timestamp_ns must be non-negative, was {nanos}"
     );
     Ok(UnixNanos::from(nanos as u64))
+}
+
+/// Domain separator for the market-data trade identity digest.
+///
+/// Changing this invalidates every AX `TradeId` already published or persisted, so bump the
+/// version suffix only as a deliberate decision.
+const TRADE_ID_DOMAIN: &[u8] = b"nautilus-architect-ax/trade-id/v1";
+
+/// Creates a [`TradeId`] for an AX market-data trade.
+///
+/// AX publishes no trade identifier for market data: `GET /trades` and the market-data WebSocket
+/// both carry only `ts`, `tn`, `s`, `p`, `q`, and `d`, and `tn` is the nanosecond component of the
+/// timestamp rather than a sequence number. The composed timestamp alone is not unique either,
+/// because one aggressor sweeping several levels reports multiple prints at an identical `ts` and
+/// `tn`. Across 100 sandbox trades on 2026-07-25, `GBPUSD-PERP` yielded only 64 distinct
+/// timestamps.
+///
+/// The identity is therefore the composed timestamp plus a digest over the price, quantity, and
+/// aggressor side, which separated 99 of those 100 prints. Two prints identical in all five
+/// fields remain indistinguishable; nothing the venue publishes separates them. A sandbox run on
+/// 2026-07-25 observed exactly that, two `JPYUSD-PERP` prints agreeing on timestamp, price,
+/// quantity, and side, so the residual is real rather than theoretical at roughly 1 to 4 percent
+/// of prints.
+///
+/// That residual is accepted because a duplicate here cannot reach an execution. Live fills carry
+/// the venue's own identifiers, `fill.trade_id` on REST and `execution.tid` on the orders
+/// WebSocket, and the backtest matching engine mints its own trade IDs with a per-timestamp
+/// counter. This function is called only from the two market-data `parse_trade_tick` functions, so
+/// a duplicate is a market-data fidelity limit and never an execution or position-accounting risk.
+/// Only a consumer that itself deduplicates on [`TradeId`] is affected; nothing in the Nautilus
+/// data path compares them.
+///
+/// Both transports must call this so the same trade fetched historically and received live gets
+/// one identity. The digest covers the parsed [`Price`] and [`Quantity`] rather than the wire
+/// text, because AX sends the same price as `"1.339700000000"` over REST and in a shorter form
+/// over the WebSocket.
+///
+/// Parity relies on both transports reporting the aggressor side. `GET /trades` always does, and
+/// no sandbox WebSocket trade has omitted it, but `AxMdTrade::d` is modeled as optional and an
+/// omitted side resolves to [`AggressorSide::NoAggressor`], which would not match the REST
+/// identity for that trade.
+///
+/// The result is exactly 36 characters, which is [`TradeId`]'s maximum, so a timestamp beyond
+/// 19 digits (year 2262) returns an error rather than silently truncating.
+///
+/// # Errors
+///
+/// Returns an error if the composed identity is not a valid [`TradeId`].
+pub fn create_architect_trade_id(
+    ts_event: UnixNanos,
+    price: Price,
+    quantity: Quantity,
+    aggressor_side: AggressorSide,
+) -> anyhow::Result<TradeId> {
+    // Normalized decimals, not raw fixed-point, so the identity survives a precision change
+    let price = price.as_decimal().normalize();
+    let quantity = quantity.as_decimal().normalize();
+
+    let side = match aggressor_side {
+        AggressorSide::NoAggressor => b'N',
+        AggressorSide::Buy => b'B',
+        AggressorSide::Sell => b'S',
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TRADE_ID_DOMAIN);
+    hasher.update(&ts_event.as_u64().to_be_bytes());
+    hasher.update(&price.mantissa().to_be_bytes());
+    hasher.update(&price.scale().to_be_bytes());
+    hasher.update(&quantity.mantissa().to_be_bytes());
+    hasher.update(&quantity.scale().to_be_bytes());
+    hasher.update(&[side]);
+
+    let mut digest = [0u8; 8];
+    digest.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    let suffix = u64::from_be_bytes(digest);
+
+    TradeId::new_checked(format!("{}-{suffix:016x}", ts_event.as_u64()))
+        .context("Failed to create TradeId")
 }
 
 /// Cached hasher state for deterministic client order ID to cid conversion
@@ -90,7 +188,7 @@ pub fn map_bar_spec_to_candle_width(spec: &BarSpecification) -> anyhow::Result<A
 /// - The quantity represents a fractional number of contracts.
 /// - The quantity is zero.
 pub fn quantity_to_contracts(quantity: Quantity) -> anyhow::Result<u64> {
-    let raw = quantity.raw;
+    let raw = quantity.raw();
     let scale = 10_u64.pow(FIXED_PRECISION as u32) as QuantityRaw;
 
     // AX requires whole contract quantities
@@ -101,6 +199,8 @@ pub fn quantity_to_contracts(quantity: Quantity) -> anyhow::Result<u64> {
         );
     }
 
+    // QuantityRaw is u128 under the `high-precision` feature and u64 otherwise,
+    // so the narrowing cast is conditional on the active feature set.
     #[allow(clippy::unnecessary_cast)]
     let contracts = (raw / scale) as u64;
     if contracts == 0 {
@@ -109,13 +209,12 @@ pub fn quantity_to_contracts(quantity: Quantity) -> anyhow::Result<u64> {
     Ok(contracts)
 }
 
-/// Converts a [`ClientOrderId`] to a 64-bit unsigned integer for AX `cid` field.
+/// Converts a [`ClientOrderId`] to a deterministic AX `cid` in the non-negative `int64` range.
 ///
-/// Uses a deterministic hash of the client order ID string to produce
-/// a u64 value that can be used for order correlation.
+/// Inbound WebSocket `cid` values remain `u64` because venue messages can exceed `int64`.
 #[must_use]
 pub fn client_order_id_to_cid(client_order_id: &ClientOrderId) -> u64 {
-    CID_HASHER.hash_one(client_order_id.inner())
+    CID_HASHER.hash_one(client_order_id.inner()) & i64::MAX as u64
 }
 
 /// Creates a [`ClientOrderId`] from a cid value.
@@ -135,8 +234,105 @@ mod tests {
         types::Quantity,
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
+
+    /// The composed timestamp of the captured `EURUSD-PERP` trade shared by the REST and
+    /// WebSocket fixtures.
+    const CAPTURED_TS_EVENT: u64 = 1_766_193_240_334_589_144;
+
+    fn captured_trade_id() -> TradeId {
+        create_architect_trade_id(
+            UnixNanos::from(CAPTURED_TS_EVENT),
+            Price::from_decimal_dp(dec!(1.1719), 4).unwrap(),
+            Quantity::from_decimal_dp(dec!(400), 0).unwrap(),
+            AggressorSide::Buy,
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn test_create_architect_trade_id_format() {
+        let trade_id = captured_trade_id().to_string();
+
+        let (timestamp, digest) = trade_id.split_once('-').unwrap();
+
+        assert_eq!(trade_id.len(), 36);
+        assert_eq!(timestamp, CAPTURED_TS_EVENT.to_string());
+        assert_eq!(digest.len(), 16);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[rstest]
+    fn test_create_architect_trade_id_is_deterministic() {
+        assert_eq!(captured_trade_id(), captured_trade_id());
+    }
+
+    #[rstest]
+    fn test_create_architect_trade_id_ignores_trailing_wire_zeros() {
+        // AX sends this price as "1.1719" on the WebSocket and "1.171900000000" on REST
+        let padded = create_architect_trade_id(
+            UnixNanos::from(CAPTURED_TS_EVENT),
+            Price::from_decimal_dp(dec!(1.17190000), 4).unwrap(),
+            Quantity::from_decimal_dp(dec!(400.00), 0).unwrap(),
+            AggressorSide::Buy,
+        )
+        .unwrap();
+
+        assert_eq!(padded, captured_trade_id());
+    }
+
+    #[rstest]
+    fn test_create_architect_trade_id_ignores_instrument_precision() {
+        // A venue tick size change between a historical request and the live stream must not
+        // split one trade into two identities.
+        let wider = create_architect_trade_id(
+            UnixNanos::from(CAPTURED_TS_EVENT),
+            Price::from_decimal_dp(dec!(1.1719), 6).unwrap(),
+            Quantity::from_decimal_dp(dec!(400), 2).unwrap(),
+            AggressorSide::Buy,
+        )
+        .unwrap();
+
+        assert_eq!(wider, captured_trade_id());
+    }
+
+    #[rstest]
+    #[case(dec!(1.1720), dec!(400), AggressorSide::Buy)]
+    #[case(dec!(1.1719), dec!(100), AggressorSide::Buy)]
+    #[case(dec!(1.1719), dec!(400), AggressorSide::Sell)]
+    #[case(dec!(1.1719), dec!(400), AggressorSide::NoAggressor)]
+    fn test_create_architect_trade_id_separates_prints_within_one_timestamp(
+        #[case] price: Decimal,
+        #[case] quantity: Decimal,
+        #[case] aggressor_side: AggressorSide,
+    ) {
+        let other = create_architect_trade_id(
+            UnixNanos::from(CAPTURED_TS_EVENT),
+            Price::from_decimal_dp(price, 4).unwrap(),
+            Quantity::from_decimal_dp(quantity, 0).unwrap(),
+            aggressor_side,
+        )
+        .unwrap();
+
+        assert_ne!(other, captured_trade_id());
+    }
+
+    #[rstest]
+    fn test_create_architect_trade_id_rejects_timestamp_beyond_capacity() {
+        // `u64::MAX` is 20 digits, one past what the 36-character format allows
+        let error = create_architect_trade_id(
+            UnixNanos::from(u64::MAX),
+            Price::from_decimal_dp(dec!(1.1719), 4).unwrap(),
+            Quantity::from_decimal_dp(dec!(400), 0).unwrap(),
+            AggressorSide::Buy,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Failed to create TradeId");
+    }
 
     #[rstest]
     fn test_client_order_id_to_cid_deterministic() {
@@ -160,6 +356,67 @@ mod tests {
         let cid2 = client_order_id_to_cid(&coid2);
 
         assert_ne!(cid1, cid2);
+    }
+
+    #[rstest]
+    fn test_client_order_id_to_cid_fits_signed_64_bit_range() {
+        let coid = ClientOrderId::new("O-20260720-055815-001-001-1");
+
+        let cid = client_order_id_to_cid(&coid);
+
+        assert!(i64::try_from(cid).is_ok());
+    }
+
+    #[rstest]
+    #[case("O-1")]
+    #[case("O-SHORT")]
+    #[case("O-20240101-000001")]
+    #[case("Order-with-dashes-and-digits-12345")]
+    #[case("SINGLE")]
+    #[case("a")]
+    #[case("X")]
+    #[case("LONG-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789")]
+    fn test_client_order_id_to_cid_stable_across_varied_inputs(#[case] value: &str) {
+        // The hash must be deterministic for any valid ClientOrderId, and the
+        // recovered ClientOrderId via cid_to_client_order_id must match the
+        // "CID-{cid}" format so reconciliation can resolve lost mappings.
+        let coid = ClientOrderId::new(value);
+        let cid_a = client_order_id_to_cid(&coid);
+        let cid_b = client_order_id_to_cid(&coid);
+        assert_eq!(cid_a, cid_b, "hash must be deterministic");
+
+        let recovered = cid_to_client_order_id(cid_a);
+        assert!(
+            recovered.inner().starts_with("CID-"),
+            "recovered id should have CID prefix: {recovered}",
+        );
+        assert!(
+            !recovered.inner().is_empty(),
+            "recovered id should not be empty",
+        );
+    }
+
+    #[rstest]
+    fn test_client_order_id_to_cid_collision_resistance_small_corpus() {
+        // Collision-free over a handful of distinct client order IDs.
+        let values = [
+            "O-1",
+            "O-2",
+            "O-10",
+            "O-11",
+            "O-20240101-000001",
+            "O-20240101-000002",
+            "strategy-a/1",
+            "strategy-a/2",
+            "strategy-b/1",
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for v in values {
+            let coid = ClientOrderId::new(v);
+            let cid = client_order_id_to_cid(&coid);
+            assert!(seen.insert(cid), "cid collision for {v}");
+        }
     }
 
     #[rstest]
@@ -289,5 +546,28 @@ mod tests {
     #[rstest]
     fn test_ax_timestamp_ns_to_unix_nanos_negative_errors() {
         assert!(ax_timestamp_ns_to_unix_nanos(-1).is_err());
+    }
+
+    #[rstest]
+    fn test_ax_timestamp_stn_to_unix_nanos_combines_seconds_and_nanos() {
+        let result = ax_timestamp_stn_to_unix_nanos(1_000, 500).unwrap();
+        assert_eq!(result, UnixNanos::from(1_000_000_000_500u64));
+    }
+
+    #[rstest]
+    fn test_ax_timestamp_stn_to_unix_nanos_zero_nanos() {
+        let result = ax_timestamp_stn_to_unix_nanos(1_000, 0).unwrap();
+        assert_eq!(result, UnixNanos::from(1_000_000_000_000u64));
+    }
+
+    #[rstest]
+    fn test_ax_timestamp_stn_to_unix_nanos_negative_seconds_errors() {
+        assert!(ax_timestamp_stn_to_unix_nanos(-1, 0).is_err());
+    }
+
+    #[rstest]
+    fn test_ax_timestamp_stn_to_unix_nanos_negative_nanos_clamps_to_zero() {
+        let result = ax_timestamp_stn_to_unix_nanos(1_000, -1).unwrap();
+        assert_eq!(result, UnixNanos::from(1_000_000_000_000u64));
     }
 }

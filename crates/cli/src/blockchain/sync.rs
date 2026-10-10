@@ -18,16 +18,16 @@ use std::sync::Arc;
 use nautilus_blockchain::{
     config::BlockchainDataClientConfig,
     data::core::BlockchainDataClientCore,
-    exchanges::{find_dex_type_case_insensitive, get_supported_dexes_for_chain},
+    exchanges::{find_dex_type_case_insensitive, get_dex_extended, get_supported_dexes_for_chain},
     rpc::providers::check_infura_rpc_provider,
 };
-use nautilus_core::string::mask_api_key;
+use nautilus_core::string::secret::mask_api_key;
 use nautilus_infrastructure::sql::pg::get_postgres_connect_options;
 use nautilus_model::defi::chain::Chain;
 
 use crate::opt::DatabaseConfig;
 
-pub async fn run_sync_dex(
+pub(crate) async fn run_sync_dex(
     chain: String,
     dex: String,
     rpc_url: Option<String>,
@@ -47,6 +47,22 @@ pub async fn run_sync_dex(
         }
     })?;
 
+    // Fail before connecting to the RPC/database when the DEX cannot discover pools from
+    // PoolCreated logs; without a parser sync-dex would otherwise find zero pools silently.
+    let dex_extended = get_dex_extended(chain.name, &dex_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "DEX '{dex_type}' is not registered on chain '{}'",
+            chain.name
+        )
+    })?;
+
+    if !dex_extended.supports_pool_discovery() {
+        anyhow::bail!(
+            "DEX '{dex_type}' on chain '{}' cannot be synced: missing a PoolCreated parser for pool discovery.",
+            chain.name
+        );
+    }
+
     let postgres_connect_options = get_postgres_connect_options(
         database.host,
         database.port,
@@ -58,21 +74,20 @@ pub async fn run_sync_dex(
     let rpc_http_url = rpc_url
         .or_else(|| check_infura_rpc_provider(&chain.name))
         .or_else(|| std::env::var("RPC_HTTP_URL").ok())
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            anyhow::anyhow!(
                 "No RPC URL provided for {name}. Set --rpc-url, INFURA_API_KEY, or RPC_HTTP_URL",
                 name = chain.name
             )
-        });
+        })?;
 
     // Mask potential API key in URL for logging (key is typically the last path segment)
-    let masked_url = if let Some(idx) = rpc_http_url.rfind('/') {
-        let (base, key) = rpc_http_url.split_at(idx + 1);
+    let masked_url = if let Some((base, key)) = rpc_http_url.rsplit_once('/') {
         if key.is_empty() {
             rpc_http_url.clone()
         } else {
             let masked_key = mask_api_key(key);
-            format!("{base}{masked_key}")
+            format!("{base}/{masked_key}")
         }
     } else {
         // URL without path separator - mask entirely as it may contain credentials
@@ -81,18 +96,14 @@ pub async fn run_sync_dex(
 
     log::info!("Using RPC HTTP URL: '{masked_url}'");
 
-    let config = BlockchainDataClientConfig::new(
-        Arc::new(chain.to_owned()),
-        vec![dex_type],
-        rpc_http_url,
-        None,
-        multicall_calls_per_rpc_request,
-        None,
-        true,
-        None,
-        None,
-        Some(postgres_connect_options),
-    );
+    let config = BlockchainDataClientConfig::builder()
+        .chain(Arc::new(chain.to_owned()))
+        .dex_ids(vec![dex_type])
+        .http_rpc_url(rpc_http_url.into())
+        .maybe_multicall_calls_per_rpc_request(multicall_calls_per_rpc_request)
+        .use_hypersync_for_live_data(true)
+        .postgres_cache_database_config(postgres_connect_options)
+        .build();
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token);
     data_client.initialize_cache_database().await;
@@ -111,7 +122,7 @@ pub async fn run_sync_dex(
     Ok(())
 }
 
-pub async fn run_sync_blocks(
+pub(crate) async fn run_sync_blocks(
     chain: String,
     from_block: Option<u64>,
     to_block: Option<u64>,
@@ -129,18 +140,12 @@ pub async fn run_sync_blocks(
         database.password,
         database.database,
     );
-    let config = BlockchainDataClientConfig::new(
-        chain.clone(),
-        vec![],
-        String::new(), // we dont need to http rpc url for block syncing
-        None,
-        None,
-        None,
-        true,
-        None,
-        None,
-        Some(postgres_connect_options),
-    );
+    let config = BlockchainDataClientConfig::builder()
+        .chain(Arc::clone(&chain))
+        .http_rpc_url(String::new().into()) // we dont need to http rpc url for block syncing
+        .use_hypersync_for_live_data(true)
+        .postgres_cache_database_config(postgres_connect_options)
+        .build();
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let mut data_client = BlockchainDataClientCore::new(config, None, None, cancellation_token);
     data_client.initialize_cache_database().await;

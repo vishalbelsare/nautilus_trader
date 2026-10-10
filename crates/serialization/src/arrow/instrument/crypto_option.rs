@@ -15,12 +15,11 @@
 
 //! Arrow serialization for CryptoOption instruments.
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{borrow::Borrow, collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
     array::{
-        BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, StringArray, StringBuilder,
-        UInt8Array, UInt64Array,
+        Array, BooleanArray, BooleanBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema},
     error::ArrowError,
@@ -31,37 +30,17 @@ use nautilus_model::{
     enums::OptionKind,
     identifiers::{InstrumentId, Symbol},
     instruments::crypto_option::CryptoOption,
-    types::{currency::Currency, money::Money, price::Price, quantity::Quantity},
+    types::{money::Money, price::Price, quantity::Quantity},
 };
-#[allow(unused)]
 use rust_decimal::Decimal;
-#[allow(unused)]
-use serde_json::Value;
 
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name,
+    extract_optional_string_column_by_name, json_string_field, metadata_with_type_name,
+    optional_ustr_value, record_batch_with_timestamps, record_batch_with_u64_timestamps,
+    timestamp_data_type,
 };
-
-// Helper function to convert OptionKind to string
-fn option_kind_to_string(ok: OptionKind) -> String {
-    match ok {
-        OptionKind::Call => "Call".to_string(),
-        OptionKind::Put => "Put".to_string(),
-    }
-}
-
-// Helper function to parse OptionKind from string
-fn option_kind_from_str(s: &str) -> Result<OptionKind, EncodingError> {
-    match s {
-        "Call" => Ok(OptionKind::Call),
-        "Put" => Ok(OptionKind::Put),
-        _ => Err(EncodingError::ParseError(
-            "option_kind",
-            format!("Unknown option kind: {s}"),
-        )),
-    }
-}
 
 impl ArrowSchemaProvider for CryptoOption {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
@@ -74,13 +53,14 @@ impl ArrowSchemaProvider for CryptoOption {
             Field::new("is_inverse", DataType::Boolean, false),
             Field::new("option_kind", DataType::Utf8, false),
             Field::new("strike_price", DataType::Utf8, false),
-            Field::new("activation_ns", DataType::UInt64, false),
-            Field::new("expiration_ns", DataType::UInt64, false),
+            Field::new("activation_ns", timestamp_data_type(), false),
+            Field::new("expiration_ns", timestamp_data_type(), false),
             Field::new("price_precision", DataType::UInt8, false),
             Field::new("size_precision", DataType::UInt8, false),
             Field::new("price_increment", DataType::Utf8, false),
             Field::new("size_increment", DataType::Utf8, false),
             Field::new("multiplier", DataType::Utf8, false),
+            Field::new("lot_size", DataType::Utf8, true),
             Field::new("max_quantity", DataType::Utf8, true), // nullable
             Field::new("min_quantity", DataType::Utf8, true), // nullable
             Field::new("max_notional", DataType::Utf8, true), // nullable
@@ -89,29 +69,24 @@ impl ArrowSchemaProvider for CryptoOption {
             Field::new("min_price", DataType::Utf8, true),    // nullable
             Field::new("margin_init", DataType::Utf8, false),
             Field::new("margin_maint", DataType::Utf8, false),
-            Field::new("maker_fee", DataType::Utf8, false),
-            Field::new("taker_fee", DataType::Utf8, false),
-            Field::new("info", DataType::Binary, true), // nullable
-            Field::new("ts_event", DataType::UInt64, false),
-            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
+            json_string_field("info", true),
+            Field::new("ts_event", timestamp_data_type(), false),
+            Field::new("ts_init", timestamp_data_type(), false),
         ];
 
-        let mut final_metadata = HashMap::new();
-        final_metadata.insert("class".to_string(), "CryptoOption".to_string());
-
-        if let Some(meta) = metadata {
-            final_metadata.extend(meta);
-        }
-
-        Schema::new_with_metadata(fields, final_metadata)
+        Schema::new_with_metadata(fields, metadata_with_type_name("CryptoOption", metadata))
     }
 }
 
 impl EncodeToRecordBatch for CryptoOption {
-    fn encode_batch(
+    fn encode_batch<T>(
         #[allow(unused)] metadata: &HashMap<String, String>,
-        data: &[Self],
-    ) -> Result<RecordBatch, ArrowError> {
+        data: &[T],
+    ) -> Result<RecordBatch, ArrowError>
+    where
+        T: std::borrow::Borrow<Self>,
+    {
         let mut id_builder = StringBuilder::new();
         let mut raw_symbol_builder = StringBuilder::new();
         let mut underlying_builder = StringBuilder::new();
@@ -127,6 +102,7 @@ impl EncodeToRecordBatch for CryptoOption {
         let mut price_increment_builder = StringBuilder::new();
         let mut size_increment_builder = StringBuilder::new();
         let mut multiplier_builder = StringBuilder::new();
+        let mut lot_size_builder = StringBuilder::new();
         let mut max_quantity_builder = StringBuilder::new();
         let mut min_quantity_builder = StringBuilder::new();
         let mut max_notional_builder = StringBuilder::new();
@@ -135,20 +111,19 @@ impl EncodeToRecordBatch for CryptoOption {
         let mut min_price_builder = StringBuilder::new();
         let mut margin_init_builder = StringBuilder::new();
         let mut margin_maint_builder = StringBuilder::new();
-        let mut maker_fee_builder = StringBuilder::new();
-        let mut taker_fee_builder = StringBuilder::new();
-        let mut info_builder = BinaryBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
+        let mut info_builder = StringBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
 
-        for co in data {
+        for co in data.iter().map(Borrow::borrow) {
             id_builder.append_value(co.id.to_string());
             raw_symbol_builder.append_value(co.raw_symbol);
             underlying_builder.append_value(co.underlying.to_string());
             quote_currency_builder.append_value(co.quote_currency.to_string());
             settlement_currency_builder.append_value(co.settlement_currency.to_string());
             is_inverse_builder.append_value(co.is_inverse);
-            option_kind_builder.append_value(option_kind_to_string(co.option_kind));
+            option_kind_builder.append_value(co.option_kind);
             strike_price_builder.append_value(co.strike_price.to_string());
             activation_ns_builder.append_value(co.activation_ns.as_u64());
             expiration_ns_builder.append_value(co.expiration_ns.as_u64());
@@ -157,6 +132,7 @@ impl EncodeToRecordBatch for CryptoOption {
             price_increment_builder.append_value(co.price_increment.to_string());
             size_increment_builder.append_value(co.size_increment.to_string());
             multiplier_builder.append_value(co.multiplier.to_string());
+            lot_size_builder.append_value(co.lot_size.to_string());
 
             if let Some(max_qty) = co.max_quantity {
                 max_quantity_builder.append_value(max_qty.to_string());
@@ -196,14 +172,17 @@ impl EncodeToRecordBatch for CryptoOption {
 
             margin_init_builder.append_value(co.margin_init.to_string());
             margin_maint_builder.append_value(co.margin_maint.to_string());
-            maker_fee_builder.append_value(co.maker_fee.to_string());
-            taker_fee_builder.append_value(co.taker_fee.to_string());
 
-            // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
+            if let Some(tick_scheme) = co.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
+
             if let Some(ref info) = co.info {
-                match serde_json::to_vec(info) {
-                    Ok(json_bytes) => {
-                        info_builder.append_value(json_bytes);
+                match serde_json::to_string(info) {
+                    Ok(json) => {
+                        info_builder.append_value(json);
                     }
                     Err(e) => {
                         return Err(ArrowError::InvalidArgumentError(format!(
@@ -219,11 +198,8 @@ impl EncodeToRecordBatch for CryptoOption {
             ts_init_builder.append_value(co.ts_init.as_u64());
         }
 
-        let mut final_metadata = metadata.clone();
-        final_metadata.insert("class".to_string(), "CryptoOption".to_string());
-
-        RecordBatch::try_new(
-            Self::get_schema(Some(final_metadata)).into(),
+        record_batch_with_timestamps(
+            Self::get_schema(Some(metadata.clone())).into(),
             vec![
                 Arc::new(id_builder.finish()),
                 Arc::new(raw_symbol_builder.finish()),
@@ -240,6 +216,7 @@ impl EncodeToRecordBatch for CryptoOption {
                 Arc::new(price_increment_builder.finish()),
                 Arc::new(size_increment_builder.finish()),
                 Arc::new(multiplier_builder.finish()),
+                Arc::new(lot_size_builder.finish()),
                 Arc::new(max_quantity_builder.finish()),
                 Arc::new(min_quantity_builder.finish()),
                 Arc::new(max_notional_builder.finish()),
@@ -248,8 +225,7 @@ impl EncodeToRecordBatch for CryptoOption {
                 Arc::new(min_price_builder.finish()),
                 Arc::new(margin_init_builder.finish()),
                 Arc::new(margin_maint_builder.finish()),
-                Arc::new(maker_fee_builder.finish()),
-                Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -272,16 +248,21 @@ impl EncodeToRecordBatch for CryptoOption {
     }
 }
 
-/// Helper function to decode CryptoOption from RecordBatch
-/// (Cannot implement DecodeFromRecordBatch trait due to `Into<Data>` bound)
+/// Decodes [`CryptoOption`] instruments from a record batch.
+///
+/// Not a [`DecodeFromRecordBatch`] implementation because that trait requires `Into<Data>`.
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the RecordBatch cannot be decoded.
+/// Returns an `EncodingError` if the record batch cannot be decoded.
+///
+/// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_crypto_option_batch(
     #[allow(unused)] metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<CryptoOption>, EncodingError> {
+    let record_batch = record_batch_with_u64_timestamps(record_batch)?;
+    let record_batch = &record_batch;
     let cols = record_batch.columns();
     let num_rows = record_batch.num_rows();
 
@@ -310,35 +291,41 @@ pub fn decode_crypto_option_batch(
     let size_increment_values =
         extract_column::<StringArray>(cols, "size_increment", 13, DataType::Utf8)?;
     let multiplier_values = extract_column::<StringArray>(cols, "multiplier", 14, DataType::Utf8)?;
+    let lot_size_values = record_batch
+        .schema()
+        .index_of("lot_size")
+        .ok()
+        .map(|index| extract_column::<StringArray>(cols, "lot_size", index, DataType::Utf8))
+        .transpose()?;
+    let lot_size_offset = usize::from(lot_size_values.is_some());
     let max_quantity_values = cols
-        .get(15)
-        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 15))?;
+        .get(15 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 15 + lot_size_offset))?;
     let min_quantity_values = cols
-        .get(16)
-        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 16))?;
+        .get(16 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 16 + lot_size_offset))?;
     let max_notional_values = cols
-        .get(17)
-        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 17))?;
+        .get(17 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 17 + lot_size_offset))?;
     let min_notional_values = cols
-        .get(18)
-        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 18))?;
+        .get(18 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 18 + lot_size_offset))?;
     let max_price_values = cols
-        .get(19)
-        .ok_or_else(|| EncodingError::MissingColumn("max_price", 19))?;
+        .get(19 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_price", 19 + lot_size_offset))?;
     let min_price_values = cols
-        .get(20)
-        .ok_or_else(|| EncodingError::MissingColumn("min_price", 20))?;
+        .get(20 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_price", 20 + lot_size_offset))?;
     let margin_init_values =
-        extract_column::<StringArray>(cols, "margin_init", 21, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_init", 21 + lot_size_offset, DataType::Utf8)?;
     let margin_maint_values =
-        extract_column::<StringArray>(cols, "margin_maint", 22, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 23, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 24, DataType::Utf8)?;
-    let info_values = cols
-        .get(25)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 25))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 26, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 27, DataType::UInt64)?;
+        extract_column::<StringArray>(cols, "margin_maint", 22 + lot_size_offset, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values = extract_column_by_name::<StringArray>(record_batch, "info", DataType::Utf8)?;
+    let ts_event_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
+    let ts_init_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -346,16 +333,27 @@ pub fn decode_crypto_option_batch(
         let id = InstrumentId::from_str(id_values.value(i))
             .map_err(|e| EncodingError::ParseError("id", format!("row {i}: {e}")))?;
         let raw_symbol = Symbol::from(raw_symbol_values.value(i));
-        let underlying = Currency::from_str(underlying_values.value(i))
-            .map_err(|e| EncodingError::ParseError("underlying", format!("row {i}: {e}")))?;
-        let quote_currency = Currency::from_str(quote_currency_values.value(i))
-            .map_err(|e| EncodingError::ParseError("quote_currency", format!("row {i}: {e}")))?;
-        let settlement_currency =
-            Currency::from_str(settlement_currency_values.value(i)).map_err(|e| {
-                EncodingError::ParseError("settlement_currency", format!("row {i}: {e}"))
-            })?;
+        let underlying = super::decode_currency(
+            underlying_values.value(i),
+            "underlying",
+            "crypto_option.underlying",
+            i,
+        )?;
+        let quote_currency = super::decode_currency(
+            quote_currency_values.value(i),
+            "quote_currency",
+            "crypto_option.quote_currency",
+            i,
+        )?;
+        let settlement_currency = super::decode_currency(
+            settlement_currency_values.value(i),
+            "settlement_currency",
+            "crypto_option.settlement_currency",
+            i,
+        )?;
         let is_inverse = is_inverse_values.value(i);
-        let option_kind = option_kind_from_str(option_kind_values.value(i))?;
+        let option_kind = OptionKind::from_str(option_kind_values.value(i))
+            .map_err(|e| EncodingError::ParseError("option_kind", format!("row {i}: {e}")))?;
         let strike_price = Price::from_str(strike_price_values.value(i))
             .map_err(|e| EncodingError::ParseError("strike_price", format!("row {i}: {e}")))?;
         let activation_ns = nautilus_core::UnixNanos::from(activation_ns_values.value(i));
@@ -369,6 +367,18 @@ pub fn decode_crypto_option_batch(
             .map_err(|e| EncodingError::ParseError("size_increment", format!("row {i}: {e}")))?;
         let multiplier = Quantity::from_str(multiplier_values.value(i))
             .map_err(|e| EncodingError::ParseError("multiplier", format!("row {i}: {e}")))?;
+        let lot_size =
+            if let Some(values) = lot_size_values {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(Quantity::from_str(values.value(i)).map_err(|e| {
+                        EncodingError::ParseError("lot_size", format!("row {i}: {e}"))
+                    })?)
+                }
+            } else {
+                None
+            };
 
         let max_quantity =
             if max_quantity_values.is_null(i) {
@@ -470,21 +480,17 @@ pub fn decode_crypto_option_batch(
             .map_err(|e| EncodingError::ParseError("margin_init", format!("row {i}: {e}")))?;
         let margin_maint = Decimal::from_str(margin_maint_values.value(i))
             .map_err(|e| EncodingError::ParseError("margin_maint", format!("row {i}: {e}")))?;
-        let maker_fee = Decimal::from_str(maker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("maker_fee", format!("row {i}: {e}")))?;
-        let taker_fee = Decimal::from_str(taker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("taker_fee", format!("row {i}: {e}")))?;
 
-        // Decode info dict from JSON bytes (matching Python's msgspec.json.decode)
         let info = if info_values.is_null(i) {
             None
         } else {
-            let info_bytes = info_values
+            let info_json = info_values
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| EncodingError::ParseError("info", format!("row {i}: invalid type")))?
                 .value(i);
-            match serde_json::from_slice::<Params>(info_bytes) {
+
+            match serde_json::from_str::<Params>(info_json) {
                 Ok(info_dict) => Some(info_dict),
                 Err(e) => {
                     return Err(EncodingError::ParseError(
@@ -498,37 +504,39 @@ pub fn decode_crypto_option_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let crypto_option = CryptoOption::new(
-            id,
-            raw_symbol,
-            underlying,
-            quote_currency,
-            settlement_currency,
-            is_inverse,
-            option_kind,
-            strike_price,
-            activation_ns,
-            expiration_ns,
-            price_prec,
-            size_prec,
-            price_increment,
-            size_increment,
-            Some(multiplier),
-            None, // lot_size - not in Python schema, will default to 1
-            max_quantity,
-            min_quantity,
-            max_notional,
-            min_notional,
-            max_price,
-            min_price,
-            Some(margin_init),
-            Some(margin_maint),
-            Some(maker_fee),
-            Some(taker_fee),
-            info,
-            ts_event,
-            ts_init,
-        );
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let crypto_option = CryptoOption::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .underlying(underlying)
+            .quote_currency(quote_currency)
+            .settlement_currency(settlement_currency)
+            .is_inverse(is_inverse)
+            .option_kind(option_kind)
+            .strike_price(strike_price)
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .price_precision(price_prec)
+            .size_precision(size_prec)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .multiplier(multiplier)
+            .maybe_lot_size(lot_size)
+            .maybe_max_quantity(max_quantity)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_notional(max_notional)
+            .maybe_min_notional(min_notional)
+            .maybe_max_price(max_price)
+            .maybe_min_price(min_price)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<CryptoOption>(i, e))?;
 
         result.push(crypto_option);
     }

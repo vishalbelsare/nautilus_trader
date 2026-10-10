@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_model::enums::OrderSide;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -121,18 +121,6 @@ pub struct DydxWsChannelBatchDataMsg {
     /// API version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-/// General WebSocket message structure for routing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DydxWsMessageGeneral {
-    #[serde(rename = "type")]
-    pub msg_type: Option<DydxWsMessageType>,
-    pub connection_id: Option<String>,
-    pub message_id: Option<u64>,
-    pub channel: Option<DydxWsChannel>,
-    pub id: Option<String>,
-    pub message: Option<String>,
 }
 
 /// Two-level WebSocket message envelope matching dYdX protocol.
@@ -348,7 +336,7 @@ impl DydxWsGenericMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DydxBlockHeightSubscribedContents {
     pub height: String,
-    pub time: DateTime<Utc>,
+    pub time: Timestamp,
 }
 
 /// Block height subscription confirmed message.
@@ -365,7 +353,7 @@ pub struct DydxWsBlockHeightSubscribedData {
 pub struct DydxBlockHeightChannelContents {
     #[serde(rename = "blockHeight")]
     pub block_height: String,
-    pub time: DateTime<Utc>,
+    pub time: Timestamp,
 }
 
 /// Block height channel data message.
@@ -376,19 +364,6 @@ pub struct DydxWsBlockHeightChannelData {
     pub id: String,
     pub version: String,
     pub contents: DydxBlockHeightChannelContents,
-}
-
-/// Oracle price data for a market (full format from subscribed message).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DydxOraclePriceMarketFull {
-    #[serde(rename = "oraclePrice")]
-    pub oracle_price: String,
-    #[serde(rename = "effectiveAt")]
-    pub effective_at: String,
-    #[serde(rename = "effectiveAtHeight")]
-    pub effective_at_height: String,
-    #[serde(rename = "marketId")]
-    pub market_id: u32,
 }
 
 /// Oracle price data for a market (simple format from channel_data).
@@ -468,38 +443,6 @@ pub struct DydxMarketTradingUpdate {
     pub oracle_price: Option<String>,
 }
 
-/// Market message contents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DydxMarketMessageContents {
-    #[serde(rename = "oraclePrices")]
-    pub oracle_prices: Option<HashMap<String, DydxOraclePriceMarketFull>>,
-    pub trading: Option<Value>,
-}
-
-/// Markets channel data message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DydxWsMarketChannelData {
-    #[serde(rename = "type")]
-    pub msg_type: DydxWsMessageType,
-    pub channel: DydxWsChannel,
-    pub contents: DydxMarketMessageContents,
-    pub version: String,
-    pub message_id: u64,
-    pub connection_id: Option<String>,
-    pub id: Option<String>,
-}
-
-/// Markets subscription confirmed message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DydxWsMarketSubscribed {
-    #[serde(rename = "type")]
-    pub msg_type: DydxWsMessageType,
-    pub connection_id: String,
-    pub message_id: u64,
-    pub channel: DydxWsChannel,
-    pub contents: Value,
-}
-
 /// Contents of v4_markets messages (both subscription snapshots and channel_data updates).
 ///
 /// Initial subscription responses use `markets` with full market objects.
@@ -531,7 +474,7 @@ pub struct DydxTrade {
     /// Trade price.
     pub price: String,
     /// Trade timestamp.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Trade type.
     #[serde(rename = "type")]
     pub trade_type: DydxTradeType,
@@ -565,7 +508,7 @@ pub struct DydxCandle {
     /// Resolution/timeframe.
     pub resolution: DydxCandleResolution,
     /// Start time.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// Starting open interest.
     pub starting_open_interest: String,
     /// Market ticker.

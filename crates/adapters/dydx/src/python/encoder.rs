@@ -15,8 +15,6 @@
 
 //! Python bindings for dYdX ClientOrderId encoder.
 
-#![allow(clippy::missing_errors_doc)]
-
 use std::sync::Arc;
 
 use nautilus_core::python::to_pyruntime_err;
@@ -30,6 +28,7 @@ use crate::execution::encoder::ClientOrderIdEncoder;
 /// Provides bidirectional encoding of Nautilus ClientOrderId strings to
 /// dYdX's (client_id, client_metadata) u32 pair.
 #[pyclass(name = "DydxClientOrderIdEncoder")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")]
 #[derive(Debug)]
 pub struct PyDydxClientOrderIdEncoder {
     inner: Arc<ClientOrderIdEncoder>,
@@ -43,10 +42,11 @@ impl PyDydxClientOrderIdEncoder {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyDydxClientOrderIdEncoder {
     /// Create a new ClientOrderIdEncoder.
     #[new]
-    fn new() -> Self {
+    fn py_new() -> Self {
         Self {
             inner: Arc::new(ClientOrderIdEncoder::new()),
         }

@@ -15,17 +15,22 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
-#![allow(
+#![expect(
     clippy::missing_errors_doc,
     reason = "errors documented on underlying Rust methods"
 )]
 
+pub mod algorithm;
+pub mod controller;
 pub mod sessions;
 pub mod strategy;
 
+#[cfg(feature = "examples")]
+mod examples;
+
 use pyo3::{prelude::*, pymodule};
 
-/// Loaded as `nautilus_pyo3.trading`.
+/// Exposed through `nautilus_trader.trading`.
 ///
 /// # Errors
 ///
@@ -39,7 +44,23 @@ pub fn trading(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sessions::py_fx_next_end, m)?)?;
     m.add_function(wrap_pyfunction!(sessions::py_fx_prev_end, m)?)?;
     m.add_class::<strategy::PyStrategy>()?;
+    m.add_class::<crate::controller::ImportableControllerConfig>()?;
     m.add_class::<crate::strategy::StrategyConfig>()?;
     m.add_class::<crate::strategy::ImportableStrategyConfig>()?;
+    m.add_class::<algorithm::PyExecutionAlgorithm>()?;
+    m.add_class::<crate::algorithm::ExecutionAlgorithmConfig>()?;
+    m.add_class::<crate::algorithm::ImportableExecutionAlgorithmConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::CompositeMarketMakerConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::EmaCrossConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::GridMarketMakerConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::DeltaNeutralVolConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::strategies::HurstVpinDirectionalConfig>()?;
+    #[cfg(feature = "examples")]
+    m.add_class::<crate::examples::actors::BookImbalanceActorConfig>()?;
     Ok(())
 }

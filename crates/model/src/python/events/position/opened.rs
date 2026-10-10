@@ -18,14 +18,21 @@ use pyo3::{basic::CompareOp, prelude::*};
 
 use crate::{
     enums::{OrderSide, PositionSide},
-    events::PositionOpened,
+    events::{OrderFilled, PositionOpened},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
-    types::{Currency, Price, Quantity},
+    position::Position,
+    types::{Currency, Money, Price, Quantity},
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PositionOpened {
+    #[staticmethod]
+    #[pyo3(name = "create")]
+    fn py_create(position: &Position, fill: &OrderFilled, event_id: UUID4, ts_init: u64) -> Self {
+        Self::create(position, fill, event_id, ts_init.into())
+    }
+
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         match op {
             CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
@@ -120,6 +127,12 @@ impl PositionOpened {
     #[pyo3(name = "avg_px_open")]
     fn py_avg_px_open(&self) -> f64 {
         self.avg_px_open
+    }
+
+    #[getter]
+    #[pyo3(name = "realized_pnl")]
+    fn py_realized_pnl(&self) -> Option<Money> {
+        self.realized_pnl
     }
 
     #[getter]

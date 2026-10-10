@@ -15,26 +15,33 @@
 
 //! Account types such as `CashAccount` and `MarginAccount`.
 
+#[macro_use]
+mod macros;
+
 pub mod any;
 pub mod base;
+pub mod betting;
 pub mod cash;
 pub mod margin;
 pub mod margin_model;
+pub mod wallet;
 
-#[cfg(any(test, feature = "stubs"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
-use ahash::AHashMap;
 use enum_dispatch::enum_dispatch;
+use indexmap::IndexMap;
 use nautilus_core::UnixNanos;
 
 // Re-exports
 pub use crate::accounts::{
-    any::AccountAny, base::BaseAccount, cash::CashAccount, margin::MarginAccount,
+    any::AccountAny, base::BaseAccount, betting::BettingAccount, cash::CashAccount,
+    margin::MarginAccount, wallet::WalletAccount,
 };
 use crate::{
     enums::{AccountType, LiquiditySide, OrderSide},
     events::{AccountState, OrderFilled},
+    fees::MakerTakerFeeRates,
     identifiers::AccountId,
     instruments::InstrumentAny,
     position::Position,
@@ -50,24 +57,28 @@ pub trait Account: 'static + Send {
     fn is_margin_account(&self) -> bool;
     fn calculated_account_state(&self) -> bool;
     fn balance_total(&self, currency: Option<Currency>) -> Option<Money>;
-    fn balances_total(&self) -> AHashMap<Currency, Money>;
+    fn balances_total(&self) -> IndexMap<Currency, Money>;
     fn balance_free(&self, currency: Option<Currency>) -> Option<Money>;
-    fn balances_free(&self) -> AHashMap<Currency, Money>;
+    fn balances_free(&self) -> IndexMap<Currency, Money>;
     fn balance_locked(&self, currency: Option<Currency>) -> Option<Money>;
-    fn balances_locked(&self) -> AHashMap<Currency, Money>;
+    fn balances_locked(&self) -> IndexMap<Currency, Money>;
     fn balance(&self, currency: Option<Currency>) -> Option<&AccountBalance>;
     fn last_event(&self) -> Option<AccountState>;
     fn events(&self) -> Vec<AccountState>;
     fn event_count(&self) -> usize;
     fn currencies(&self) -> Vec<Currency>;
-    fn starting_balances(&self) -> AHashMap<Currency, Money>;
-    fn balances(&self) -> AHashMap<Currency, AccountBalance>;
+    fn starting_balances(&self) -> IndexMap<Currency, Money>;
+    fn balances(&self) -> IndexMap<Currency, AccountBalance>;
     /// Applies an account state event to update the account.
+    ///
+    /// Implementations reject the event before mutating any state, so a rejected event leaves
+    /// the account unchanged.
     ///
     /// # Errors
     ///
-    /// Returns an error if the account state cannot be applied (e.g., negative balance
-    /// when borrowing is not allowed for a cash account).
+    /// Returns an error if `event.account_id` does not match this account's ID, or if the
+    /// account state cannot be applied (e.g., negative balance when borrowing is not allowed
+    /// for a cash account).
     fn apply(&mut self, event: AccountState) -> anyhow::Result<()>;
     fn purge_account_events(&mut self, ts_now: UnixNanos, lookback_secs: u64);
 
@@ -77,7 +88,7 @@ pub trait Account: 'static + Send {
     ///
     /// Returns an error if calculating locked balance fails.
     fn calculate_balance_locked(
-        &mut self,
+        &self,
         instrument: &InstrumentAny,
         side: OrderSide,
         quantity: Quantity,
@@ -97,7 +108,7 @@ pub trait Account: 'static + Send {
         position: Option<Position>,
     ) -> anyhow::Result<Vec<Money>>;
 
-    /// Calculates commission for the order fill parameters.
+    /// Calculates commission for the order fill parameters from explicitly resolved fee rates.
     ///
     /// # Errors
     ///
@@ -108,6 +119,7 @@ pub trait Account: 'static + Send {
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
+        fee_rates: MakerTakerFeeRates,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money>;
 }

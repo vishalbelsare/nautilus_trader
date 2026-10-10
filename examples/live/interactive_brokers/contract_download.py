@@ -1,47 +1,58 @@
+# -------------------------------------------------------------------------------------------------
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+#  https://nautechsystems.io
+#
+#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+#  You may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+# -------------------------------------------------------------------------------------------------
+"""
+Example of contract download.
+"""
+
+from __future__ import annotations
+
 import asyncio
 
-from nautilus_trader.adapters.interactive_brokers.common import IBContract
-from nautilus_trader.adapters.interactive_brokers.historical import HistoricInteractiveBrokersClient
+from _common import default_stock_contracts
+from _common import env_bool
+from _common import env_int
+from _common import instrument_provider_config
+from _common import resolve_ib_endpoint
+
+from nautilus_trader.adapters import interactive_brokers
 
 
 async def main() -> None:
-    host: str = "localhost"
-    port: int = 7497
+    """
+    Run the example.
+    """
+    ib = interactive_brokers
+    host, port = resolve_ib_endpoint()
+    provider_config = instrument_provider_config()
+    provider = ib.InteractiveBrokersInstrumentProvider(provider_config)
+    client_config = ib.InteractiveBrokersDataClientConfig(
+        host=host,
+        port=port,
+        client_id=env_int("IB_V2_CONTRACT_CLIENT_ID", 181),
+        connection_timeout=env_int("IB_V2_CONNECTION_TIMEOUT", 10),
+        request_timeout=env_int("IB_V2_REQUEST_TIMEOUT", 30),
+        instrument_provider=provider_config,
+    )
 
-    client = HistoricInteractiveBrokersClient(host=host, port=port, log_level="DEBUG")
-    await client.connect()
-    await asyncio.sleep(1)
+    if not env_bool("IB_V2_RUN_CLIENT"):
+        print(
+            "Built IB contract client. Set IB_V2_RUN_CLIENT=1 to request contracts.",
+            flush=True,
+        )
+        return
 
-    nse_nifty_fut_contract = IBContract(
-        secType="FUT",
-        exchange="NSE",
-        symbol="NIFTY50",
-        lastTradeDateOrContractMonth="20250327",
-    )
-    ce_contract = IBContract(
-        secType="OPT",
-        exchange="NSE",
-        symbol="NIFTY50",
-        lastTradeDateOrContractMonth="20250227",
-        strike=25000,
-        right="C",
-        includeExpired=True,
-    )
-    pe_contract = IBContract(
-        secType="OPT",
-        exchange="NSE",
-        symbol="NIFTY50",
-        lastTradeDateOrContractMonth="20250227",
-        strike=25000,
-        right="P",
-        includeExpired=True,
-    )
-    contracts = [nse_nifty_fut_contract, ce_contract, pe_contract]
-
-    instruments = await client.request_instruments(
-        contracts=contracts,
-    )
-    print(instruments)
+    client = ib.HistoricalInteractiveBrokersClient(provider, client_config)
+    print("Requesting contracts...", flush=True)
+    instruments = await client.request_instruments(contracts=default_stock_contracts())
+    print(f"Loaded {len(instruments)} instrument(s)", flush=True)
+    for instrument in instruments:
+        print(instrument.id, flush=True)
 
 
 if __name__ == "__main__":

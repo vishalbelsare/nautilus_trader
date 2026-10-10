@@ -102,7 +102,7 @@ pub enum BetfairOrderStatus {
     Expired,
 }
 
-/// Controls which data fields are returned with market catalogues.
+/// Controls which data fields are returned with market catalogs.
 #[derive(
     Clone,
     Copy,
@@ -151,6 +151,8 @@ pub enum MarketStatus {
     Open,
     Suspended,
     Closed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Sorting options for market listings.
@@ -203,6 +205,8 @@ pub enum MarketBettingType {
     AsianHandicapDoubleLine,
     AsianHandicapSingleLine,
     FixedOdds,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Exchange price data options.
@@ -274,6 +278,8 @@ pub enum PriceLadderType {
     Classic,
     Finest,
     LineRange,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Order filter projection.
@@ -560,6 +566,8 @@ pub enum RunnerStatus {
     RemovedVacant,
     Removed,
     Hidden,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Bet settlement status.
@@ -702,6 +710,77 @@ pub enum RollupModel {
     Payout,
     ManagedLiability,
     None,
+}
+
+/// Certificate-based login response status.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    Display,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum CertLoginStatus {
+    Success,
+    NoError,
+    Fail,
+    AccountAlreadyLocked,
+    AccountNowLocked,
+    AccountPendingPasswordChange,
+    ActionsRequired,
+    AgentClientMaster,
+    AgentClientMasterSuspended,
+    AuthorizedOnlyForDomainRo,
+    AuthorizedOnlyForDomainSe,
+    BettingRestrictedLocation,
+    CertAuthRequired,
+    ChangePasswordRequired,
+    Closed,
+    DanishAuthorizationRequired,
+    DenmarkMigrationRequired,
+    DuplicateCards,
+    EmailLoginNotAllowed,
+    InputValidationError,
+    InternalError,
+    InternationalTermsAcceptanceRequired,
+    InvalidConnectivityToRegulatorDk,
+    InvalidConnectivityToRegulatorIt,
+    InvalidUsernameOrPassword,
+    ItalianContractAcceptanceRequired,
+    ItalianProfilingAcceptanceRequired,
+    KycSuspend,
+    LoginRestricted,
+    MultipleUsersWithSameCredential,
+    NotAuthorizedByRegulatorDk,
+    NotAuthorizedByRegulatorIt,
+    PendingAuth,
+    PersonalMessageRequired,
+    #[serde(rename = "SECURITY_QUESTION_WRONG_3X")]
+    #[strum(serialize = "SECURITY_QUESTION_WRONG_3X")]
+    SecurityQuestionWrong3x,
+    SecurityRestrictedLocation,
+    SelfExcluded,
+    SpainMigrationRequired,
+    SpanishTermsAcceptanceRequired,
+    StrongAuthCodeRequired,
+    Suspended,
+    SwedenBankIdVerificationRequired,
+    SwedenNationalIdentifierRequired,
+    TelbetTermsConditionsNa,
+    TemporaryBanTooManyRequests,
+    TradingMaster,
+    TradingMasterSuspended,
+    #[serde(other)]
+    Other,
 }
 
 /// Streaming order side (shorthand: B=Back, L=Lay).
@@ -982,7 +1061,6 @@ impl From<OrderSide> for BetfairSide {
         match value {
             OrderSide::Buy => Self::Lay,
             OrderSide::Sell => Self::Back,
-            _ => panic!("Invalid `OrderSide` for Betfair: {value}"),
         }
     }
 }
@@ -1020,7 +1098,7 @@ impl From<StreamingOrderType> for OrderType {
 /// Resolves the Nautilus `OrderStatus` for a Betfair order.
 ///
 /// `ExecutionComplete` is a terminal state covering fills, cancels, and
-/// lapses — the correct status depends on matched vs canceled quantities.
+/// lapses - the correct status depends on matched vs canceled quantities.
 #[must_use]
 pub fn resolve_order_status(
     status: BetfairOrderStatus,
@@ -1077,7 +1155,7 @@ impl From<MarketStatus> for NautilusMarketStatus {
             MarketStatus::Open => Self::Open,
             MarketStatus::Closed => Self::Closed,
             MarketStatus::Suspended => Self::Suspended,
-            MarketStatus::Inactive => Self::NotAvailable,
+            MarketStatus::Inactive | MarketStatus::Unknown => Self::NotAvailable,
         }
     }
 }
@@ -1117,6 +1195,28 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn test_reference_enums_tolerate_unmodeled_values() {
+        // Market reference enums must degrade gracefully on a new venue value
+        // rather than hard-fail deserialization of the streaming definition.
+        assert_eq!(
+            serde_json::from_str::<MarketStatus>("\"NEW_STATUS\"").unwrap(),
+            MarketStatus::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<MarketBettingType>("\"NEW_TYPE\"").unwrap(),
+            MarketBettingType::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<PriceLadderType>("\"NEW_LADDER\"").unwrap(),
+            PriceLadderType::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<RunnerStatus>("\"NEW_RUNNER\"").unwrap(),
+            RunnerStatus::Unknown
+        );
+    }
+
+    #[rstest]
     #[case(BetfairSide::Back, OrderSide::Sell)]
     #[case(BetfairSide::Lay, OrderSide::Buy)]
     fn test_betfair_side_to_order_side(#[case] input: BetfairSide, #[case] expected: OrderSide) {
@@ -1128,12 +1228,6 @@ mod tests {
     #[case(OrderSide::Sell, BetfairSide::Back)]
     fn test_order_side_to_betfair_side(#[case] input: OrderSide, #[case] expected: BetfairSide) {
         assert_eq!(BetfairSide::from(input), expected);
-    }
-
-    #[rstest]
-    #[should_panic(expected = "Invalid `OrderSide`")]
-    fn test_order_side_no_order_side_panics() {
-        let _ = BetfairSide::from(OrderSide::NoOrderSide);
     }
 
     #[rstest]

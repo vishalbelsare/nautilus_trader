@@ -16,7 +16,7 @@
 use std::fmt::Display;
 
 use derive_builder::Builder;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::identifiers::{
     AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId,
 };
@@ -24,17 +24,30 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Builder)]
 #[serde(tag = "type")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct QueryAccount {
     pub trader_id: TraderId,
     pub client_id: Option<ClientId>,
     pub account_id: AccountId,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
+    pub params: Option<Params>,
+    #[builder(default)]
+    pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl QueryAccount {
     /// Creates a new [`QueryAccount`] instance.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
         trader_id: TraderId,
@@ -42,6 +55,8 @@ impl QueryAccount {
         account_id: AccountId,
         command_id: UUID4,
         ts_init: UnixNanos,
+        params: Option<Params>,
+        correlation_id: Option<UUID4>,
     ) -> Self {
         Self {
             trader_id,
@@ -49,6 +64,9 @@ impl QueryAccount {
             account_id,
             command_id,
             ts_init,
+            params,
+            correlation_id,
+            causation_id: None,
         }
     }
 }
@@ -65,6 +83,14 @@ impl Display for QueryAccount {
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Builder)]
 #[serde(tag = "type")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.live", frozen, from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 pub struct QueryOrder {
     pub trader_id: TraderId,
     pub client_id: Option<ClientId>,
@@ -74,11 +100,17 @@ pub struct QueryOrder {
     pub venue_order_id: Option<VenueOrderId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
+    pub params: Option<Params>,
+    #[builder(default)]
+    pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl QueryOrder {
     /// Creates a new [`QueryOrder`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
         trader_id: TraderId,
@@ -89,6 +121,8 @@ impl QueryOrder {
         venue_order_id: Option<VenueOrderId>,
         command_id: UUID4,
         ts_init: UnixNanos,
+        params: Option<Params>,
+        correlation_id: Option<UUID4>,
     ) -> Self {
         Self {
             trader_id,
@@ -99,6 +133,9 @@ impl QueryOrder {
             venue_order_id,
             command_id,
             ts_init,
+            params,
+            correlation_id,
+            causation_id: None,
         }
     }
 }

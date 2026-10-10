@@ -30,6 +30,7 @@
 //! - `BINANCE_API_SECRET`: Ed25519 private key in PEM format (required)
 
 use futures_util::StreamExt;
+use jiff::{Timestamp, tz::Offset};
 use nautilus_binance::{
     common::{
         credential::resolve_credentials,
@@ -40,13 +41,13 @@ use nautilus_binance::{
         sbe::stream::mantissa_to_f64,
         websocket::streams::{
             client::BinanceSpotWebSocketClient,
-            messages::{BinanceSpotWsMessage, NautilusSpotDataWsMessage},
+            messages::BinanceSpotWsMessage,
             parse::{MarketDataMessage, decode_market_data},
         },
     },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_model::data::Data;
+use nautilus_network::websocket::TransportBackend;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,13 +57,13 @@ async fn main() -> anyhow::Result<()> {
     let (api_key, api_secret) = resolve_credentials(
         None,
         None,
-        BinanceEnvironment::Mainnet,
+        BinanceEnvironment::Live,
         BinanceProductType::Spot,
     )?;
 
     log::info!("Fetching instruments from Binance Spot API...");
     let http_client = BinanceSpotHttpClient::new(
-        BinanceEnvironment::Mainnet,
+        BinanceEnvironment::Live,
         get_atomic_clock_realtime(),
         None, // api_key (not needed for public endpoints)
         None, // api_secret
@@ -81,9 +82,10 @@ async fn main() -> anyhow::Result<()> {
         Some(api_key),
         Some(api_secret),
         None, // heartbeat
+        TransportBackend::default(),
     )?;
 
-    ws_client.cache_instruments(instruments);
+    ws_client.cache_instruments(&instruments);
 
     log::info!("Connecting to Binance Spot SBE WebSocket...");
     ws_client.connect().await?;
@@ -114,65 +116,59 @@ async fn main() -> anyhow::Result<()> {
                 message_count += 1;
 
                 match msg {
-                    BinanceSpotWsMessage::Data(data_msg) => match data_msg {
-                        NautilusSpotDataWsMessage::Data(data_vec) => {
-                            for data in &data_vec {
-                                match data {
-                                    Data::Trade(trade) => {
-                                        trade_count += 1;
-                                        log::info!(
-                                            "Trade: msg={message_count}, instrument={}, price={}, size={}, side={:?}, trade_id={}",
-                                            trade.instrument_id,
-                                            trade.price,
-                                            trade.size,
-                                            trade.aggressor_side,
-                                            trade.trade_id
-                                        );
-                                    }
-                                    Data::Quote(quote) => {
-                                        quote_count += 1;
-                                        log::info!(
-                                            "Quote: msg={message_count}, instrument={}, bid={}, ask={}, bid_size={}, ask_size={}",
-                                            quote.instrument_id,
-                                            quote.bid_price,
-                                            quote.ask_price,
-                                            quote.bid_size,
-                                            quote.ask_size
-                                        );
-                                    }
-                                    _ => {
-                                        log::debug!("Other data: msg={message_count}, data={data:?}");
-                                    }
-                                }
+                    BinanceSpotWsMessage::Trades(event) => {
+                        trade_count += event.trades.len() as u64;
+                        log::info!(
+                            "Trades: msg={message_count}, symbol={}, count={}",
+                            event.symbol,
+                            event.trades.len()
+                        );
+                    }
+                    BinanceSpotWsMessage::BestBidAsk(event) => {
+                        quote_count += 1;
+                        log::info!(
+                            "BBO: msg={message_count}, symbol={}",
+                            event.symbol
+                        );
+                    }
+                    BinanceSpotWsMessage::DepthSnapshot(event) => {
+                        log::info!(
+                            "Depth snapshot: msg={message_count}, symbol={}, bids={}, asks={}",
+                            event.symbol,
+                            event.bids.len(),
+                            event.asks.len()
+                        );
+                    }
+                    BinanceSpotWsMessage::DepthDiff(event) => {
+                        log::info!(
+                            "Depth diff: msg={message_count}, symbol={}, bids={}, asks={}",
+                            event.symbol,
+                            event.bids.len(),
+                            event.asks.len()
+                        );
+                    }
+                    BinanceSpotWsMessage::RawBinary(data) => {
+                        match decode_and_display_sbe(&data) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                log::warn!(
+                                    "Raw binary (decode failed): msg={message_count}, len={}, error={e}",
+                                    data.len()
+                                );
                             }
                         }
-                        NautilusSpotDataWsMessage::Deltas(deltas) => {
-                            log::info!(
-                                "OrderBook deltas: msg={message_count}, instrument={}, num_deltas={}",
-                                deltas.instrument_id,
-                                deltas.deltas.len()
-                            );
-                        }
-                        NautilusSpotDataWsMessage::RawBinary(data) => {
-                            match decode_and_display_sbe(&data) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    log::warn!(
-                                        "Raw binary (decode failed): msg={message_count}, len={}, error={e}",
-                                        data.len()
-                                    );
-                                }
-                            }
-                        }
-                        NautilusSpotDataWsMessage::RawJson(json) => {
-                            log::debug!("Raw JSON: msg={message_count}, json={json}");
-                        }
-                        NautilusSpotDataWsMessage::Instrument(inst) => {
-                            log::info!("Instrument: {inst:?}");
-                        }
-                    },
+                    }
+                    BinanceSpotWsMessage::RawJson(json) => {
+                        log::debug!("Raw JSON: msg={message_count}, json={json}");
+                    }
+                    BinanceSpotWsMessage::ServerShutdown(msg) => {
+                        log::warn!(
+                            "Server shutdown notice: event_time={}; disconnect expected within ~10 minutes",
+                            msg.event_time,
+                        );
+                    }
                     BinanceSpotWsMessage::Error(err) => {
-                        log::error!("WebSocket error: code={}, msg={}", err.code, err.msg);
+                        log::warn!("WebSocket error: code={}, msg={}", err.code, err.msg);
                     }
                     BinanceSpotWsMessage::Reconnected => {
                         log::warn!("WebSocket reconnected");
@@ -213,11 +209,15 @@ fn decode_and_display_sbe(data: &[u8]) -> anyhow::Result<()> {
                 let price = mantissa_to_f64(trade.price_mantissa, event.price_exponent);
                 let qty = mantissa_to_f64(trade.qty_mantissa, event.qty_exponent);
                 let side = if trade.is_buyer_maker { "SELL" } else { "BUY" };
-                let ts = chrono::DateTime::from_timestamp_micros(event.transact_time_us)
-                    .map_or_else(
-                        || "?".to_string(),
-                        |dt| dt.format("%H:%M:%S%.6f").to_string(),
-                    );
+                let ts = Timestamp::from_microsecond(event.transact_time_us).map_or_else(
+                    |_| "?".to_string(),
+                    |dt| {
+                        Offset::UTC
+                            .to_datetime(dt)
+                            .strftime("%H:%M:%S%.6f")
+                            .to_string()
+                    },
+                );
 
                 log::info!(
                     "Trade (raw SBE): symbol={}, side={side}, price={price:.2}, qty={qty:.6}, id={}, time={ts}",
@@ -231,9 +231,14 @@ fn decode_and_display_sbe(data: &[u8]) -> anyhow::Result<()> {
             let ask = mantissa_to_f64(event.ask_price_mantissa, event.price_exponent);
             let bid_size = mantissa_to_f64(event.bid_qty_mantissa, event.qty_exponent);
             let ask_size = mantissa_to_f64(event.ask_qty_mantissa, event.qty_exponent);
-            let ts = chrono::DateTime::from_timestamp_micros(event.event_time_us).map_or_else(
-                || "?".to_string(),
-                |dt| dt.format("%H:%M:%S%.6f").to_string(),
+            let ts = Timestamp::from_microsecond(event.event_time_us).map_or_else(
+                |_| "?".to_string(),
+                |dt| {
+                    Offset::UTC
+                        .to_datetime(dt)
+                        .strftime("%H:%M:%S%.6f")
+                        .to_string()
+                },
             );
 
             log::info!(

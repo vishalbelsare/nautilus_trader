@@ -48,7 +48,7 @@ impl TradeId {
         let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
         let value_str = binding.cast::<PyString>()?.extract::<&str>()?;
-        *self = Self::new(value_str);
+        *self = Self::new_checked(value_str).map_err(to_pyvalue_err)?;
         Ok(())
     }
 
@@ -67,7 +67,7 @@ impl TradeId {
         Self::from("NULL")
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn __richcmp__(&self, other: Py<PyAny>, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         if let Ok(other) = other.extract::<Self>(py) {
             match op {

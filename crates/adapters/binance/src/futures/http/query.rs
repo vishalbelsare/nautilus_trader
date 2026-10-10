@@ -16,7 +16,11 @@
 //! Binance Futures HTTP query parameter builders.
 
 use derive_builder::Builder;
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::common::enums::{
     BinanceAlgoType, BinanceFuturesOrderType, BinanceIncomeType, BinanceMarginType,
@@ -42,6 +46,26 @@ pub struct BinanceTradesParams {
     /// Trading symbol (required).
     pub symbol: String,
     /// Number of trades to return (default 500, max 1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Query parameters for `GET /fapi/v1/aggTrades` or `GET /dapi/v1/aggTrades`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option), default)]
+pub struct BinanceAggTradesParams {
+    /// Trading symbol.
+    pub symbol: String,
+    /// Aggregate trade ID to begin from, inclusive.
+    #[serde(rename = "fromId", skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<i64>,
+    /// Start time in milliseconds, inclusive.
+    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<i64>,
+    /// End time in milliseconds, inclusive.
+    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<i64>,
+    /// Number of aggregate trades to return (default 500, max 1000).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -124,6 +148,32 @@ pub struct BinanceOpenInterestParams {
     pub symbol: String,
 }
 
+/// Query parameters for `GET /futures/data/openInterestHist`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option), default)]
+pub struct BinanceOpenInterestHistParams {
+    /// Trading symbol for USD-M requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Trading pair for COIN-M requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair: Option<String>,
+    /// Contract type for COIN-M requests.
+    #[serde(rename = "contractType", skip_serializing_if = "Option::is_none")]
+    pub contract_type: Option<String>,
+    /// Aggregation period (e.g. "5m", "1h").
+    pub period: String,
+    /// Start time in milliseconds.
+    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<i64>,
+    /// End time in milliseconds.
+    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<i64>,
+    /// Number of results to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// Query parameters for `GET /fapi/v2/balance` or `GET /dapi/v1/balance`.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
@@ -148,6 +198,14 @@ pub struct BinancePositionRiskParams {
     /// Recv window override (ms).
     #[serde(rename = "recvWindow", skip_serializing_if = "Option::is_none")]
     pub recv_window: Option<u64>,
+}
+
+/// Query parameters for `GET /fapi/v1/commissionRate` or `GET /dapi/v1/commissionRate`.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into))]
+pub struct BinanceCommissionRateParams {
+    /// Trading symbol.
+    pub symbol: String,
 }
 
 /// Query parameters for `GET /fapi/v1/income` or `GET /dapi/v1/income`.
@@ -524,8 +582,11 @@ impl BatchCancelItem {
 pub struct BatchModifyItem {
     /// Trading symbol.
     pub symbol: String,
-    /// Order ID to modify.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Order ID to modify, serialized as a string because the batch endpoint rejects JSON numbers.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_batch_order_id"
+    )]
     pub order_id: Option<i64>,
     /// Original client order ID.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -539,11 +600,11 @@ pub struct BatchModifyItem {
 }
 
 /// Listen key request parameters.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenKeyParams {
     /// The listen key to extend or close.
-    pub listen_key: String,
+    pub listen_key: SecretString,
 }
 
 /// Query parameters for `POST /fapi/v1/algoOrder` (new algo order).
@@ -602,7 +663,7 @@ pub struct BinanceNewAlgoOrderParams {
     #[builder(default)]
     pub reduce_only: Option<bool>,
     /// Activation price for TRAILING_STOP_MARKET orders.
-    #[serde(rename = "activationPrice", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "activatePrice", skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub activation_price: Option<String>,
     /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
@@ -659,6 +720,10 @@ pub struct BinanceOpenAlgoOrdersParams {
 pub struct BinanceAllAlgoOrdersParams {
     /// Trading symbol (required).
     pub symbol: String,
+    /// Return orders with an algo order ID greater than or equal to this value.
+    #[serde(rename = "algoId", skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub algo_id: Option<i64>,
     /// Start time in milliseconds.
     #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
     #[builder(default)]
@@ -671,7 +736,7 @@ pub struct BinanceAllAlgoOrdersParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub page: Option<u32>,
-    /// Number of results per page (default 100, max 100).
+    /// Number of results (default 500, max 1000).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub limit: Option<u32>,
@@ -694,11 +759,39 @@ pub struct BinanceCancelAllAlgoOrdersParams {
     pub recv_window: Option<u64>,
 }
 
+fn serialize_batch_order_id<S: serde::Serializer>(
+    order_id: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match order_id {
+        Some(id) => serializer.collect_str(id),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use zeroize::Zeroize;
 
     use super::*;
+
+    #[rstest]
+    fn test_listen_key_params_preserve_wire_value_and_redact_debug() {
+        let mut params = ListenKeyParams {
+            listen_key: SecretString::from("listen-key-secret"),
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let debug = format!("{params:?}");
+
+        assert_eq!(serialized, "listenKey=listen-key-secret");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains(params.listen_key.expose_secret()));
+
+        params.zeroize();
+        assert!(params.listen_key.expose_secret().is_empty());
+    }
 
     #[rstest]
     fn test_depth_params_builder() {
@@ -720,6 +813,24 @@ mod tests {
 
         let serialized = serde_urlencoded::to_string(&params).unwrap();
         assert_eq!(serialized, "symbol=BTCUSDT");
+    }
+
+    #[rstest]
+    fn test_agg_trades_params_serialization() {
+        let params = BinanceAggTradesParams {
+            symbol: "BTCUSDT".to_string(),
+            from_id: Some(123),
+            start_time: Some(1_700_000_000_001),
+            end_time: Some(1_700_000_000_999),
+            limit: Some(456),
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+
+        assert_eq!(
+            serialized,
+            "symbol=BTCUSDT&fromId=123&startTime=1700000000001&endTime=1700000000999&limit=456"
+        );
     }
 
     #[rstest]
@@ -758,5 +869,96 @@ mod tests {
 
         assert_eq!(params.symbol.as_deref(), Some("BNBUSDT"));
         assert!(params.recv_window.is_none());
+    }
+
+    #[rstest]
+    fn test_new_algo_order_params_serialization_uses_activate_price() {
+        let params = BinanceNewAlgoOrderParamsBuilder::default()
+            .symbol("ETHUSDT")
+            .side(BinanceSide::Sell)
+            .order_type(BinanceFuturesOrderType::TrailingStopMarket)
+            .algo_type(BinanceAlgoType::Conditional)
+            .quantity("0.1")
+            .activation_price("10000.00")
+            .callback_rate("0.25")
+            .build()
+            .unwrap();
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert_eq!(query.get("activatePrice"), Some(&"10000.00".to_string()));
+        assert_eq!(query.get("callbackRate"), Some(&"0.25".to_string()));
+        assert!(!query.contains_key("activationPrice"));
+    }
+
+    #[rstest]
+    fn test_new_order_params_with_price_match_serializes_correctly() {
+        let params = BinanceNewOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceFuturesOrderType::Limit,
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            price: None,
+            new_client_order_id: Some("test-order-001".to_string()),
+            stop_price: None,
+            reduce_only: None,
+            position_side: None,
+            close_position: None,
+            activation_price: None,
+            callback_rate: None,
+            working_type: None,
+            price_protect: None,
+            new_order_resp_type: None,
+            good_till_date: None,
+            recv_window: None,
+            price_match: Some(BinancePriceMatch::Opponent5),
+            self_trade_prevention_mode: None,
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert_eq!(query.get("priceMatch"), Some(&"OPPONENT_5".to_string()));
+        assert!(!query.contains_key("price"));
+        assert_eq!(query.get("symbol"), Some(&"BTCUSDT".to_string()));
+        assert_eq!(query.get("side"), Some(&"BUY".to_string()));
+        assert_eq!(query.get("type"), Some(&"LIMIT".to_string()));
+    }
+
+    #[rstest]
+    fn test_new_order_params_without_price_match_omits_field() {
+        let params = BinanceNewOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceFuturesOrderType::Limit,
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            price: Some("50000.00".to_string()),
+            new_client_order_id: Some("test-order-002".to_string()),
+            stop_price: None,
+            reduce_only: None,
+            position_side: None,
+            close_position: None,
+            activation_price: None,
+            callback_rate: None,
+            working_type: None,
+            price_protect: None,
+            new_order_resp_type: None,
+            good_till_date: None,
+            recv_window: None,
+            price_match: None,
+            self_trade_prevention_mode: None,
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert!(!query.contains_key("priceMatch"));
+        assert_eq!(query.get("price"), Some(&"50000.00".to_string()));
     }
 }

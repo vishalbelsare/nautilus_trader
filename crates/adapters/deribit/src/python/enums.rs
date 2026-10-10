@@ -21,13 +21,12 @@ use nautilus_core::python::to_pyvalue_err;
 use pyo3::{PyTypeInfo, prelude::*, types::PyType};
 use strum::IntoEnumIterator;
 
-use crate::{
-    common::enums::{DeribitCurrency, DeribitProductType},
-    websocket::enums::DeribitUpdateInterval,
-};
+use crate::common::enums::{DeribitCurrency, DeribitEnvironment, DeribitProductType};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DeribitCurrency {
+    /// Deribit currency.
     #[new]
     fn py_new(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let t = Self::type_object(py);
@@ -78,7 +77,9 @@ impl DeribitCurrency {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DeribitProductType {
+    /// Deribit product type.
     #[new]
     fn py_new(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let t = Self::type_object(py);
@@ -129,24 +130,17 @@ impl DeribitProductType {
 }
 
 #[pymethods]
-impl DeribitUpdateInterval {
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DeribitEnvironment {
+    /// Deribit API environment.
     #[new]
     fn py_new(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let t = Self::type_object(py);
         Self::py_from_str(&t, value)
     }
 
-    fn __hash__(&self) -> isize {
+    const fn __hash__(&self) -> isize {
         *self as isize
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "<{}.{}: '{}'>",
-            stringify!(DeribitUpdateInterval),
-            self.name(),
-            self.value(),
-        )
     }
 
     fn __str__(&self) -> String {
@@ -155,8 +149,8 @@ impl DeribitUpdateInterval {
 
     #[getter]
     #[must_use]
-    pub fn name(&self) -> &str {
-        self.as_ref()
+    pub fn name(&self) -> String {
+        self.to_string()
     }
 
     #[getter]
@@ -165,9 +159,9 @@ impl DeribitUpdateInterval {
         *self as u8
     }
 
-    #[staticmethod]
+    #[classmethod]
     #[must_use]
-    fn variants() -> Vec<String> {
+    fn variants(_: &Bound<'_, PyType>) -> Vec<String> {
         Self::iter().map(|x| x.to_string()).collect()
     }
 

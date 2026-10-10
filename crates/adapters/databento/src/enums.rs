@@ -15,10 +15,7 @@
 
 //! Enumerations for the Databento integration.
 
-use std::str::FromStr;
-
 use nautilus_model::{enum_strum_serde, enums::FromU8};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
 
 /// Represents a Databento statistic type.
@@ -46,9 +43,13 @@ use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
         eq,
         eq_int,
         rename_all = "SCREAMING_SNAKE_CASE",
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
+        module = "nautilus_trader.adapters.databento",
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.databento")
 )]
 pub enum DatabentoStatisticType {
     OpeningPrice = 1,
@@ -64,6 +65,13 @@ pub enum DatabentoStatisticType {
     ClosePrice = 11,
     NetChange = 12,
     Vwap = 13,
+    Volatility = 14,
+    Delta = 15,
+    UncrossingPrice = 16,
+    UpperPriceLimit = 17,
+    LowerPriceLimit = 18,
+    BlockVolume = 19,
+    IndicativeClosePrice = 20,
 }
 
 impl FromU8 for DatabentoStatisticType {
@@ -82,6 +90,13 @@ impl FromU8 for DatabentoStatisticType {
             11 => Some(Self::ClosePrice),
             12 => Some(Self::NetChange),
             13 => Some(Self::Vwap),
+            14 => Some(Self::Volatility),
+            15 => Some(Self::Delta),
+            16 => Some(Self::UncrossingPrice),
+            17 => Some(Self::UpperPriceLimit),
+            18 => Some(Self::LowerPriceLimit),
+            19 => Some(Self::BlockVolume),
+            20 => Some(Self::IndicativeClosePrice),
             _ => None,
         }
     }
@@ -112,9 +127,13 @@ impl FromU8 for DatabentoStatisticType {
         eq,
         eq_int,
         rename_all = "SCREAMING_SNAKE_CASE",
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
+        module = "nautilus_trader.adapters.databento",
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.databento")
 )]
 pub enum DatabentoStatisticUpdateAction {
     Added = 1,

@@ -15,11 +15,11 @@
 
 #[cfg(feature = "python")]
 use std::collections::HashSet;
-#[cfg(feature = "python")]
-use std::sync::RwLock;
 use std::{any::Any, fmt::Debug, sync::Arc};
 
 use nautilus_core::UnixNanos;
+#[cfg(feature = "python")]
+use parking_lot::RwLock;
 #[cfg(feature = "python")]
 use pyo3::{IntoPyObjectExt, prelude::*, types::PyAny};
 use serde::{Serialize, Serializer};
@@ -35,26 +35,19 @@ fn intern_type_name_static(name: String) -> &'static str {
         std::sync::OnceLock::new();
     let set = INTERNER.get_or_init(|| RwLock::new(HashSet::new()));
 
-    if let Ok(guard) = set.read()
-        && guard.contains(name.as_str())
-    {
-        return guard.get(name.as_str()).copied().unwrap();
+    let guard = set.read();
+    if let Some(&existing) = guard.get(name.as_str()) {
+        return existing;
     }
+    drop(guard);
 
-    match set.write() {
-        Ok(mut guard) => {
-            if let Some(&existing) = guard.get(name.as_str()) {
-                return existing;
-            }
-            let leaked: &'static str = Box::leak(name.into_boxed_str());
-            guard.insert(leaked);
-            leaked
-        }
-        Err(_) => {
-            log::warn!("intern_type_name_static: RwLock poisoned, interning skipped for type name");
-            Box::leak(name.into_boxed_str())
-        }
+    let mut guard = set.write();
+    if let Some(&existing) = guard.get(name.as_str()) {
+        return existing;
     }
+    let leaked: &'static str = Box::leak(name.into_boxed_str());
+    guard.insert(leaked);
+    leaked
 }
 
 /// Wraps a Python custom data object so it can participate in the Rust data
@@ -67,13 +60,13 @@ fn intern_type_name_static(name: String) -> &'static str {
 pub struct PythonCustomDataWrapper {
     /// The Python object implementing the custom data interface.
     py_object: Py<PyAny>,
-    /// Cached ts_event value (extracted once at construction).
+    /// Cached `ts_event` value (extracted once at construction).
     cached_ts_event: UnixNanos,
-    /// Cached ts_init value (extracted once at construction).
+    /// Cached `ts_init` value (extracted once at construction).
     cached_ts_init: UnixNanos,
     /// Cached type name (extracted once at construction).
     cached_type_name: String,
-    /// Leaked static string for type_name() return (required by trait signature).
+    /// Leaked static string for `type_name()` return (required by trait signature).
     cached_type_name_static: &'static str,
 }
 
@@ -144,7 +137,9 @@ impl Clone for PythonCustomDataWrapper {
 impl Debug for PythonCustomDataWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(PythonCustomDataWrapper))
+            .field("py_object", &self.py_object)
             .field("type_name", &self.cached_type_name)
+            .field("type_name_static", &self.cached_type_name_static)
             .field("ts_event", &self.cached_ts_event)
             .field("ts_init", &self.cached_ts_init)
             .finish()
@@ -234,6 +229,7 @@ pub fn register_python_data_class(type_name: &str, data_class: &Bound<'_, PyAny>
 }
 
 #[cfg(feature = "python")]
+#[must_use]
 pub fn get_python_data_class(py: Python<'_>, type_name: &str) -> Option<Py<PyAny>> {
     python_data_classes()
         .get(type_name)
@@ -261,7 +257,7 @@ pub fn reconstruct_python_custom_data(
     data_class
         .bind(py)
         .call_method1("from_json", (payload,))
-        .map(|obj| obj.unbind())
+        .map(Bound::unbind)
 }
 
 /// Converts a cloneable PyO3-backed custom data value into a Python object.
@@ -326,6 +322,7 @@ pub trait CustomDataTrait: HasTsInit + Send + Sync + Debug {
     }
 
     /// Returns the type name used in serialized form (e.g. in the `"type"` field).
+    #[must_use]
     fn type_name_static() -> &'static str
     where
         Self: Sized,
@@ -362,7 +359,7 @@ pub fn register_custom_data_json<T: CustomDataTrait + Sized>() -> anyhow::Result
 /// Idempotent: safe to call multiple times for the same type (e.g. module init).
 ///
 /// # Errors
-/// Does not return an error (idempotent insert into DashMap).
+/// Does not return an error (idempotent insert into `DashMap`).
 pub fn ensure_custom_data_json_registered<T: CustomDataTrait + Sized>() -> anyhow::Result<()> {
     let type_name = T::type_name_static();
     ensure_json_deserializer_registered(type_name, Box::new(|value| T::from_json(value)))
@@ -375,11 +372,7 @@ pub fn ensure_custom_data_json_registered<T: CustomDataTrait + Sized>() -> anyho
 /// Custom data is always Rust-defined (optionally with PyO3 bindings).
 #[cfg_attr(
     feature = "python",
-    pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.model",
-        name = "CustomData",
-        from_py_object
-    )
+    pyclass(module = "nautilus_trader.model", name = "CustomData", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -439,17 +432,17 @@ pub(crate) fn parse_custom_data_from_json_bytes(
 }
 
 impl CustomData {
-    /// Deserializes CustomData from JSON bytes (full CustomData format with type and data_type).
+    /// Deserializes `CustomData` from JSON bytes (full `CustomData` format with type and `data_type`).
     ///
     /// # Errors
     ///
-    /// Returns an error if the bytes are not valid JSON or do not represent CustomData.
+    /// Returns an error if the bytes are not valid JSON or do not represent `CustomData`.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         parse_custom_data_from_json_bytes(bytes)
     }
 }
 
-/// Canonical JSON envelope for CustomData. All serialized CustomData uses this shape so
+/// Canonical JSON envelope for `CustomData`. All serialized `CustomData` uses this shape so
 /// deserialization can extract the payload without depending on user payload field names.
 struct CustomDataEnvelope {
     type_name: String,

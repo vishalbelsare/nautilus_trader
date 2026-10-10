@@ -16,13 +16,21 @@
 //! Builder types for Bybit REST query parameters and filters.
 
 use derive_builder::Builder;
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-use crate::common::enums::{
-    BybitAccountType, BybitExecType, BybitInstrumentStatus, BybitKlineInterval, BybitMarginMode,
-    BybitOpenOnly, BybitOptionType, BybitOrderFilter, BybitOrderSide, BybitOrderStatus,
-    BybitOrderType, BybitPositionIdx, BybitPositionMode, BybitProductType, BybitTimeInForce,
-    BybitTpSlMode, BybitTriggerDirection, BybitTriggerType,
+use crate::common::{
+    enums::{
+        BybitAccountType, BybitBboSideType, BybitExecType, BybitInstrumentStatus,
+        BybitKlineInterval, BybitMarginMode, BybitMarketUnit, BybitOpenOnly, BybitOptionType,
+        BybitOrderFilter, BybitOrderSide, BybitOrderSmpType, BybitOrderStatus, BybitOrderType,
+        BybitPositionIdx, BybitPositionMode, BybitProductType, BybitStopOrderType,
+        BybitTimeInForce, BybitTpSlMode, BybitTriggerDirection, BybitTriggerType,
+    },
+    parse::opt_bool_as_int,
 };
 
 /// Query parameters for `GET /v5/market/instruments-info`.
@@ -366,6 +374,25 @@ pub struct BybitNoConvertRepayParams {
     pub amount: Option<String>,
 }
 
+/// Body parameters for `POST /v5/account/repay`.
+///
+/// # References
+///
+/// - <https://bybit-exchange.github.io/docs/v5/account/repay>
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct BybitRepayParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub coin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub repayment_type: Option<String>,
+}
+
 /// Order entry payload for `POST /v5/order/create-batch`.
 ///
 /// # References
@@ -385,13 +412,13 @@ pub struct BybitBatchPlaceOrderEntry {
     pub price: Option<String>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub market_unit: Option<String>,
+    pub market_unit: Option<BybitMarketUnit>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_direction: Option<BybitTriggerDirection>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub order_filter: Option<String>,
+    pub order_filter: Option<BybitOrderFilter>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<String>,
@@ -406,7 +433,7 @@ pub struct BybitBatchPlaceOrderEntry {
     pub time_in_force: Option<BybitTimeInForce>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub position_idx: Option<i32>,
+    pub position_idx: Option<BybitPositionIdx>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
@@ -431,7 +458,7 @@ pub struct BybitBatchPlaceOrderEntry {
     pub close_on_trigger: Option<bool>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub smp_type: Option<String>,
+    pub smp_type: Option<BybitOrderSmpType>,
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mmp: Option<bool>,
@@ -450,6 +477,12 @@ pub struct BybitBatchPlaceOrderEntry {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_order_type: Option<BybitOrderType>,
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbo_side_type: Option<BybitBboSideType>,
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbo_level: Option<String>,
 }
 
 /// Body parameters for `POST /v5/order/create-batch`.
@@ -461,6 +494,51 @@ pub struct BybitBatchPlaceOrderEntry {
 pub struct BybitBatchPlaceOrderParams {
     pub category: BybitProductType,
     pub request: Vec<BybitBatchPlaceOrderEntry>,
+}
+
+/// Native TP/SL and option-specific fields that map onto the `POST /v5/order/create` entry.
+///
+/// Bundled to keep the `submit_order` signature manageable, and to give the demo HTTP path
+/// access to the same fields the mainnet WS path supports via
+/// [`crate::websocket::messages::BybitWsPlaceOrderParams`]. All fields are optional; populated
+/// fields are written onto the entry builder as-is. `tpsl_mode` defaults to `Full` upstream when
+/// only `take_profit` / `stop_loss` are set without an explicit mode.
+///
+/// `tp_trigger_price` / `sl_trigger_price` are intentionally absent: the create-order entry does
+/// not carry them (the mainnet WS Trade API does, via separate fields).
+#[derive(Debug, Clone, Default)]
+pub struct BybitNativeTpSlParams {
+    pub take_profit: Option<String>,
+    pub stop_loss: Option<String>,
+    pub tp_trigger_by: Option<BybitTriggerType>,
+    pub sl_trigger_by: Option<BybitTriggerType>,
+    pub tp_order_type: Option<BybitOrderType>,
+    pub sl_order_type: Option<BybitOrderType>,
+    pub tp_limit_price: Option<String>,
+    pub sl_limit_price: Option<String>,
+    pub tpsl_mode: Option<BybitTpSlMode>,
+    pub close_on_trigger: Option<bool>,
+    pub order_iv: Option<String>,
+    pub mmp: Option<bool>,
+}
+
+impl BybitNativeTpSlParams {
+    /// Returns `true` if no TP/SL or option-specific field is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.take_profit.is_none()
+            && self.stop_loss.is_none()
+            && self.tp_trigger_by.is_none()
+            && self.sl_trigger_by.is_none()
+            && self.tp_order_type.is_none()
+            && self.sl_order_type.is_none()
+            && self.tp_limit_price.is_none()
+            && self.sl_limit_price.is_none()
+            && self.tpsl_mode.is_none()
+            && self.close_on_trigger.is_none()
+            && self.order_iv.is_none()
+            && self.mmp.is_none()
+    }
 }
 
 /// Body parameters for `POST /v5/order/create`.
@@ -489,34 +567,48 @@ pub struct BybitPlaceOrderParams {
 #[serde(rename_all = "camelCase")]
 pub struct BybitBatchAmendOrderEntry {
     pub symbol: String,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub order_id: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_iv: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qty: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpsl_mode: Option<BybitTpSlMode>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_loss: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_by: Option<BybitTriggerType>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp_limit_price: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sl_limit_price: Option<String>,
 }
@@ -552,14 +644,17 @@ pub struct BybitAmendOrderParams {
 #[serde(rename_all = "camelCase")]
 pub struct BybitBatchCancelOrderEntry {
     pub symbol: String,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub order_id: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
     pub order_link_id: Option<String>,
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub order_filter: Option<String>,
+    pub order_filter: Option<BybitOrderFilter>,
 }
 
 /// Body parameters for `POST /v5/order/cancel-batch`.
@@ -606,10 +701,10 @@ pub struct BybitCancelAllOrdersParams {
     pub settle_coin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
-    pub order_filter: Option<String>,
+    pub order_filter: Option<BybitOrderFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
-    pub stop_order_type: Option<String>,
+    pub stop_order_type: Option<BybitStopOrderType>,
 }
 
 /// Query parameters for `GET /v5/order/realtime`.
@@ -740,22 +835,260 @@ pub struct BybitTradeHistoryParams {
     pub cursor: Option<String>,
 }
 
-/// Body parameters for `POST /v5/user/update-sub-api`.
+/// Request-side permission patch for API-key update endpoints (`PascalCase`).
+///
+/// Kept separate from the response-side
+/// [`crate::http::models::BybitApiKeyPermissions`]: every field here is
+/// `Option<Vec<String>>` with `skip_serializing_if`, so an unset bucket is
+/// omitted from the request body entirely rather than being serialized as an
+/// explicit empty array (which the venue treats as "clear all permissions").
+///
+/// The field set is the superset of the master and sub-account permission
+/// tables. Buckets that only appear for master-account keys (`FiatP2P`,
+/// `FiatBybitPay`, `FiatBitPay`, `FiatConvertBroker`, `BitCard`, `ByXPost`)
+/// must not be set when calling `POST /v5/user/update-sub-api`; callers are
+/// expected to only populate the buckets documented for the endpoint being
+/// invoked.
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/user/modify-sub-apikey>
+/// - <https://bybit-exchange.github.io/docs/v5/user/modify-master-apikey>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[serde(rename_all = "PascalCase")]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+pub struct BybitApiKeyPermissionUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_trade: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivatives: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earn: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affiliate: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_trade: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_trading: Option<Vec<String>>,
+    // Bybit ships this key uppercase (`"NFT"`); the struct-level PascalCase
+    // rule would otherwise emit `"Nft"` and the venue would ignore the field.
+    #[serde(rename = "NFT", skip_serializing_if = "Option::is_none")]
+    pub nft: Option<Vec<String>>,
+    // Bybit uses `"FiatP2P"` - PascalCase rename would emit `"FiatP2p"`.
+    #[serde(rename = "FiatP2P", skip_serializing_if = "Option::is_none")]
+    pub fiat_p2p: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fiat_bybit_pay: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fiat_bit_pay: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fiat_convert_broker: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_card: Option<Vec<String>>,
+    // Bybit uses `"ByXPost"` - PascalCase rename would emit `"ByxPost"`.
+    #[serde(rename = "ByXPost", skip_serializing_if = "Option::is_none")]
+    pub byx_post: Option<Vec<String>>,
+}
+
+/// Body parameters for `POST /v5/user/update-sub-api`.
+///
+/// `api_key` is only required when a master key is editing a sub-account key;
+/// it is omitted when a sub key edits itself.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/user/modify-sub-apikey>
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Builder)]
+#[serde(rename_all = "camelCase")]
+#[builder(setter(into))]
+pub struct BybitUpdateSubApiParams {
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub api_key: Option<SecretString>,
+    // Bybit accepts `readOnly` as a 0/1 integer on the wire; the builder takes
+    // a `bool` and `opt_bool_as_int` serializes it to match.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none", with = "opt_bool_as_int")]
+    #[builder(setter(strip_option))]
+    pub read_only: Option<bool>,
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub ips: Option<String>,
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub permissions: Option<BybitApiKeyPermissionUpdate>,
+}
+
+impl Zeroize for BybitUpdateSubApiParams {
+    fn zeroize(&mut self) {
+        self.api_key.zeroize();
+    }
+}
+
+/// Body parameters for `POST /v5/user/update-api`.
+///
+/// Can only modify the caller's own master key.
+///
+/// The official request parameter table lists only `readOnly` and
+/// `permissions`; `ips` appears in the response but is not a request field,
+/// so it is deliberately excluded here.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/user/modify-master-apikey>
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
 #[builder(default)]
 #[builder(setter(into))]
-pub struct BybitUpdateSubApiParams {
+pub struct BybitUpdateMasterApiParams {
+    #[serde(skip_serializing_if = "Option::is_none", with = "opt_bool_as_int")]
+    #[builder(setter(strip_option))]
+    pub read_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
-    pub api_key: Option<String>,
+    pub permissions: Option<BybitApiKeyPermissionUpdate>,
+}
+
+/// Query parameters for cursor-paginated sub-account listings.
+///
+/// Shared by `GET /v5/user/submembers` and `GET /v5/user/escrow_sub_members`,
+/// which take the same pagination shape (`pageSize` up to 100 plus
+/// `nextCursor`). Bybit documents `pageSize` as a string, but the URL encoder
+/// serializes any numeric value as text anyway, so `u32` is used on the Rust
+/// side for compile-time type safety.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/user/page-subuid>
+/// - <https://bybit-exchange.github.io/docs/v5/user/fund-subuid-list>
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[serde(rename_all = "camelCase")]
+#[builder(default)]
+#[builder(setter(into))]
+pub struct BybitSubMembersPageParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
-    pub read_only: Option<i32>,
+    pub page_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(setter(strip_option))]
-    pub ips: Option<String>,
+    pub next_cursor: Option<String>,
+}
+
+/// Query parameters for `GET /v5/user/sub-apikeys`.
+///
+/// `sub_member_id` is required, so this struct intentionally does not carry
+/// `#[builder(default)]`; the generated builder returns `Err` when the field
+/// is missing, matching the convention used by `BybitBorrowParams`.
+///
+/// # References
+/// - <https://bybit-exchange.github.io/docs/v5/user/list-sub-apikeys>
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[serde(rename_all = "camelCase")]
+#[builder(setter(into))]
+pub struct BybitSubApiKeysParams {
+    pub sub_member_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option), default)]
+    pub cursor: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use zeroize::Zeroize;
+
+    use super::*;
+
+    #[rstest]
+    fn test_update_sub_api_preserves_wire_value_and_redacts_debug() {
+        let mut params = BybitUpdateSubApiParamsBuilder::default()
+            .api_key("sub-api-key-secret".to_string())
+            .read_only(true)
+            .build()
+            .unwrap();
+
+        let value = serde_json::to_value(&params).unwrap();
+        let debug = format!("{params:?}");
+
+        assert_eq!(value["apiKey"], "sub-api-key-secret");
+        assert_eq!(value["readOnly"], 1);
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("sub-api-key-secret"));
+
+        params.zeroize();
+        assert!(params.api_key.is_none());
+    }
+
+    #[rstest]
+    fn test_amend_entry_builds_with_only_order_id() {
+        let entry = BybitBatchAmendOrderEntryBuilder::default()
+            .symbol("ETHUSDT".to_string())
+            .order_id("12345".to_string())
+            .price(Some("1600.0".to_string()))
+            .build()
+            .expect("amend entry should build with only order_id");
+
+        assert_eq!(entry.order_id.as_deref(), Some("12345"));
+        assert_eq!(entry.order_link_id, None);
+    }
+
+    #[rstest]
+    fn test_amend_entry_builds_with_only_order_link_id() {
+        let entry = BybitBatchAmendOrderEntryBuilder::default()
+            .symbol("ETHUSDT".to_string())
+            .order_link_id("link-1".to_string())
+            .qty(Some("0.02".to_string()))
+            .build()
+            .expect("amend entry should build with only order_link_id");
+
+        assert_eq!(entry.order_link_id.as_deref(), Some("link-1"));
+        assert_eq!(entry.order_id, None);
+    }
+
+    #[rstest]
+    fn test_amend_entry_builds_with_no_identifiers() {
+        let entry = BybitBatchAmendOrderEntryBuilder::default()
+            .symbol("ETHUSDT".to_string())
+            .price(Some("1600.0".to_string()))
+            .build()
+            .expect("amend entry optional identifiers default to None");
+
+        assert_eq!(entry.order_id, None);
+        assert_eq!(entry.order_link_id, None);
+    }
+
+    #[rstest]
+    fn test_cancel_entry_builds_with_only_order_id() {
+        let entry = BybitBatchCancelOrderEntryBuilder::default()
+            .symbol("ETHUSDT".to_string())
+            .order_id("12345".to_string())
+            .build()
+            .expect("cancel entry should build with only order_id");
+
+        assert_eq!(entry.order_id.as_deref(), Some("12345"));
+        assert_eq!(entry.order_link_id, None);
+    }
+
+    #[rstest]
+    fn test_cancel_entry_builds_with_only_order_link_id() {
+        let entry = BybitBatchCancelOrderEntryBuilder::default()
+            .symbol("ETHUSDT".to_string())
+            .order_link_id("link-1".to_string())
+            .build()
+            .expect("cancel entry should build with only order_link_id");
+
+        assert_eq!(entry.order_link_id.as_deref(), Some("link-1"));
+        assert_eq!(entry.order_id, None);
+    }
 }

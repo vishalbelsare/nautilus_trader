@@ -50,7 +50,7 @@ use crate::{
 impl StopLimitOrder {
     /// Creates a new `StopLimitOrder` instance.
     #[new]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, order_side, quantity, price, trigger_price, trigger_type, time_in_force, post_only, reduce_only, quote_quantity, init_id, ts_init, expire_time=None, display_qty=None, emulation_trigger=None, trigger_instrument_id=None, contingency_type=None, order_list_id=None, linked_order_ids=None, parent_order_id=None, exec_algorithm_id=None, exec_algorithm_params=None, exec_spawn_id=None, tags=None))]
     fn py_new(
         trader_id: TraderId,
@@ -131,8 +131,8 @@ impl StopLimitOrder {
 
     #[staticmethod]
     #[pyo3(name = "create")]
-    fn py_create(init: OrderInitialized) -> Self {
-        Self::from(init)
+    fn py_create(init: OrderInitialized) -> PyResult<Self> {
+        Self::try_from(init).map_err(to_pyvalue_err)
     }
 
     #[staticmethod]
@@ -143,7 +143,7 @@ impl StopLimitOrder {
 
     #[staticmethod]
     #[pyo3(name = "closing_side")]
-    fn py_closing_side(side: PositionSide) -> OrderSide {
+    fn py_closing_side(side: PositionSide) -> Option<OrderSide> {
         OrderCore::closing_side(side)
     }
 
@@ -373,10 +373,9 @@ impl StopLimitOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
-    #[getter]
     #[pyo3(name = "events")]
     fn py_events(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.events()
@@ -397,7 +396,7 @@ impl StopLimitOrder {
 
     #[pyo3(name = "apply")]
     fn py_apply(&mut self, event: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
-        let event_any = pyobject_to_order_event(py, event).unwrap();
+        let event_any = pyobject_to_order_event(py, event)?;
         self.apply(event_any).map_err(to_pyruntime_err)
     }
 
@@ -425,7 +424,8 @@ impl StopLimitOrder {
         let reduce_only = get_required::<bool>(values, "is_reduce_only")?;
         let quote_quantity = get_required::<bool>(values, "is_quote_quantity")?;
         let expire_time = get_optional::<u64>(values, "expire_time_ns")?.map(UnixNanos::from);
-        let display_quantity = get_optional::<Quantity>(values, "display_qty")?;
+        let display_quantity =
+            get_optional_parsed(values, "display_qty", |s| Ok(Quantity::from(s.as_str())))?;
         let emulation_trigger = get_optional_parsed(values, "emulation_trigger", |s| {
             s.parse::<TriggerType>().map_err(|e| e.to_string())
         })?;
@@ -460,7 +460,7 @@ impl StopLimitOrder {
             .map(|vec| vec.iter().map(|s| Ustr::from(s)).collect());
         let init_id = get_required_parsed(values, "init_id", |s| s.parse::<UUID4>())?;
         let ts_init = get_required::<u64>(values, "ts_init")?;
-        let stop_limit_order = Self::new(
+        let stop_limit_order = Self::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -488,7 +488,8 @@ impl StopLimitOrder {
             tags,
             init_id,
             ts_init.into(),
-        );
+        )
+        .map_err(to_pyvalue_err)?;
         Ok(stop_limit_order)
     }
 
@@ -529,7 +530,7 @@ impl StopLimitOrder {
         )?;
         self.avg_px.map_or_else(
             || dict.set_item("avg_px", py.None()),
-            |x| dict.set_item("avg_px", x),
+            |x| dict.set_item("avg_px", x.to_string()),
         )?;
         self.position_id.map_or_else(
             || dict.set_item("position_id", py.None()),
@@ -541,7 +542,7 @@ impl StopLimitOrder {
         )?;
         self.slippage.map_or_else(
             || dict.set_item("slippage", py.None()),
-            |x| dict.set_item("slippage", x),
+            |x| dict.set_item("slippage", x.to_string()),
         )?;
         self.account_id.map_or_else(
             || dict.set_item("account_id", py.None()),
@@ -559,7 +560,10 @@ impl StopLimitOrder {
             || dict.set_item("emulation_trigger", py.None()),
             |x| dict.set_item("emulation_trigger", x.to_string()),
         )?;
-        dict.set_item("trigger_instrument_id", self.trigger_instrument_id)?;
+        self.trigger_instrument_id.map_or_else(
+            || dict.set_item("trigger_instrument_id", py.None()),
+            |x| dict.set_item("trigger_instrument_id", x.to_string()),
+        )?;
         self.contingency_type.map_or_else(
             || dict.set_item("contingency_type", py.None()),
             |x| dict.set_item("contingency_type", x.to_string()),
@@ -598,7 +602,7 @@ impl StopLimitOrder {
             "tags",
             self.tags
                 .as_ref()
-                .map(|vec| vec.iter().map(|s| s.to_string()).collect::<Vec<String>>()),
+                .map(|vec| vec.iter().map(ToString::to_string).collect::<Vec<String>>()),
         )?;
         Ok(dict.into())
     }

@@ -1,101 +1,91 @@
 # %% [markdown]
-# # Backtest (low-level API)
+# # Backtest (Low-Level API)
 #
-# Tutorial for [NautilusTrader](https://nautilustrader.io/docs/latest/) a high-performance algorithmic trading platform and event-driven backtester.
+# Use `BacktestEngine` for direct component access: load market data, wire up
+# strategies and execution algorithms, and run backtests with full control over
+# every step. This tutorial backtests an EMA cross strategy with a TWAP execution
+# algorithm on a simulated Binance Spot exchange using historical trade tick data.
 #
 # [View source on GitHub](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/getting_started/backtest_low_level.py).
 
 # %% [markdown]
-# ## Overview
-#
-# This tutorial walks through how to use a `BacktestEngine` to backtest a simple EMA cross strategy
-# with a TWAP execution algorithm on a simulated Binance Spot exchange using historical trade tick data.
-#
-# The following points will be covered:
-# - Load raw data (external to Nautilus) using data loaders and wranglers.
-# - Add this data to a `BacktestEngine`.
-# - Add venues, strategies, and execution algorithms to a `BacktestEngine`.
-# - Run backtests with a `BacktestEngine`.
-# - Perform post-run analysis and repeated runs.
-#
-
-# %% [markdown]
 # ## Prerequisites
-# - Python 3.12+ installed.
-# - [NautilusTrader](https://pypi.org/project/nautilus_trader/) latest release installed (`uv pip install nautilus_trader`).
-
-# %% [markdown]
-# ## Imports
-#
-# We'll start with all of our imports for the remainder of this tutorial.
+# - Python 3.13-3.14
+# - [NautilusTrader](https://pypi.org/project/nautilus_trader/) 2.x installed
+#   (`pip install -U --pre nautilus_trader`). The `--pre` flag is required while 2.x
+#   ships as `2.0.0rcN`.
+# - pandas (`pip install pandas`), used by the reports at the end. The wheel
+#   declares no runtime dependencies.
 
 # %%
 from decimal import Decimal
 
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm
-from nautilus_trader.examples.strategies.ema_cross_twap import EMACrossTWAP
-from nautilus_trader.examples.strategies.ema_cross_twap import EMACrossTWAPConfig
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.config import ExecutionAlgorithmConfig
+from nautilus_trader.config import LoggerConfig
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.indicators import ExponentialMovingAverage
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
+from nautilus_trader.model import ExecAlgorithmId
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderSide
 from nautilus_trader.model import TraderId
 from nautilus_trader.model import Venue
-from nautilus_trader.model.currencies import ETH
-from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.persistence.wranglers import TradeTickDataWrangler
-from nautilus_trader.test_kit.providers import TestDataProvider
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.testkit.providers import TestDataProvider
+from nautilus_trader.testkit.providers import TestInstrumentProvider
+from nautilus_trader.trading import Strategy
+
 
 # %% [markdown]
-# ## Loading data
+# ## Load data
 #
-# For this tutorial we use stub test data from the NautilusTrader repository (the automated test suite also uses this data to verify platform correctness).
-#
-# First, instantiate a data provider to read raw CSV trade tick data into a `pd.DataFrame`.
-# Next, initialize the matching instrument (`ETHUSDT` spot on Binance).
-# Then wrangle the data into Nautilus `TradeTick` objects to add to the `BacktestEngine`.
-#
+# Load sample test data (ETHUSDT trades from Binance), initialize the matching
+# instrument, and build Nautilus `TradeTick` objects from the CSV. `TestDataProvider`
+# reads the CSV from the local `test_data/` directory in a source checkout and
+# downloads it from GitHub otherwise, so a wheel install needs network access.
 
 # %%
-# Load stub test data
-provider = TestDataProvider()
-trades_df = provider.read_csv_ticks("binance/ethusdt-trades.csv")
-
 # Initialize the instrument which matches the data
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 
-# Process into Nautilus objects
-wrangler = TradeTickDataWrangler(instrument=ETHUSDT_BINANCE)
-ticks = wrangler.process(trades_df)
+# Build Nautilus trade ticks from the sample Binance CSV
+ticks = TestDataProvider.trades_from_binance_csv(
+    ETHUSDT_BINANCE,
+    "binance/ethusdt-trades.csv",
+)
 
 # %% [markdown]
-# See the [Loading External Data](https://nautilustrader.io/docs/latest/concepts/data#loading-data) guide for details on the data processing pipeline.
+# See the [Data](../concepts/data/) concept guide for details on the data processing pipeline.
 
 # %% [markdown]
-# ## Initialize a backtest engine
+# ## Initialize the engine
 #
-# Create a `BacktestEngine`. Here we pass a `BacktestEngineConfig` with a custom `trader_id` to show the configuration pattern.
-#
-# See the [Configuration](https://nautilustrader.io/docs/api_reference/config) API reference for all available options.
-#
+# Pass a `BacktestEngineConfig` to configure the engine. Here we set a custom
+# `trader_id` to show the pattern.
 
 # %%
 # Configure backtest engine
-config = BacktestEngineConfig(trader_id=TraderId("BACKTESTER-001"))
+config = BacktestEngineConfig(
+    trader_id=TraderId("BACKTESTER-001"),
+    logging=LoggerConfig(stdout_level=LogLevel.ERROR),
+)
 
 # Build the backtest engine
 engine = BacktestEngine(config=config)
 
 # %% [markdown]
-# ## Add venues
+# ## Add a venue
 #
-# Create a venue to trade on that matches the market data you add to the engine.
-#
-# In this case we set up a simulated Binance Spot exchange.
-#
+# Set up a simulated venue that matches the market data. Here we configure a
+# Binance Spot exchange with a cash account.
 
 # %%
 # Add a trading venue (multiple venues possible)
@@ -105,16 +95,20 @@ engine.add_venue(
     oms_type=OmsType.NETTING,
     account_type=AccountType.CASH,  # Spot CASH account (not for perpetuals or futures)
     base_currency=None,  # Multi-currency account
-    starting_balances=[Money(1_000_000.0, USDT), Money(10.0, ETH)],
+    starting_balances=[
+        Money(1_000_000.0, Currency.from_str("USDT")),
+        Money(10.0, Currency.from_str("ETH")),
+    ],
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0.0001"),
+        taker_rate=Decimal("0.0001"),
+    ),
 )
 
 # %% [markdown]
 # ## Add data
 #
-# Add data to the backtest engine. Start by adding the `Instrument` object we initialized earlier to match the data.
-#
-# Then add the trades we wrangled earlier.
-#
+# Add the instrument and trade ticks to the engine.
 
 # %%
 # Add instrument(s)
@@ -132,13 +126,92 @@ engine.add_data(ticks)
 # %% [markdown]
 # ## Add strategies
 #
-# Add the trading strategies you plan to run as part of the system.
-#
-# Initialize a strategy configuration, then create and add the strategy:
-#
+# The strategy extends `Strategy` and trades an EMA crossover on 250-tick bars,
+# which the engine aggregates internally from the trade ticks. Entries are
+# submitted with an `exec_algorithm_id` so the engine routes them to the TWAP
+# execution algorithm for slicing.
+
 
 # %%
-# Configure your strategy
+class EMACrossTWAPConfig(StrategyConfig):
+    def __init__(
+        self,
+        *,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        trade_size: Decimal,
+        fast_ema_period: int = 10,
+        slow_ema_period: int = 20,
+        twap_horizon_secs: float = 10.0,
+        twap_interval_secs: float = 2.5,
+        **_kwargs: object,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = instrument_id
+        self.bar_type = bar_type
+        self.trade_size = trade_size
+        self.fast_ema_period = fast_ema_period
+        self.slow_ema_period = slow_ema_period
+        self.twap_horizon_secs = twap_horizon_secs
+        self.twap_interval_secs = twap_interval_secs
+
+
+class EMACrossTWAP(Strategy):
+    def __init__(self, config: EMACrossTWAPConfig) -> None:
+        super().__init__(config)
+        self.fast_ema = ExponentialMovingAverage(config.fast_ema_period)
+        self.slow_ema = ExponentialMovingAverage(config.slow_ema_period)
+        self.exec_algorithm_id = ExecAlgorithmId("TWAP")
+        self.exec_algorithm_params = {
+            "horizon_secs": str(config.twap_horizon_secs),
+            "interval_secs": str(config.twap_interval_secs),
+        }
+
+    def on_start(self) -> None:
+        self.register_indicator_for_bars(self.config.bar_type, self.fast_ema)
+        self.register_indicator_for_bars(self.config.bar_type, self.slow_ema)
+        self.subscribe_bars(self.config.bar_type)
+
+    def on_bar(self, _bar: Bar) -> None:
+        if not self.indicators_initialized():
+            return
+
+        if self.fast_ema.value >= self.slow_ema.value:
+            if self.portfolio.is_net_flat(self.config.instrument_id):
+                self.buy()
+            elif self.portfolio.is_net_short(self.config.instrument_id):
+                self.close_all_positions(self.config.instrument_id)
+                self.buy()
+        elif self.fast_ema.value < self.slow_ema.value:
+            if self.portfolio.is_net_flat(self.config.instrument_id):
+                self.sell()
+            elif self.portfolio.is_net_long(self.config.instrument_id):
+                self.close_all_positions(self.config.instrument_id)
+                self.sell()
+
+    def buy(self) -> None:
+        self.submit_twap_order(OrderSide.BUY)
+
+    def sell(self) -> None:
+        self.submit_twap_order(OrderSide.SELL)
+
+    def submit_twap_order(self, side: OrderSide) -> None:
+        instrument = self.cache.instrument(self.config.instrument_id)
+        order = self.order_factory.market(
+            self.config.instrument_id,
+            side,
+            instrument.make_qty(self.config.trade_size),
+            exec_algorithm_id=self.exec_algorithm_id,
+            exec_algorithm_params=self.exec_algorithm_params,
+        )
+        self.submit_order(order)
+
+    def on_stop(self) -> None:
+        self.close_all_positions(self.config.instrument_id)
+
+
+# %%
+# Configure and add the strategy
 strategy_config = EMACrossTWAPConfig(
     instrument_id=ETHUSDT_BINANCE.id,
     bar_type=BarType.from_str("ETHUSDT.BINANCE-250-TICK-LAST-INTERNAL"),
@@ -149,70 +222,68 @@ strategy_config = EMACrossTWAPConfig(
     twap_interval_secs=2.5,
 )
 
-# Instantiate and add your strategy
 strategy = EMACrossTWAP(config=strategy_config)
 engine.add_strategy(strategy=strategy)
 
 # %% [markdown]
-# The strategy config above includes TWAP parameters, but we still need to add the `ExecAlgorithm` component.
+# The strategy config carries the TWAP parameters, but the execution algorithm
+# itself is a separate component.
 #
 # ## Add execution algorithms
 #
-# Add a TWAP execution algorithm to the engine, following the same pattern as strategies.
-#
+# Register the built-in TWAP execution algorithm under the `TWAP` identifier the
+# strategy references.
 
 # %%
-# Instantiate and add your execution algorithm
-exec_algorithm = TWAPExecAlgorithm()  # Using defaults
-engine.add_exec_algorithm(exec_algorithm)
+# Add the native TWAP execution algorithm
+engine.add_native_exec_algorithm(
+    "TwapAlgorithm",
+    ExecutionAlgorithmConfig(exec_algorithm_id=ExecAlgorithmId("TWAP")),
+)
 
 # %% [markdown]
-# ## Run backtest
+# ## Run the backtest
 #
-# After configuring the data, venues, and trading system, run a backtest.
-# Call the `.run(...)` method to process all available data by default.
-#
-# See the [BacktestEngineConfig](https://nautilustrader.io/docs/latest/api_reference/config) API reference for all available options.
-#
+# Call `.run()` to process all available data. The engine replays events in
+# timestamp order with deterministic execution semantics.
 
 # %%
 # Run the engine (from start to end of data)
 engine.run()
 
 # %% [markdown]
-# ## Post-run and analysis
-#
-# The engine logs a post-run tearsheet with default statistics. You can load custom statistics too; see the [Portfolio statistics](../concepts/portfolio.md#portfolio-statistics) guide.
+# ## Post-run analysis
 #
 # The engine retains data and execution objects in memory for generating reports.
-#
+# It also logs a tearsheet with default statistics; see the
+# [Portfolio statistics](../concepts/portfolio.md#portfolio-statistics) guide for
+# custom statistics.
 
 # %%
-engine.trader.generate_account_report(BINANCE)
+engine.generate_account_report(BINANCE)
 
 # %%
-engine.trader.generate_order_fills_report()
+engine.generate_order_fills_report()
 
 # %%
-engine.trader.generate_positions_report()
+engine.generate_positions_report()
 
 # %% [markdown]
 # ## Repeated runs
 #
-# You can reset the engine for repeated runs with different strategy and component configurations.
-#
-# Instruments and data persist across resets by default, so you don't need to reload them.
+# Reset the engine for repeated runs. Instruments, data, and loaded components
+# persist across resets; loaded components have their internal state reset.
 
 # %%
 # For repeated backtest runs, reset the engine
 engine.reset()
 
-# Instruments and data persist, just add new components and run again
+# Clear loaded components before adding replacements.
 
 # %% [markdown]
-# Remove and add individual components (actors, strategies, execution algorithms) as required.
+# Clear and add components (actors, strategies, execution algorithms) as required.
 #
-# See the [Trader](../api_reference/trading.md) API reference for a description of all methods available to achieve this.
+# See the [BacktestEngine](../api_reference/backtest.md) API reference for the add and clear methods.
 #
 
 # %%

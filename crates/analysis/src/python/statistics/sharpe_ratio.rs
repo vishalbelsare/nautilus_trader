@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use super::transform_returns;
@@ -53,7 +54,7 @@ impl SharpeRatio {
     }
 
     #[pyo3(name = "calculate_from_returns")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_calculate_from_returns(&mut self, raw_returns: BTreeMap<u64, f64>) -> Option<f64> {
         self.calculate_from_returns(&transform_returns(&raw_returns))
     }
@@ -64,7 +65,7 @@ impl SharpeRatio {
     }
 
     #[pyo3(name = "calculate_from_positions")]
-    fn py_calculate_from_positions(&mut self, _positions: Vec<Py<PyAny>>) -> Option<f64> {
+    fn py_calculate_from_positions(&mut self, _positions: Vec<Position>) -> Option<f64> {
         None
     }
 }

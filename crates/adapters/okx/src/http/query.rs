@@ -32,8 +32,8 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType, OKXPositionMode,
-        OKXPositionSide, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
+        OKXPositionMode, OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
@@ -43,9 +43,18 @@ use crate::{
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct SetPositionModeParams {
-    /// Position mode: "net_mode" or "long_short_mode".
+    /// Position mode: "`net_mode`" or "`long_short_mode`".
     #[serde(rename = "posMode")]
     pub pos_mode: OKXPositionMode,
+}
+
+/// Parameters for the POST /api/v5/account/activate-feature endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateFeatureParams {
+    /// Feature to activate. `1` enables USDC order book trading.
+    pub feature: String,
 }
 
 /// Parameters for the GET /api/v5/public/position-tiers endpoint.
@@ -77,7 +86,7 @@ pub struct GetPositionTiersParams {
     pub tier: Option<String>,
 }
 
-/// Parameters for the GET /api/v5/public/instruments endpoint.
+/// Parameters for the public and account instrument endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
 #[builder(setter(into, strip_option))]
@@ -96,6 +105,184 @@ pub struct GetInstrumentsParams {
     /// Instrument ID, e.g. BTC-USD-SWAP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_id: Option<String>,
+    /// Series ID. Required when `inst_type` is EVENTS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/spreads endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadsParams {
+    /// Currency the spread is based in, e.g. BTC or ETH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ccy: Option<String>,
+    /// Instrument ID to include in the spread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Spread state: live, suspend, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/order endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadOrderParams {
+    /// Exchange-assigned order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// User-assigned client order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/orders-pending and orders-history endpoints.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadOrdersParams {
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Order type filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_type: Option<OKXOrderType>,
+    /// Order state filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<OKXOrderStatus>,
+    /// Start order ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin_id: Option<String>,
+    /// End order ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_id: Option<String>,
+    /// Start timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the GET /api/v5/sprd/trades endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadTradesParams {
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Trade ID filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
+    /// Order ID filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// Start ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin_id: Option<String>,
+    /// End ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_id: Option<String>,
+    /// Start timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/series endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractSeriesParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY. If absent, all series are returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/events endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractEventsParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY.
+    pub series_id: String,
+    /// Event ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Event state filter: preopen, live, settling, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// Pagination cursor. Returns records newer than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Pagination cursor. Returns records older than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/markets endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractMarketsParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY.
+    pub series_id: String,
+    /// Event ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Instrument ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Market state filter: preopen, live, settling, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// Pagination cursor. Returns records newer than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Pagination cursor. Returns records older than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/opt-summary endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetOptionSummaryParams {
+    /// Instrument family. Only applicable to OPTION.
+    pub inst_family: String,
+    /// Contract expiry date in YYMMDD format, e.g. "250328".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_time: Option<String>,
 }
 
 /// Parameters for the GET /api/v5/market/history-trades endpoint.
@@ -142,7 +329,7 @@ pub struct GetCandlesticksParams {
     pub limit: Option<u32>,
 }
 
-/// Builder for GetCandlesticksParams with validation.
+/// Builder for `GetCandlesticksParams` with validation.
 #[derive(Debug, Default)]
 pub struct GetCandlesticksParamsBuilder {
     inst_id: Option<String>,
@@ -271,6 +458,16 @@ pub struct GetMarkPriceParams {
     pub inst_id: Option<String>,
 }
 
+/// Parameters for the GET /api/v5/public/price-limit endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetPriceLimitParams {
+    /// Instrument ID, e.g. "BTC-USDT-SWAP".
+    pub inst_id: String,
+}
+
 /// Parameters for the GET /api/v5/market/index-tickers.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
@@ -292,6 +489,19 @@ pub struct GetIndexTickerParams {
 #[serde(rename_all = "camelCase")]
 pub struct GetOrderBookParams {
     /// Instrument ID, e.g. "BTC-USDT-SWAP".
+    pub inst_id: String,
+    /// Order book depth per side. Maximum 400, default 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sz: Option<u32>,
+}
+
+/// Parameters for the GET /api/v5/market/books-rpi endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetRpiOrderBookParams {
+    /// Instrument ID, e.g. "BTC-USDT".
     pub inst_id: String,
     /// Order book depth per side. Maximum 400, default 1.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,7 +544,7 @@ pub struct GetOrderHistoryParams {
     /// Instrument ID, e.g. "BTC-USD-SWAP" (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_id: Option<String>,
-    /// Order type: limit, market, post_only, fok, ioc (optional).
+    /// Order type: limit, market, `post_only`, fok, ioc (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ord_type: Option<OKXOrderType>,
     /// Order state: live, filled, canceled (optional).
@@ -380,7 +590,21 @@ pub struct GetOrderListParams {
     pub limit: Option<u32>,
 }
 
-/// Parameters for the GET /api/v5/trade/order-algo-* endpoints.
+/// Parameters for the GET /api/v5/trade/order-algo endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetAlgoOrderParams {
+    /// Algo order identifier assigned by OKX (optional).
+    #[serde(rename = "algoId", skip_serializing_if = "Option::is_none")]
+    pub algo_id: Option<String>,
+    /// Client supplied algo order identifier (optional).
+    #[serde(rename = "algoClOrdId", skip_serializing_if = "Option::is_none")]
+    pub algo_cl_ord_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/trade/orders-algo-* endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
 #[builder(setter(into, strip_option))]
@@ -402,11 +626,11 @@ pub struct GetAlgoOrdersParams {
     pub ord_type: Option<OKXAlgoOrderType>,
     /// State filter (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<OKXOrderStatus>,
-    /// Pagination cursor – fetch records after this value (optional).
+    pub state: Option<OKXAlgoOrderStatus>,
+    /// Pagination cursor - fetch records after this value (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    /// Pagination cursor – fetch records before this value (optional).
+    /// Pagination cursor - fetch records before this value (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
     /// Maximum number of records to return (optional, default 100).
@@ -435,6 +659,12 @@ pub struct GetTransactionDetailsParams {
     /// Pagination of data to return records newer than the requested ID (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    /// Filter with a begin timestamp in milliseconds (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// Filter with an end timestamp in milliseconds (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
     /// Number of results per request (optional, default 100, max 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -488,7 +718,8 @@ pub struct GetPositionsHistoryParams {
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct GetOrderParams {
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Instrument type retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub inst_type: OKXInstrumentType,
     /// Instrument ID, e.g. "BTC-USDT".
     pub inst_id: String,
@@ -498,8 +729,8 @@ pub struct GetOrderParams {
     /// User-assigned client order ID (optional if order ID is provided).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// Position side (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Position side retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub pos_side: Option<OKXPositionSide>,
 }
 
@@ -508,14 +739,27 @@ pub struct GetOrderParams {
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct GetTradeFeeParams {
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION, EVENTS.
     pub inst_type: OKXInstrumentType,
-    /// Underlying, required for SWAP/FUTURES/OPTION (optional).
+    /// Legacy underlying selector for SWAP/FUTURES/OPTION (optional).
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uly: Option<String>,
-    /// Instrument family, required for SWAP/FUTURES/OPTION (optional).
+    /// Instrument family for SWAP/FUTURES/OPTION (optional).
+    /// Required to obtain applicable incentive-program rates.
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_family: Option<String>,
+    /// Instrument ID for SPOT/MARGIN (optional).
+    /// Required to obtain applicable incentive-program rates.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Fee group ID from instrument metadata (optional).
+    /// Mutually exclusive with `inst_id` and `inst_family`.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -579,8 +823,8 @@ mod tests {
         builder.bar("1m");
         // OKX backwards semantics: before=lower bound, after=upper bound
         // This creates invalid range where before >= after
-        builder.after_ms(1725307200000);
-        builder.before_ms(1725393600000);
+        builder.after_ms(1_725_307_200_000);
+        builder.before_ms(1_725_393_600_000);
 
         let result = builder.build();
         assert!(result.is_err());
@@ -601,9 +845,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(1725307200000, "after=1725307200000")] // 13 digits = milliseconds
-    #[case(1725307200, "after=1725307200")] // 10 digits = seconds
-    #[case(1725307, "after=1725307")] // 7 digits = also valid
+    #[case(1_725_307_200_000, "after=1725307200000")] // 13 digits = milliseconds
+    #[case(1_725_307_200, "after=1725307200")] // 10 digits = seconds
+    #[case(1_725_307, "after=1725307")] // 7 digits = also valid
     fn test_valid_millisecond_cursor_passes(#[case] timestamp: i64, #[case] expected: &str) {
         let mut builder = GetCandlesticksParamsBuilder::default();
         builder.inst_id("BTC-USDT-SWAP");

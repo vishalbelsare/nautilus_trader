@@ -15,12 +15,13 @@
 
 //! Python bindings for the [`BacktestResult`] type.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nautilus_core::UUID4;
 
 use crate::result::BacktestResult;
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestResult {
     #[getter]
@@ -45,6 +46,36 @@ impl BacktestResult {
     #[pyo3(name = "run_config_id")]
     fn py_run_config_id(&self) -> Option<&str> {
         self.run_config_id.as_deref()
+    }
+
+    #[getter]
+    #[pyo3(name = "run_id")]
+    const fn py_run_id(&self) -> Option<UUID4> {
+        self.run_id
+    }
+
+    #[getter]
+    #[pyo3(name = "run_started")]
+    fn py_run_started(&self) -> Option<u64> {
+        self.run_started.map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "run_finished")]
+    fn py_run_finished(&self) -> Option<u64> {
+        self.run_finished.map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "backtest_start")]
+    fn py_backtest_start(&self) -> Option<u64> {
+        self.backtest_start.map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "backtest_end")]
+    fn py_backtest_end(&self) -> Option<u64> {
+        self.backtest_end.map(|timestamp| timestamp.as_u64())
     }
 
     #[getter]
@@ -78,6 +109,15 @@ impl BacktestResult {
     }
 
     #[getter]
+    #[pyo3(name = "summary")]
+    fn py_summary(&self) -> HashMap<String, String> {
+        self.summary
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    #[getter]
     #[pyo3(name = "stats_pnls")]
     fn py_stats_pnls(&self) -> HashMap<String, HashMap<String, f64>> {
         self.stats_pnls
@@ -106,6 +146,15 @@ impl BacktestResult {
         self.stats_general
             .iter()
             .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    #[getter]
+    #[pyo3(name = "returns_series")]
+    fn py_returns_series(&self) -> BTreeMap<u64, f64> {
+        self.returns_series
+            .iter()
+            .map(|(timestamp, value)| (timestamp.as_u64(), *value))
             .collect()
     }
 

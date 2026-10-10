@@ -1,7 +1,7 @@
 # nautilus-persistence
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-persistence)](https://docs.rs/nautilus-persistence/latest/nautilus-persistence/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-persistence)](https://docs.rs/nautilus-persistence/latest/nautilus_persistence/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-persistence.svg)](https://crates.io/crates/nautilus-persistence)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -12,27 +12,29 @@ The `nautilus-persistence` crate provides data persistence capabilities includin
 trading data to various storage backends. This includes Apache Parquet file support, streaming data
 pipelines, and cloud storage integration for historical data management.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
 - `cloud`: Enables cloud storage backends (S3, Azure, GCP, HTTP) via `object_store`.
-- `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `cloud`).
-- `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
+- `defi`: Enables DeFi (Decentralized Finance) support.
 - `extension-module`: Builds as a Python extension module.
+- `high-precision`: Enables
+  [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+  to use 128-bit value types.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `cloud`.
 
 ## Documentation
+
+See [Parquet streaming](../../docs/how_to/stream_parquet_catalog.md) for staging, promotion, and query visibility.
 
 See [the docs](https://docs.rs/nautilus-persistence) for more detailed usage.
 

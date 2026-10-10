@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::sync::Arc;
+
 use alloy::primitives::{Address, I256, U160};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -60,7 +62,7 @@ pub struct SwapEvent {
 impl SwapEvent {
     /// Creates a new [`SwapEvent`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
@@ -94,25 +96,25 @@ impl SwapEvent {
     }
 
     /// Converts a swap event into a `PoolSwap`.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn to_pool_swap(
         &self,
         chain: SharedChain,
         instrument_id: InstrumentId,
         pool_identifier: PoolIdentifier,
-        timestamp: Option<UnixNanos>,
+        timestamp: UnixNanos,
     ) -> PoolSwap {
         PoolSwap::new(
             chain,
-            self.dex.clone(),
+            Arc::clone(&self.dex),
             instrument_id,
             pool_identifier,
             self.block_number,
             self.transaction_hash.clone(),
             self.transaction_index,
             self.log_index,
-            timestamp,
+            timestamp, // ts_event
+            timestamp, // ts_init (same block timestamp)
             self.sender,
             self.receiver,
             self.amount0,

@@ -126,7 +126,7 @@ impl FeedHandler {
     ) -> Result<(), DydxWsError> {
         let keys_owned: Option<Vec<Ustr>> = rate_limit_keys.map(|k| k.to_vec());
         self.retry_manager
-            .execute_with_retry(
+            .invocation(
                 "websocket_send",
                 || {
                     let payload = payload.clone();
@@ -139,8 +139,9 @@ impl FeedHandler {
                     }
                 },
                 should_retry_dydx_error,
-                create_dydx_timeout_error,
+                |e| create_dydx_timeout_error(e.to_string()),
             )
+            .execute()
             .await
     }
 
@@ -152,6 +153,7 @@ impl FeedHandler {
     /// because we explicitly check that `msgs` is not empty before calling it.
     pub async fn run(&mut self) {
         log::debug!("WebSocket handler started");
+
         loop {
             // First drain any buffered messages
             if !self.message_buffer.is_empty() {
@@ -204,11 +206,13 @@ impl FeedHandler {
             Message::Text(txt) => {
                 if txt == RECONNECTED {
                     self.clear_state();
+                    self.subscriptions.reset_after_reconnect();
 
                     if let Err(e) = self.replay_subscriptions().await {
                         log::error!("Failed to replay subscriptions after reconnect: {e}");
                     }
-                    return vec![DydxWsOutputMessage::Reconnected];
+                    let topics = self.subscriptions.all_topics();
+                    return vec![DydxWsOutputMessage::Reconnected { topics }];
                 }
 
                 // Hot path: zero-copy parse for feed messages (orderbook/trades/candles)
@@ -297,7 +301,7 @@ impl FeedHandler {
             Message::Ping(_data) => vec![],
             Message::Binary(_bin) => vec![],
             Message::Close(_frame) => {
-                log::info!("WebSocket close frame received");
+                log::debug!("WebSocket close frame received");
                 vec![]
             }
             Message::Frame(_) => vec![],
@@ -319,6 +323,7 @@ impl FeedHandler {
             "Handling feed message: {:?}",
             std::mem::discriminant(&feed_msg)
         );
+
         match feed_msg {
             DydxWsFeedMessage::Subaccounts(msg) => self.handle_subaccounts(msg),
             DydxWsFeedMessage::Orderbook(msg) => self.handle_orderbook(msg),
@@ -489,6 +494,7 @@ impl FeedHandler {
                 let topic =
                     self.topic_from_msg(&DydxWsChannel::BlockHeight, &Some(data.id.clone()));
                 self.subscriptions.confirm_subscribe(&topic);
+
                 match data.contents.height.parse::<u64>() {
                     Ok(height) => vec![DydxWsOutputMessage::BlockHeight {
                         height,
@@ -525,6 +531,7 @@ impl FeedHandler {
             log::error!("Missing id for trades channel");
             return vec![];
         };
+
         match serde_json::from_value::<DydxTradeContents>(data.contents.clone()) {
             Ok(contents) => vec![DydxWsOutputMessage::Trades { id, contents }],
             Err(e) => {
@@ -542,6 +549,7 @@ impl FeedHandler {
             log::error!("Missing id for orderbook snapshot");
             return vec![];
         };
+
         match serde_json::from_value::<DydxOrderbookSnapshotContents>(data.contents.clone()) {
             Ok(contents) => vec![DydxWsOutputMessage::OrderbookSnapshot { id, contents }],
             Err(e) => {
@@ -559,6 +567,7 @@ impl FeedHandler {
             log::error!("Missing id for orderbook update");
             return vec![];
         };
+
         match serde_json::from_value::<DydxOrderbookContents>(data.contents.clone()) {
             Ok(contents) => vec![DydxWsOutputMessage::OrderbookUpdate { id, contents }],
             Err(e) => {
@@ -576,6 +585,7 @@ impl FeedHandler {
             log::error!("Missing id for orderbook batch");
             return vec![];
         };
+
         match serde_json::from_value::<Vec<DydxOrderbookContents>>(data.contents.clone()) {
             Ok(updates) => vec![DydxWsOutputMessage::OrderbookBatch { id, updates }],
             Err(e) => {
@@ -590,6 +600,7 @@ impl FeedHandler {
             log::error!("Missing id for candles channel");
             return vec![];
         };
+
         match serde_json::from_value::<DydxCandle>(data.contents.clone()) {
             Ok(contents) => vec![DydxWsOutputMessage::Candles { id, contents }],
             Err(e) => {
@@ -669,6 +680,10 @@ impl FeedHandler {
     }
 
     fn topic_from_msg(&self, channel: &DydxWsChannel, id: &Option<String>) -> String {
+        if matches!(channel, DydxWsChannel::BlockHeight) {
+            return channel.as_ref().to_string();
+        }
+
         match id {
             Some(id) => format!(
                 "{}{}{}",
@@ -720,14 +735,13 @@ impl FeedHandler {
     /// # Errors
     ///
     /// Returns an error if the message cannot be processed.
-    #[allow(clippy::result_large_err)]
     pub async fn handle_message(
         &mut self,
         msg: DydxWsMessage,
     ) -> DydxWsResult<Vec<DydxWsOutputMessage>> {
         match msg {
             DydxWsMessage::Connected(_) => {
-                log::info!("dYdX WebSocket connected");
+                log::debug!("dYdX WebSocket connected");
                 Ok(vec![])
             }
             DydxWsMessage::Subscribed(sub) => {
@@ -753,11 +767,13 @@ impl FeedHandler {
             DydxWsMessage::Error(err) => Ok(vec![DydxWsOutputMessage::Error(err)]),
             DydxWsMessage::Reconnected => {
                 self.clear_state();
+                self.subscriptions.reset_after_reconnect();
 
                 if let Err(e) = self.replay_subscriptions().await {
                     log::error!("Failed to replay subscriptions after reconnect message: {e}");
                 }
-                Ok(vec![DydxWsOutputMessage::Reconnected])
+                let topics = self.subscriptions.all_topics();
+                Ok(vec![DydxWsOutputMessage::Reconnected { topics }])
             }
             DydxWsMessage::Pong => Ok(vec![]),
             DydxWsMessage::Raw(_) => Ok(vec![]),

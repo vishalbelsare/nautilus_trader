@@ -1,7 +1,7 @@
 # nautilus-model
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-model)](https://docs.rs/nautilus-model/latest/nautilus-model/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-model)](https://docs.rs/nautilus-model/latest/nautilus_model/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-model.svg)](https://crates.io/crates/nautilus-model)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -11,26 +11,28 @@ Trading domain model for [NautilusTrader](https://nautilustrader.io).
 The `nautilus-model` crate provides a type-safe domain model that forms the backbone of the framework
 and can serve as the foundation for building algorithmic trading systems.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-- `stubs`: Enables type stubs for use in testing scenarios.
-- `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
+- `arrow`: Enables Apache Arrow schema and `RecordBatch` registries for custom data.
 - `defi`: Enables the DeFi (Decentralized Finance) domain model.
 - `extension-module`: Builds as a Python extension module.
+- `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://crates.io/crates/cbindgen).
+- `high-precision`: Enables
+  [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+  to use 128-bit value types.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `python-arrow`: Enables Python bindings together with `PyArrow` `RecordBatch` bridging.
+- `test-support`: Enables test fixtures, builders, specs, and defaults.
 
 ## Documentation
 

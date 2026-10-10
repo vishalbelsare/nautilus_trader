@@ -22,21 +22,21 @@ comment on the underlying Rust item, and writes it as the wrapper's
 doc comment.
 
 Copies section headers (# Errors, # Safety) as-is for clippy
-compatibility. Drops # Panics sections with a warning since panics
-must not cross the FFI boundary. Strips Rust intra-doc link brackets
-and converts :: to . for Python conventions.
+compatibility. Drops # Panics sections since panics must not cross the
+FFI boundary. Strips Rust intra-doc link brackets and converts :: to .
+for Python conventions.
 
 Usage:
-    python generate_docstrings.py [--dry-run] [--crate NAME]
+    python generate_docstrings.py [--dry-run] [--crate NAME] [--verbose]
 
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,10 +53,29 @@ ANNOTATED_CRATES = [
     "infrastructure",
     "cryptography",
     "network",
+    "indicators",
+    "data",
+    "trading",
+    "testkit",
+    "backtest",
+    "live",
 ]
 
 ANNOTATED_ADAPTER_CRATES = [
+    "architect_ax",
+    "betfair",
+    "binance",
     "blockchain",
+    "bybit",
+    "databento",
+    "deribit",
+    "dydx",
+    "hyperliquid",
+    "kraken",
+    "okx",
+    "polymarket",
+    "sandbox",
+    "tardis",
 ]
 
 DROPPED_SECTIONS = {"Panics"}
@@ -65,6 +84,10 @@ BANNER_RE = re.compile(r"^-{3,}.*-{3,}$")
 
 # Rust intra-doc link: [`Type::method`] or [`Type`](path)
 INTRA_DOC_LINK_RE = re.compile(r"\[`([^`]+)`\](?:\([^)]*\))?")
+
+# Attribute line that closes on this line, allowing a trailing line comment
+# (e.g. `#[allow(unused_imports)] // used in template pattern`)
+ATTR_END_RE = re.compile(r"\]\s*(?://.*)?$")
 
 
 def get_crate_src_dirs(crate_filter: str | None = None) -> list[tuple[str, Path]]:
@@ -90,14 +113,15 @@ def get_crate_src_dirs(crate_filter: str | None = None) -> list[tuple[str, Path]
     return dirs
 
 
-def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]]:  # noqa: C901
+def collect_source_docs(  # noqa: C901
+    src_dir: Path,
+) -> dict[tuple[str | None, str], list[str]]:
     """
     Collect doc comments for items in a crate, excluding python/ files.
 
-    Returns {(type_name_or_none, item_name): [doc_line, ...]} where lines
-    exclude the ``///`` prefix. Free functions and type definitions use
-    ``None`` as the type_name. Methods inside ``impl TypeName`` blocks use
-    the enclosing type name.
+    Returns {(type_name_or_none, item_name): [doc_line, ...]} where lines exclude the
+    ``///`` prefix. Free functions and type definitions use ``None`` as the type_name.
+    Methods inside ``impl TypeName`` blocks use the enclosing type name.
 
     """
     docs: dict[tuple[str | None, str], list[str]] = {}
@@ -107,7 +131,7 @@ def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]
         if rel.parts[0] == "python":
             continue
 
-        lines = rs_file.read_text().splitlines()
+        lines = rs_file.read_text(encoding="utf-8").splitlines()
         doc_block: list[str] = []
         in_multiline_attr = False
         current_impl: str | None = None
@@ -118,19 +142,17 @@ def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]
             stripped = line.strip()
 
             if in_multiline_attr:
-                if stripped.endswith(("]", ")]")):
+                if ATTR_END_RE.search(stripped):
                     in_multiline_attr = False
                 continue
 
             if stripped.startswith("///"):
-                content = stripped[3:]
-                if content.startswith(" "):
-                    content = content[1:]
+                content = stripped[3:].removeprefix(" ")
                 doc_block.append(content)
                 continue
 
             if stripped.startswith("#["):
-                if not (stripped.endswith(("]", ")]"))):
+                if rust_attr_continues(stripped):
                     in_multiline_attr = True
                 continue
 
@@ -153,13 +175,17 @@ def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]
                     current_impl = None
 
             if doc_block:
-                is_banner = all(BANNER_RE.match(l) or l == "" for l in doc_block)
+                is_banner = all(
+                    BANNER_RE.match(doc_line) or doc_line == "" for doc_line in doc_block
+                )
                 fn_m = re.match(
                     r"\s*pub(?:\([^)]*\))?\s+(?:const\s+|async\s+)?fn\s+(\w+)",
                     line,
                 )
+
                 if fn_m:
                     name = fn_m.group(1)
+
                     if not is_banner:
                         docs[(current_impl, name)] = list(doc_block)
                 else:
@@ -167,8 +193,10 @@ def collect_source_docs(src_dir: Path) -> dict[tuple[str | None, str], list[str]
                         r"\s*pub(?:\([^)]*\))?\s+(?:struct|enum)\s+(\w+)",
                         line,
                     )
+
                     if type_m:
                         name = type_m.group(1)
+
                         if not is_banner:
                             docs[(None, name)] = list(doc_block)
 
@@ -181,13 +209,14 @@ def transform_doc(
     doc_lines: list[str],
     source_file: str = "",
     fn_name: str = "",
+    *,
+    strip_errors: bool = False,
 ) -> list[str]:
     """
-    Copy doc lines, dropping ``# Panics`` sections.
+    Copy doc lines, dropping sections that do not belong on the Python wrapper.
 
-    Section headers like ``# Errors`` and ``# Safety`` are kept as-is
-    for clippy compatibility. The numpydoc transformation happens later
-    in the stub post-processor.
+    Section headers like ``# Errors`` and ``# Safety`` are kept as-is for clippy
+    compatibility. The numpydoc transformation happens later in the stub post-processor.
 
     """
     result: list[str] = []
@@ -201,11 +230,8 @@ def transform_doc(
         if m:
             section = m.group(1)
 
-            if section in DROPPED_SECTIONS:
-                print(
-                    f"  WARNING: # {section} in {fn_name} ({source_file})",
-                    file=sys.stderr,
-                )
+            dropped = DROPPED_SECTIONS | ({"Errors"} if strip_errors else set())
+            if section in dropped:
                 skip_section = True
                 i += 1
                 if i < len(doc_lines) and doc_lines[i] == "":
@@ -233,6 +259,7 @@ def format_as_doc_comment(doc_lines: list[str], indent: str) -> list[str]:
     Format lines as Rust ``///`` doc comments with the given indentation.
     """
     formatted = []
+
     for line in doc_lines:
         if line:
             formatted.append(f"{indent}/// {line}")
@@ -265,7 +292,7 @@ def parse_pyo3_items(lines: list[str]) -> list[dict]:  # noqa: C901
         stripped = line.strip()
 
         if in_ml_attr:
-            if stripped.endswith(("]", ")]")):
+            if ATTR_END_RE.search(stripped):
                 in_ml_attr = False
             continue
 
@@ -282,7 +309,7 @@ def parse_pyo3_items(lines: list[str]) -> list[dict]:  # noqa: C901
                 has_new = True
             if stripped in ("#[pymethods]", "#[pyo3::pymethods]"):
                 in_pymethods = True
-            if not (stripped.endswith(("]", ")]"))):
+            if rust_attr_continues(stripped):
                 in_ml_attr = True
             continue
 
@@ -300,6 +327,8 @@ def parse_pyo3_items(lines: list[str]) -> list[dict]:  # noqa: C901
         fn_m = re.match(r"\s*(?:pub\s+)?(?:const\s+)?fn\s+(py_\w+)", line)
         if fn_m:
             insert = first_attr_line if first_attr_line is not None else i
+            fn_signature = rust_fn_signature(lines, i)
+
             if doc_start is not None:
                 insert = doc_start
 
@@ -307,8 +336,10 @@ def parse_pyo3_items(lines: list[str]) -> list[dict]:  # noqa: C901
                 {
                     "fn_name": fn_m.group(1),
                     "fn_line": i,
+                    "fn_signature": fn_signature,
                     "impl_type": impl_type,
                     "is_constructor": has_new,
+                    "in_pymethods": in_pymethods,
                     "doc_start": doc_start,
                     "doc_end": doc_end,
                     "insert_line": insert,
@@ -324,10 +355,49 @@ def parse_pyo3_items(lines: list[str]) -> list[dict]:  # noqa: C901
     return items
 
 
+def rust_attr_continues(line: str) -> bool:
+    """
+    Return whether a Rust attribute starting on ``line`` continues onto the next line.
+
+    A parameter attribute such as ``#[builder(default)] name: T`` closes its brackets
+    before the parameter on the same line.
+
+    """
+    return not ATTR_END_RE.search(line) and line.count("[") > line.count("]")
+
+
+def rust_fn_signature(lines: list[str], start: int) -> str:
+    """
+    Return a Rust function signature starting at ``start``.
+    """
+    signature_lines: list[str] = []
+
+    for line in lines[start:]:
+        signature_lines.append(line.strip())
+        if "{" in line:
+            break
+
+    return " ".join(signature_lines)
+
+
+def rust_fn_returns_result(signature: str) -> bool:
+    """
+    Return whether a Rust function signature returns a Result-like type.
+    """
+    match = re.search(r"\)\s*->\s*(.*?)\s*\{", signature)
+    if match is None:
+        return False
+
+    return_type = match.group(1).split(" where ", maxsplit=1)[0].strip()
+    return re.search(r"(?:^|::)\w*Result\b", return_type) is not None
+
+
 def process_crate(  # noqa: C901
     crate_name: str,
     src_dir: Path,
+    *,
     dry_run: bool = False,
+    verbose: bool = False,
 ) -> int:
     """
     Process a single crate, updating PyO3 doc comments.
@@ -335,20 +405,23 @@ def process_crate(  # noqa: C901
     Returns number of doc comments updated.
 
     """
-    print(f"Processing crate: {crate_name}")
+    if verbose:
+        print(f"Processing crate: {crate_name}")
 
     source_docs = collect_source_docs(src_dir)
-    print(f"  Collected {len(source_docs)} source doc comments")
+    if verbose:
+        print(f"  Collected {len(source_docs)} source doc comments")
 
     python_dir = src_dir / "python"
     if not python_dir.is_dir():
-        print("  No python/ directory, skipping")
+        if verbose:
+            print("  No python/ directory, skipping")
         return 0
 
     total_updates = 0
 
     for rs_file in sorted(python_dir.rglob("*.rs")):
-        text = rs_file.read_text()
+        text = rs_file.read_text(encoding="utf-8")
         file_lines = text.splitlines()
         items = parse_pyo3_items(file_lines)
 
@@ -369,16 +442,23 @@ def process_crate(  # noqa: C901
                 )
             elif impl_type:
                 source_doc = source_docs.get((impl_type, target))
+            elif item["in_pymethods"]:
+                # Method lost its impl_type (parser brace tracking); skip
+                source_doc = None
             else:
+                # Standalone pyfunction (no impl block)
                 source_doc = source_docs.get((None, target))
 
             if not source_doc:
                 continue
 
+            returns_result = rust_fn_returns_result(item["fn_signature"])
+
             transformed = transform_doc(
                 source_doc,
                 source_file=str(rs_file.relative_to(ROOT)),
                 fn_name=fn_name,
+                strip_errors=not returns_result,
             )
 
             if not transformed:
@@ -404,7 +484,7 @@ def process_crate(  # noqa: C901
             print(f"  {action} {updates} doc(s) in {rel_path}")
 
             if not dry_run:
-                rs_file.write_text("\n".join(file_lines) + "\n")
+                rs_file.write_text("\n".join(file_lines) + "\n", encoding="utf-8")
 
         total_updates += updates
 
@@ -412,6 +492,9 @@ def process_crate(  # noqa: C901
 
 
 def main() -> None:
+    """
+    Parse CLI arguments and generate PyO3 doc comments.
+    """
     parser = argparse.ArgumentParser(
         description="Generate PyO3 doc comments from underlying Rust documentation.",
     )
@@ -425,6 +508,11 @@ def main() -> None:
         dest="crate_name",
         help="Process only this crate (e.g. 'network')",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show per-crate traversal details",
+    )
     args = parser.parse_args()
 
     crate_dirs = get_crate_src_dirs(args.crate_name)
@@ -435,7 +523,12 @@ def main() -> None:
 
     total = 0
     for name, src_dir in crate_dirs:
-        total += process_crate(name, src_dir, dry_run=args.dry_run)
+        total += process_crate(
+            name,
+            src_dir,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
 
     prefix = "would be " if args.dry_run else ""
     print(f"\nTotal: {total} doc comments {prefix}updated")

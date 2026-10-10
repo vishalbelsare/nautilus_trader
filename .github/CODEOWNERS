@@ -11,7 +11,6 @@
 # =============================================================================
 /.github/workflows/              @nautechsystems/core
 /.github/actions/                @nautechsystems/core
-/.github/dependabot.yml          @nautechsystems/core
 /.github/CODEOWNERS              @nautechsystems/core
 
 # =============================================================================
@@ -21,18 +20,17 @@
 /Cargo.lock                      @nautechsystems/core
 /crates/Cargo.toml               @nautechsystems/core
 /crates/**/Cargo.toml            @nautechsystems/core
-/.cargo/config.toml              @nautechsystems/core
+/crates/**/fuzz/Cargo.lock       @nautechsystems/core
 /rust-toolchain.toml             @nautechsystems/core
 /deny.toml                       @nautechsystems/core
+/security-audit.toml             @nautechsystems/core
+/.cargo/config.toml              @nautechsystems/core
+/.cargo/deny-fuzz.toml           @nautechsystems/core
+/.supply-chain/                  @nautechsystems/core
 
 # =============================================================================
 # Python Build & Dependencies - SUPPLY CHAIN RISK
 # =============================================================================
-# Root Python project
-/pyproject.toml                  @nautechsystems/core
-/uv.lock                         @nautechsystems/core
-
-# Python nautilus_trader v2 system
 /python/pyproject.toml           @nautechsystems/core
 /python/uv.lock                  @nautechsystems/core
 
@@ -46,12 +44,13 @@
 # Code Quality & Formatting Configuration
 # =============================================================================
 /.pre-commit-config.yaml         @nautechsystems/core
+/.nautilus-engineering.lock      @nautechsystems/core
+/.nautilus-engineering/          @nautechsystems/core
 /.pre-commit-hooks/              @nautechsystems/core
 /rustfmt.toml                    @nautechsystems/core
 /clippy.toml                     @nautechsystems/core
 /.taplo.toml                     @nautechsystems/core
 /.markdownlint.jsonc             @nautechsystems/core
-/.gitlint                        @nautechsystems/core
 /.yamllint.yaml                  @nautechsystems/core
 
 # =============================================================================
@@ -70,12 +69,6 @@
 # Scripts - HIGH SECURITY RISK
 # =============================================================================
 /scripts/                        @nautechsystems/core
-
-# =============================================================================
-# Build Automation & Reporting
-# =============================================================================
-/build.py                        @nautechsystems/core
-/.codecov.yml                    @nautechsystems/core
 
 # =============================================================================
 # Security & Documentation

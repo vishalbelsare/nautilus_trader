@@ -15,30 +15,62 @@
 
 //! Python bindings for backtest configuration types.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display, str::FromStr, time::Duration};
 
-use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_common::{
+    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
+    msgbus::MessageBusConfig, python::config_error_to_pyvalue_err,
+};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    python::{to_pytype_err, to_pyvalue_err},
+};
+use nautilus_data::engine::config::DataEngineConfig;
+use nautilus_execution::{
+    engine::config::ExecutionEngineConfig,
+    python::{
+        fee::{fee_model_any_to_pyobject, pyobject_to_fee_model_any},
+        fill::{fill_model_any_to_pyobject, pyobject_to_fill_model_any},
+        latency::{latency_model_any_to_pyobject, pyobject_to_latency_model_any},
+    },
+};
 use nautilus_model::{
+    accounts::margin_model::MarginModelAny,
     data::BarSpecification,
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId},
+    python::data::PyNautilusDataType,
     types::Currency,
 };
+use nautilus_persistence::{
+    config::{DataCatalogConfig, StreamingConfig},
+    python::config::PyCatalogBackend,
+};
+use nautilus_portfolio::config::PortfolioConfig;
+use nautilus_risk::engine::config::RiskEngineConfig;
+use nautilus_trading::ImportableControllerConfig;
+use pyo3::{Bound, IntoPyObjectExt, Py, PyAny, PyResult, Python, types::PyAnyMethods};
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use super::{
+    engine::pyobject_to_margin_model_any,
+    modules::{pyobject_to_simulation_module_any, simulation_module_any_to_pyobject},
+};
 use crate::config::{
     BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
-    NautilusDataType,
 };
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestEngineConfig {
+    /// Configuration for ``BacktestEngine`` instances.
     #[new]
     #[pyo3(signature = (
         trader_id = None,
         load_state = None,
         save_state = None,
+        shutdown_on_error = None,
         bypass_logging = None,
         run_analysis = None,
         timeout_connection = None,
@@ -49,12 +81,22 @@ impl BacktestEngineConfig {
         timeout_shutdown = None,
         logging = None,
         instance_id = None,
+        cache = None,
+        msgbus = None,
+        data_engine = None,
+        risk_engine = None,
+        exec_engine = None,
+        portfolio = None,
+        controller = None,
+        streaming = None,
+        catalogs = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         trader_id: Option<TraderId>,
         load_state: Option<bool>,
         save_state: Option<bool>,
+        shutdown_on_error: Option<bool>,
         bypass_logging: Option<bool>,
         run_analysis: Option<bool>,
         timeout_connection: Option<u64>,
@@ -65,30 +107,43 @@ impl BacktestEngineConfig {
         timeout_shutdown: Option<u64>,
         logging: Option<LoggerConfig>,
         instance_id: Option<UUID4>,
+        cache: Option<CacheConfig>,
+        msgbus: Option<MessageBusConfig>,
+        data_engine: Option<DataEngineConfig>,
+        risk_engine: Option<RiskEngineConfig>,
+        exec_engine: Option<ExecutionEngineConfig>,
+        portfolio: Option<PortfolioConfig>,
+        controller: Option<ImportableControllerConfig>,
+        streaming: Option<StreamingConfig>,
+        catalogs: Option<Vec<DataCatalogConfig>>,
     ) -> Self {
-        Self::new(
-            Environment::Backtest,
-            trader_id.unwrap_or_default(),
-            load_state,
-            save_state,
-            bypass_logging,
-            run_analysis,
-            timeout_connection,
-            timeout_reconciliation,
-            timeout_portfolio,
-            timeout_disconnection,
-            delay_post_stop,
-            timeout_shutdown,
-            logging,
+        let defaults = Self::default();
+        Self {
+            environment: Environment::Backtest,
+            trader_id: trader_id.unwrap_or_default(),
+            load_state: load_state.unwrap_or(defaults.load_state),
+            save_state: save_state.unwrap_or(defaults.save_state),
+            shutdown_on_error: shutdown_on_error.unwrap_or(defaults.shutdown_on_error),
+            bypass_logging: bypass_logging.unwrap_or(defaults.bypass_logging),
+            run_analysis: run_analysis.unwrap_or(defaults.run_analysis),
+            timeout_connection: Duration::from_secs(timeout_connection.unwrap_or(60)),
+            timeout_reconciliation: Duration::from_secs(timeout_reconciliation.unwrap_or(30)),
+            timeout_portfolio: Duration::from_secs(timeout_portfolio.unwrap_or(10)),
+            timeout_disconnection: Duration::from_secs(timeout_disconnection.unwrap_or(10)),
+            delay_post_stop: Duration::from_secs(delay_post_stop.unwrap_or(10)),
+            timeout_shutdown: Duration::from_secs(timeout_shutdown.unwrap_or(5)),
+            logging: logging.unwrap_or_default(),
             instance_id,
-            None, // cache
-            None, // msgbus
-            None, // data_engine
-            None, // risk_engine
-            None, // exec_engine
-            None, // portfolio
-            None, // streaming
-        )
+            cache,
+            msgbus,
+            data_engine,
+            risk_engine,
+            exec_engine,
+            portfolio,
+            controller,
+            streaming,
+            catalogs: catalogs.unwrap_or_default(),
+        }
     }
 
     #[getter]
@@ -110,6 +165,12 @@ impl BacktestEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "shutdown_on_error")]
+    const fn py_shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
+    }
+
+    #[getter]
     #[pyo3(name = "bypass_logging")]
     const fn py_bypass_logging(&self) -> bool {
         self.bypass_logging
@@ -121,20 +182,124 @@ impl BacktestEngineConfig {
         self.run_analysis
     }
 
+    #[getter]
+    #[pyo3(name = "timeout_connection")]
+    fn py_timeout_connection(&self) -> f64 {
+        self.timeout_connection.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_reconciliation")]
+    fn py_timeout_reconciliation(&self) -> f64 {
+        self.timeout_reconciliation.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_portfolio")]
+    fn py_timeout_portfolio(&self) -> f64 {
+        self.timeout_portfolio.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_disconnection")]
+    fn py_timeout_disconnection(&self) -> f64 {
+        self.timeout_disconnection.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "delay_post_stop")]
+    fn py_delay_post_stop(&self) -> f64 {
+        self.delay_post_stop.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_shutdown")]
+    fn py_timeout_shutdown(&self) -> f64 {
+        self.timeout_shutdown.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "logging")]
+    fn py_logging(&self) -> LoggerConfig {
+        self.logging.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "instance_id")]
+    const fn py_instance_id(&self) -> Option<UUID4> {
+        self.instance_id
+    }
+
+    #[getter]
+    #[pyo3(name = "cache")]
+    fn py_cache(&self) -> Option<CacheConfig> {
+        self.cache.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "msgbus")]
+    fn py_msgbus(&self) -> Option<MessageBusConfig> {
+        self.msgbus.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "data_engine")]
+    fn py_data_engine(&self) -> Option<DataEngineConfig> {
+        self.data_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "risk_engine")]
+    fn py_risk_engine(&self) -> Option<RiskEngineConfig> {
+        self.risk_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "exec_engine")]
+    fn py_exec_engine(&self) -> Option<ExecutionEngineConfig> {
+        self.exec_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "portfolio")]
+    const fn py_portfolio(&self) -> Option<PortfolioConfig> {
+        self.portfolio
+    }
+
+    #[getter]
+    #[pyo3(name = "controller")]
+    fn py_controller(&self) -> Option<ImportableControllerConfig> {
+        self.controller.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "streaming")]
+    fn py_streaming(&self) -> Option<StreamingConfig> {
+        self.streaming.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "catalogs")]
+    fn py_catalogs(&self) -> Vec<DataCatalogConfig> {
+        self.catalogs.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
 }
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestVenueConfig {
+    /// Represents a venue configuration for one specific backtest engine.
     #[new]
     #[pyo3(signature = (
         name,
         oms_type,
         account_type,
-        book_type,
         starting_balances,
+        book_type = None,
         routing = None,
         frozen_account = None,
         reject_stop_orders = None,
@@ -154,15 +319,28 @@ impl BacktestVenueConfig {
         base_currency = None,
         default_leverage = None,
         leverages = None,
+        margin_model = None,
+        modules = None,
+        fill_model = None,
+        latency_model = None,
+        fee_model = None,
         price_protection_points = None,
+        liquidation_enabled = None,
+        liquidation_trigger_ratio = None,
+        liquidation_cancel_open_orders = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         name: &str,
-        oms_type: OmsType,
-        account_type: AccountType,
-        book_type: BookType,
+        #[gen_stub(override_type(type_repr = "model.OmsType | str"))] oms_type: &Bound<'_, PyAny>,
+        #[gen_stub(override_type(type_repr = "model.AccountType | str"))] account_type: &Bound<
+            '_,
+            PyAny,
+        >,
         starting_balances: Vec<String>,
+        #[gen_stub(override_type(type_repr = "model.BookType | str | None"))] book_type: Option<
+            &Bound<'_, PyAny>,
+        >,
         routing: Option<bool>,
         frozen_account: Option<bool>,
         reject_stop_orders: Option<bool>,
@@ -178,40 +356,85 @@ impl BacktestVenueConfig {
         liquidity_consumption: Option<bool>,
         allow_cash_borrowing: Option<bool>,
         queue_position: Option<bool>,
-        oto_trigger_mode: Option<OtoTriggerMode>,
+        #[gen_stub(override_type(type_repr = "model.OtoTriggerMode | str | None"))]
+        oto_trigger_mode: Option<&Bound<'_, PyAny>>,
         base_currency: Option<Currency>,
-        default_leverage: Option<f64>,
-        leverages: Option<HashMap<InstrumentId, f64>>,
+        default_leverage: Option<Decimal>,
+        leverages: Option<HashMap<InstrumentId, Decimal>>,
+        margin_model: Option<Py<PyAny>>,
+        modules: Option<Vec<Py<PyAny>>>,
+        fill_model: Option<Py<PyAny>>,
+        latency_model: Option<Py<PyAny>>,
+        fee_model: Option<Py<PyAny>>,
         price_protection_points: Option<u32>,
-    ) -> Self {
-        let leverages = leverages.map(|m| m.into_iter().collect());
-        Self::new(
-            Ustr::from(name),
-            oms_type,
-            account_type,
-            book_type,
-            routing,
-            frozen_account,
-            reject_stop_orders,
-            support_gtd_orders,
-            support_contingent_orders,
-            use_position_ids,
-            use_random_ids,
-            use_reduce_only,
-            bar_execution,
-            bar_adaptive_high_low_ordering,
-            trade_execution,
-            use_market_order_acks,
-            liquidity_consumption,
-            allow_cash_borrowing,
-            queue_position,
-            oto_trigger_mode,
-            starting_balances,
-            base_currency,
-            default_leverage,
-            leverages,
-            price_protection_points,
-        )
+        liquidation_enabled: Option<bool>,
+        liquidation_trigger_ratio: Option<f64>,
+        liquidation_cancel_open_orders: Option<bool>,
+    ) -> pyo3::PyResult<Self> {
+        let oms_type = enum_from_python(oms_type)?;
+        let account_type = enum_from_python(account_type)?;
+        let book_type = book_type
+            .map(enum_from_python)
+            .transpose()?
+            .unwrap_or(BookType::L1_MBP);
+        let oto_trigger_mode = oto_trigger_mode.map(enum_from_python).transpose()?;
+        let margin_model = margin_model
+            .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
+            .transpose()?;
+        let modules = modules
+            .map(|objs| {
+                objs.into_iter()
+                    .map(|obj| Python::attach(|py| pyobject_to_simulation_module_any(obj.bind(py))))
+                    .collect::<pyo3::PyResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let fill_model = fill_model
+            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(obj.bind(py))))
+            .transpose()?;
+        let latency_model = latency_model
+            .map(|obj| Python::attach(|py| pyobject_to_latency_model_any(obj.bind(py))))
+            .transpose()?;
+        let fee_model = fee_model
+            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(obj.bind(py))))
+            .transpose()?;
+
+        Self::builder()
+            .name(Ustr::from(name))
+            .oms_type(oms_type)
+            .account_type(account_type)
+            .book_type(book_type)
+            .starting_balances(starting_balances)
+            .maybe_routing(routing)
+            .maybe_frozen_account(frozen_account)
+            .maybe_reject_stop_orders(reject_stop_orders)
+            .maybe_support_gtd_orders(support_gtd_orders)
+            .maybe_support_contingent_orders(support_contingent_orders)
+            .maybe_use_position_ids(use_position_ids)
+            .maybe_use_random_ids(use_random_ids)
+            .maybe_use_reduce_only(use_reduce_only)
+            .maybe_bar_execution(bar_execution)
+            .maybe_bar_adaptive_high_low_ordering(bar_adaptive_high_low_ordering)
+            .maybe_trade_execution(trade_execution)
+            .maybe_use_market_order_acks(use_market_order_acks)
+            .maybe_liquidity_consumption(liquidity_consumption)
+            .maybe_allow_cash_borrowing(allow_cash_borrowing)
+            .maybe_queue_position(queue_position)
+            .maybe_oto_trigger_mode(oto_trigger_mode)
+            .maybe_base_currency(base_currency)
+            .maybe_default_leverage(default_leverage)
+            .maybe_leverages(leverages.map(|m| m.into_iter().collect()))
+            .maybe_margin_model(margin_model)
+            .modules(modules)
+            .maybe_fill_model(fill_model)
+            .maybe_latency_model(latency_model)
+            .maybe_fee_model(fee_model)
+            .maybe_price_protection_points(price_protection_points)
+            .maybe_liquidation_enabled(liquidation_enabled)
+            .maybe_liquidation_trigger_ratio(liquidation_trigger_ratio)
+            .maybe_liquidation_cancel_open_orders(liquidation_cancel_open_orders)
+            .build()
+            .map_err(config_error_to_pyvalue_err)
     }
 
     #[getter]
@@ -245,6 +468,54 @@ impl BacktestVenueConfig {
     }
 
     #[getter]
+    #[pyo3(name = "routing")]
+    fn py_routing(&self) -> bool {
+        self.routing()
+    }
+
+    #[getter]
+    #[pyo3(name = "frozen_account")]
+    fn py_frozen_account(&self) -> bool {
+        self.frozen_account()
+    }
+
+    #[getter]
+    #[pyo3(name = "reject_stop_orders")]
+    fn py_reject_stop_orders(&self) -> bool {
+        self.reject_stop_orders()
+    }
+
+    #[getter]
+    #[pyo3(name = "support_gtd_orders")]
+    fn py_support_gtd_orders(&self) -> bool {
+        self.support_gtd_orders()
+    }
+
+    #[getter]
+    #[pyo3(name = "support_contingent_orders")]
+    fn py_support_contingent_orders(&self) -> bool {
+        self.support_contingent_orders()
+    }
+
+    #[getter]
+    #[pyo3(name = "use_position_ids")]
+    fn py_use_position_ids(&self) -> bool {
+        self.use_position_ids()
+    }
+
+    #[getter]
+    #[pyo3(name = "use_random_ids")]
+    fn py_use_random_ids(&self) -> bool {
+        self.use_random_ids()
+    }
+
+    #[getter]
+    #[pyo3(name = "use_reduce_only")]
+    fn py_use_reduce_only(&self) -> bool {
+        self.use_reduce_only()
+    }
+
+    #[getter]
     #[pyo3(name = "bar_execution")]
     fn py_bar_execution(&self) -> bool {
         self.bar_execution()
@@ -256,19 +527,146 @@ impl BacktestVenueConfig {
         self.trade_execution()
     }
 
+    #[getter]
+    #[pyo3(name = "bar_adaptive_high_low_ordering")]
+    fn py_bar_adaptive_high_low_ordering(&self) -> bool {
+        self.bar_adaptive_high_low_ordering()
+    }
+
+    #[getter]
+    #[pyo3(name = "use_market_order_acks")]
+    fn py_use_market_order_acks(&self) -> bool {
+        self.use_market_order_acks()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidity_consumption")]
+    fn py_liquidity_consumption(&self) -> bool {
+        self.liquidity_consumption()
+    }
+
+    #[getter]
+    #[pyo3(name = "allow_cash_borrowing")]
+    fn py_allow_cash_borrowing(&self) -> bool {
+        self.allow_cash_borrowing()
+    }
+
+    #[getter]
+    #[pyo3(name = "queue_position")]
+    fn py_queue_position(&self) -> bool {
+        self.queue_position()
+    }
+
+    #[getter]
+    #[pyo3(name = "oto_trigger_mode")]
+    fn py_oto_trigger_mode(&self) -> OtoTriggerMode {
+        self.oto_trigger_mode()
+    }
+
+    #[getter]
+    #[pyo3(name = "base_currency")]
+    fn py_base_currency(&self) -> Option<Currency> {
+        self.base_currency()
+    }
+
+    #[getter]
+    #[pyo3(name = "default_leverage")]
+    fn py_default_leverage(&self) -> Option<Decimal> {
+        self.default_leverage()
+    }
+
+    #[getter]
+    #[pyo3(name = "leverages")]
+    fn py_leverages(&self) -> Option<HashMap<InstrumentId, Decimal>> {
+        self.leverages().map(|leverages| {
+            leverages
+                .iter()
+                .map(|(key, value)| (*key, *value))
+                .collect()
+        })
+    }
+
+    #[getter]
+    #[pyo3(name = "margin_model")]
+    fn py_margin_model(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.margin_model()
+            .map(|model| margin_model_any_to_pyobject(py, model))
+            .transpose()
+    }
+
+    #[getter]
+    #[pyo3(name = "modules")]
+    fn py_modules(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.modules()
+            .iter()
+            .map(|module| simulation_module_any_to_pyobject(py, module))
+            .collect()
+    }
+
+    #[getter]
+    #[pyo3(name = "fill_model")]
+    fn py_fill_model(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.fill_model()
+            .map(|model| fill_model_any_to_pyobject(py, model))
+            .transpose()
+    }
+
+    #[getter]
+    #[pyo3(name = "latency_model")]
+    fn py_latency_model(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.latency_model()
+            .map(|model| latency_model_any_to_pyobject(py, model))
+            .transpose()
+    }
+
+    #[getter]
+    #[pyo3(name = "fee_model")]
+    fn py_fee_model(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.fee_model()
+            .map(|model| fee_model_any_to_pyobject(py, model))
+            .transpose()
+    }
+
+    #[getter]
+    #[pyo3(name = "price_protection_points")]
+    fn py_price_protection_points(&self) -> u32 {
+        self.price_protection_points()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidation_enabled")]
+    fn py_liquidation_enabled(&self) -> bool {
+        self.liquidation_enabled()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidation_trigger_ratio")]
+    fn py_liquidation_trigger_ratio(&self) -> f64 {
+        self.liquidation_trigger_ratio()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidation_cancel_open_orders")]
+    fn py_liquidation_cancel_open_orders(&self) -> bool {
+        self.liquidation_cancel_open_orders()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
 }
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestDataConfig {
+    /// Represents the data configuration for one specific backtest run.
     #[new]
     #[pyo3(signature = (
         data_type,
         catalog_path,
         catalog_fs_protocol = None,
         catalog_fs_storage_options = None,
+        catalog_fs_rust_storage_options = None,
         instrument_id = None,
         instrument_ids = None,
         start_time = None,
@@ -279,52 +677,91 @@ impl BacktestDataConfig {
         bar_spec = None,
         bar_types = None,
         optimize_file_loading = None,
+        catalog_backend = None,
+        batch_deltas = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
-        data_type: &str,
+        #[gen_stub(override_type(type_repr = "model.NautilusDataType"))] data_type: &Bound<
+            '_,
+            PyAny,
+        >,
         catalog_path: String,
         catalog_fs_protocol: Option<String>,
         catalog_fs_storage_options: Option<HashMap<String, String>>,
+        catalog_fs_rust_storage_options: Option<HashMap<String, String>>,
         instrument_id: Option<InstrumentId>,
         instrument_ids: Option<Vec<InstrumentId>>,
-        start_time: Option<u64>,
-        end_time: Option<u64>,
+        #[gen_stub(override_type(
+            type_repr = "int | str | datetime.datetime | pd.Timestamp | None",
+            imports = ("datetime", "pandas as pd")
+        ))]
+        start_time: Option<Py<PyAny>>,
+        #[gen_stub(override_type(
+            type_repr = "int | str | datetime.datetime | pd.Timestamp | None",
+            imports = ("datetime", "pandas as pd")
+        ))]
+        end_time: Option<Py<PyAny>>,
         filter_expr: Option<String>,
         client_id: Option<ClientId>,
         metadata: Option<HashMap<String, String>>,
         bar_spec: Option<BarSpecification>,
         bar_types: Option<Vec<String>>,
         optimize_file_loading: Option<bool>,
+        catalog_backend: Option<pyo3::PyRef<'_, PyCatalogBackend>>,
+        batch_deltas: Option<bool>,
     ) -> pyo3::PyResult<Self> {
         let data_type = data_type
-            .parse::<NautilusDataType>()
-            .map_err(nautilus_core::python::to_pyvalue_err)?;
-        let catalog_fs_storage_options =
-            catalog_fs_storage_options.map(|m| m.into_iter().collect());
-        let metadata = metadata.map(|m| m.into_iter().collect());
-        Ok(Self::new(
-            data_type,
-            catalog_path,
-            catalog_fs_protocol,
-            catalog_fs_storage_options,
-            instrument_id,
-            instrument_ids,
-            start_time.map(UnixNanos::from),
-            end_time.map(UnixNanos::from),
-            filter_expr,
-            client_id,
-            metadata,
-            bar_spec,
-            bar_types,
-            optimize_file_loading,
-        ))
+            .extract::<pyo3::PyRef<'_, PyNautilusDataType>>()
+            .map(|data_type| data_type.inner())
+            .map_err(|_| to_pytype_err("data_type must be NautilusDataType"))?;
+        let start_time = timestamp_from_python(start_time)?;
+        let end_time = timestamp_from_python(end_time)?;
+        Self::builder()
+            .data_type(data_type)
+            .catalog_path(catalog_path)
+            .catalog_backend(
+                catalog_backend
+                    .map(|backend| backend.inner())
+                    .unwrap_or_default(),
+            )
+            .maybe_catalog_fs_protocol(catalog_fs_protocol)
+            .maybe_catalog_fs_storage_options(catalog_fs_storage_options.map(|m| {
+                m.into_iter()
+                    .map(|(key, value)| (key, value.into()))
+                    .collect()
+            }))
+            .maybe_catalog_fs_rust_storage_options(catalog_fs_rust_storage_options.map(|m| {
+                m.into_iter()
+                    .map(|(key, value)| (key, value.into()))
+                    .collect()
+            }))
+            .maybe_instrument_id(instrument_id)
+            .maybe_instrument_ids(instrument_ids)
+            .maybe_start_time(start_time)
+            .maybe_end_time(end_time)
+            .maybe_filter_expr(filter_expr)
+            .maybe_client_id(client_id)
+            .maybe_metadata(metadata.map(|m| m.into_iter().collect()))
+            .maybe_bar_spec(bar_spec)
+            .maybe_bar_types(bar_types)
+            .maybe_optimize_file_loading(optimize_file_loading)
+            .maybe_batch_deltas(batch_deltas)
+            .build()
+            .map_err(config_error_to_pyvalue_err)
+    }
+
+    /// Returns the configured catalog backend.
+    #[getter]
+    #[pyo3(name = "catalog_backend")]
+    fn py_catalog_backend(&self) -> PyCatalogBackend {
+        PyCatalogBackend::new(self.catalog_backend())
     }
 
     #[getter]
     #[pyo3(name = "data_type")]
-    fn py_data_type(&self) -> String {
-        self.data_type().to_string()
+    fn py_data_type(&self) -> PyNautilusDataType {
+        PyNautilusDataType::new(self.data_type().clone())
     }
 
     #[getter]
@@ -339,13 +776,107 @@ impl BacktestDataConfig {
         self.instrument_id()
     }
 
+    #[getter]
+    #[pyo3(name = "catalog_fs_protocol")]
+    fn py_catalog_fs_protocol(&self) -> Option<&str> {
+        self.catalog_fs_protocol()
+    }
+
+    #[getter]
+    #[pyo3(name = "catalog_fs_storage_option_keys")]
+    fn py_catalog_fs_storage_option_keys(&self) -> Option<Vec<String>> {
+        self.catalog_fs_storage_options().map(|options| {
+            let mut keys = options.keys().cloned().collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        })
+    }
+
+    #[getter]
+    #[pyo3(name = "catalog_fs_rust_storage_option_keys")]
+    fn py_catalog_fs_rust_storage_option_keys(&self) -> Option<Vec<String>> {
+        self.catalog_fs_rust_storage_options().map(|options| {
+            let mut keys = options.keys().cloned().collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        })
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_ids")]
+    fn py_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
+        self.instrument_ids().map(<[InstrumentId]>::to_vec)
+    }
+
+    #[getter]
+    #[pyo3(name = "start_time")]
+    fn py_start_time(&self) -> Option<u64> {
+        self.start_time().map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "end_time")]
+    fn py_end_time(&self) -> Option<u64> {
+        self.end_time().map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "filter_expr")]
+    fn py_filter_expr(&self) -> Option<&str> {
+        self.filter_expr()
+    }
+
+    #[getter]
+    #[pyo3(name = "client_id")]
+    fn py_client_id(&self) -> Option<ClientId> {
+        self.client_id()
+    }
+
+    #[getter]
+    #[pyo3(name = "metadata")]
+    fn py_metadata(&self) -> Option<HashMap<String, String>> {
+        self.metadata().map(|metadata| {
+            metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+    }
+
+    #[getter]
+    #[pyo3(name = "bar_spec")]
+    fn py_bar_spec(&self) -> Option<BarSpecification> {
+        self.bar_spec()
+    }
+
+    #[getter]
+    #[pyo3(name = "bar_types")]
+    fn py_bar_types(&self) -> Option<Vec<String>> {
+        self.bar_types().map(<[String]>::to_vec)
+    }
+
+    #[getter]
+    #[pyo3(name = "optimize_file_loading")]
+    fn py_optimize_file_loading(&self) -> bool {
+        self.optimize_file_loading()
+    }
+
+    #[getter]
+    #[pyo3(name = "batch_deltas")]
+    fn py_batch_deltas(&self) -> bool {
+        self.batch_deltas()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
 }
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestRunConfig {
+    /// Represents the configuration for one specific backtest run.
+    /// This includes a backtest engine with its actors and strategies, with the external inputs of venues and data.
     #[new]
     #[pyo3(signature = (
         venues,
@@ -353,31 +884,45 @@ impl BacktestRunConfig {
         engine = None,
         id = None,
         chunk_size = None,
+        raise_exception = None,
         dispose_on_completion = None,
         start = None,
         end = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         venues: Vec<BacktestVenueConfig>,
         data: Vec<BacktestDataConfig>,
         engine: Option<BacktestEngineConfig>,
         id: Option<String>,
         chunk_size: Option<usize>,
+        raise_exception: Option<bool>,
         dispose_on_completion: Option<bool>,
-        start: Option<u64>,
-        end: Option<u64>,
-    ) -> Self {
-        Self::new(
-            id,
-            venues,
-            data,
-            engine.unwrap_or_default(),
-            chunk_size,
-            dispose_on_completion,
-            start.map(UnixNanos::from),
-            end.map(UnixNanos::from),
-        )
+        #[gen_stub(override_type(
+            type_repr = "int | str | datetime.datetime | pd.Timestamp | None",
+            imports = ("datetime", "pandas as pd")
+        ))]
+        start: Option<Py<PyAny>>,
+        #[gen_stub(override_type(
+            type_repr = "int | str | datetime.datetime | pd.Timestamp | None",
+            imports = ("datetime", "pandas as pd")
+        ))]
+        end: Option<Py<PyAny>>,
+    ) -> pyo3::PyResult<Self> {
+        let start = timestamp_from_python(start)?;
+        let end = timestamp_from_python(end)?;
+        Self::builder()
+            .venues(venues)
+            .data(data)
+            .maybe_engine(engine)
+            .maybe_id(id)
+            .maybe_chunk_size(chunk_size)
+            .maybe_raise_exception(raise_exception)
+            .maybe_dispose_on_completion(dispose_on_completion)
+            .maybe_start(start)
+            .maybe_end(end)
+            .build()
+            .map_err(config_error_to_pyvalue_err)
     }
 
     #[getter]
@@ -386,7 +931,190 @@ impl BacktestRunConfig {
         self.id()
     }
 
+    #[getter]
+    #[pyo3(name = "venues")]
+    fn py_venues(&self) -> Vec<BacktestVenueConfig> {
+        self.venues().to_vec()
+    }
+
+    #[getter]
+    #[pyo3(name = "data")]
+    fn py_data(&self) -> Vec<BacktestDataConfig> {
+        self.data().to_vec()
+    }
+
+    #[getter]
+    #[pyo3(name = "engine")]
+    fn py_engine(&self) -> BacktestEngineConfig {
+        self.engine().clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "chunk_size")]
+    fn py_chunk_size(&self) -> Option<usize> {
+        self.chunk_size()
+    }
+
+    #[getter]
+    #[pyo3(name = "raise_exception")]
+    fn py_raise_exception(&self) -> bool {
+        self.raise_exception()
+    }
+
+    #[getter]
+    #[pyo3(name = "dispose_on_completion")]
+    fn py_dispose_on_completion(&self) -> bool {
+        self.dispose_on_completion()
+    }
+
+    #[getter]
+    #[pyo3(name = "start")]
+    fn py_start(&self) -> Option<u64> {
+        self.start().map(|timestamp| timestamp.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "end")]
+    fn py_end(&self) -> Option<u64> {
+        self.end().map(|timestamp| timestamp.as_u64())
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
+    }
+}
+
+fn timestamp_from_python(value: Option<Py<PyAny>>) -> PyResult<Option<UnixNanos>> {
+    value
+        .map(|value| {
+            Python::attach(|py| {
+                py.import("nautilus_trader.core.datetime")?
+                    .getattr("dt_to_unix_nanos")?
+                    .call1((value,))?
+                    .extract::<u64>()
+                    .map(UnixNanos::from)
+            })
+        })
+        .transpose()
+}
+
+fn enum_from_python<'py, E>(value: &Bound<'py, PyAny>) -> PyResult<E>
+where
+    E: pyo3::conversion::FromPyObjectOwned<'py> + FromStr,
+    E::Err: Display,
+{
+    if let Ok(value) = value.extract::<E>() {
+        return Ok(value);
+    }
+    value
+        .extract::<String>()?
+        .parse::<E>()
+        .map_err(to_pyvalue_err)
+}
+
+fn margin_model_any_to_pyobject(py: Python<'_>, model: &MarginModelAny) -> PyResult<Py<PyAny>> {
+    match model {
+        MarginModelAny::Standard(model) => (*model).into_py_any(py),
+        MarginModelAny::Leveraged(model) => (*model).into_py_any(py),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ahash::AHashMap;
+    use nautilus_core::string::secret::SecretString;
+    use nautilus_model::data::NautilusDataType;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_data_config_py_new_keeps_storage_option_values() {
+        Python::initialize();
+
+        let config = Python::attach(|py| {
+            let data_type =
+                Bound::new(py, PyNautilusDataType::new(NautilusDataType::QuoteTick)).unwrap();
+            BacktestDataConfig::py_new(
+                data_type.as_any(),
+                "bucket/catalog".to_string(),
+                Some("s3".to_string()),
+                Some(HashMap::from([("key".to_string(), "fs-key".to_string())])),
+                Some(HashMap::from([(
+                    "aws_secret_access_key".to_string(),
+                    "rust-secret".to_string(),
+                )])),
+                Some(InstrumentId::from("EUR/USD.SIM")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+
+        assert_eq!(
+            config.catalog_fs_storage_options(),
+            Some(&AHashMap::from([(
+                "key".to_string(),
+                SecretString::from("fs-key"),
+            )]))
+        );
+        assert_eq!(
+            config.catalog_fs_rust_storage_options(),
+            Some(&AHashMap::from([(
+                "aws_secret_access_key".to_string(),
+                SecretString::from("rust-secret"),
+            )]))
+        );
+    }
+
+    #[rstest]
+    #[case::default(None, true)]
+    #[case::disabled(Some(false), false)]
+    #[case::enabled(Some(true), true)]
+    fn test_data_config_py_new_sets_batch_deltas(
+        #[case] batch_deltas: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        Python::initialize();
+
+        let config = Python::attach(|py| {
+            let data_type = Bound::new(
+                py,
+                PyNautilusDataType::new(NautilusDataType::OrderBookDelta),
+            )
+            .unwrap();
+            BacktestDataConfig::py_new(
+                data_type.as_any(),
+                "catalog".to_string(),
+                None,
+                None,
+                None,
+                Some(InstrumentId::from("EUR/USD.SIM")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                batch_deltas,
+            )
+            .unwrap()
+        });
+
+        assert_eq!(config.batch_deltas(), expected);
+        assert_eq!(config.py_batch_deltas(), expected);
     }
 }

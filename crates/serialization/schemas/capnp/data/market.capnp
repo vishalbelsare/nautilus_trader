@@ -1,5 +1,8 @@
 @0xe9ad557eba0125dc;
 # Cap'n Proto schema for Nautilus market data types
+#
+# WARNING: This schema is not yet stable and may change without notice
+# between releases. Do not depend on wire compatibility across versions.
 
 using Identifiers = import "../common/identifiers.capnp";
 using Types = import "../common/types.capnp";
@@ -30,7 +33,7 @@ struct TradeTick {
 
 # Bar specification
 struct BarSpec {
-    step @0 :UInt32;
+    step @0 :UInt64;
     aggregation @1 :Enums.BarAggregation;
     priceType @2 :Enums.PriceType;
 }
@@ -82,11 +85,11 @@ struct InstrumentClose {
 struct InstrumentStatus {
     instrumentId @0 :Identifiers.InstrumentId;
     action @1 :Enums.MarketStatusAction;
-    reason @2 :Text;  # Optional explanation (empty if not provided)
-    tradingEvent @3 :Text;  # Optional venue-specific trading event description
-    isTrading @4 :Bool;
-    isQuoting @5 :Bool;
-    isShortSellRestricted @6 :Bool;
+    reason @2 :Text;  # Optional - absence means None
+    tradingEvent @3 :Text;  # Optional - absence means None
+    isTrading @4 :Enums.OptionalBool;
+    isQuoting @5 :Enums.OptionalBool;
+    isShortSellRestricted @6 :Enums.OptionalBool;
     tsEvent @7 :Base.UnixNanos;
     tsInit @8 :Base.UnixNanos;
 }
@@ -95,10 +98,34 @@ struct InstrumentStatus {
 struct FundingRateUpdate {
     instrumentId @0 :Identifiers.InstrumentId;
     rate @1 :Types.Decimal;  # Decimal as binary (optimized)
-    interval @2 :UInt16;  # Optional - 0 means None
-    nextFundingTime @3 :Base.UnixNanos;  # Optional - 0 means None
+    interval @2 :UInt16;  # Valid when hasInterval is true
+    nextFundingTime @3 :Base.UnixNanos;  # Optional - absence means None
     tsEvent @4 :Base.UnixNanos;
     tsInit @5 :Base.UnixNanos;
+    hasInterval @6 :Bool;  # Presence flag for interval
+}
+
+# Option greeks and implied volatility for a single instrument
+struct OptionGreeks {
+    instrumentId @0 :Identifiers.InstrumentId;
+    convention @1 :Enums.GreeksConvention;
+    delta @2 :Float64;
+    gamma @3 :Float64;
+    vega @4 :Float64;
+    theta @5 :Float64;
+    rho @6 :Float64;
+    markIv @7 :Float64;  # Valid when hasMarkIv is true
+    bidIv @8 :Float64;  # Valid when hasBidIv is true
+    askIv @9 :Float64;  # Valid when hasAskIv is true
+    underlyingPrice @10 :Float64;  # Valid when hasUnderlyingPrice is true
+    openInterest @11 :Float64;  # Valid when hasOpenInterest is true
+    hasMarkIv @12 :Bool;
+    hasBidIv @13 :Bool;
+    hasAskIv @14 :Bool;
+    hasUnderlyingPrice @15 :Bool;
+    hasOpenInterest @16 :Bool;
+    tsEvent @17 :Base.UnixNanos;
+    tsInit @18 :Base.UnixNanos;
 }
 
 # Market data enum union
@@ -109,12 +136,13 @@ struct DataAny {
         bar @2 :Bar;
         markPrice @3 :MarkPriceUpdate;
         indexPrice @4 :IndexPriceUpdate;
-        instrumentClose @5 :InstrumentClose;
-        instrumentStatus @6 :InstrumentStatus;
-        fundingRate @7 :FundingRateUpdate;
-        orderBookDelta @8 :OrderBookDelta;
-        orderBookDeltas @9 :OrderBookDeltas;
-        orderBookDepth10 @10 :OrderBookDepth10;
+        fundingRate @5 :FundingRateUpdate;
+        optionGreeks @6 :OptionGreeks;
+        instrumentStatus @7 :InstrumentStatus;
+        instrumentClose @8 :InstrumentClose;
+        orderBookDelta @9 :OrderBookDelta;
+        orderBookDeltas @10 :OrderBookDeltas;
+        orderBookDepth @11 :OrderBookDepth;
     }
 }
 
@@ -153,11 +181,12 @@ struct BookLevel {
     size @1 :Types.Quantity;
 }
 
-# Order book depth (top 10 levels)
-struct OrderBookDepth10 {
+# Order book depth snapshot with a variable number of levels per side.
+# The node ID is pinned to the pre-rename `OrderBookDepth10` identity for wire continuity.
+struct OrderBookDepth @0xa314672be4630bdd {
     instrumentId @0 :Identifiers.InstrumentId;
-    bids @1 :List(BookLevel);  # Up to 10 levels
-    asks @2 :List(BookLevel);  # Up to 10 levels
+    bids @1 :List(BookLevel);
+    asks @2 :List(BookLevel);
     bidCounts @3 :List(UInt32);
     askCounts @4 :List(UInt32);
     flags @5 :UInt8;

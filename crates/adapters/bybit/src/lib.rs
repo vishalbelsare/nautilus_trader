@@ -14,38 +14,34 @@
 // -------------------------------------------------------------------------------------------------
 
 //! [NautilusTrader](https://nautilustrader.io) adapter for the
-//! [Bybit](https://www.bybit.com/) cryptocurrency exchange.
+//! [Bybit](https://www.bybit.com) cryptocurrency exchange.
 //!
-//! The `nautilus-bybit` crate provides client bindings (HTTP & WebSocket), data
-//! models, and helper utilities that wrap the official **Bybit v5 API**.
+//! The `nautilus-bybit` crate provides client bindings (HTTP & WebSocket) and data
+//! models for the official **Bybit v5 API**.
 //!
 //! The official Bybit API reference can be found at <https://bybit-exchange.github.io/docs/v5/intro>.
 //! All public links inside this crate reference the English version of the documentation.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software
-//! correctness and safety at the highest level, with the aim of supporting mission-critical trading
-//! system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
 //! This crate provides feature flags to control source code inclusion during compilation,
 //! depending on the intended use case (Rust-only builds vs. Python bindings through PyO3).
 //!
-//! - `python`: Enables Python bindings via [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds as a Python extension module (used together with `python`).
-//!
-//! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
-//!
-//! # Documentation
-//!
-//! See <https://docs.rs/nautilus-bybit> for the latest API documentation.
+//! - `arrow`: Enables Apache Arrow data support.
+//! - `examples`: Enables the crate's example binaries.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision` (default): Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -54,14 +50,19 @@
 // #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
+pub(crate) mod book;
 pub mod common;
 pub mod config;
 pub mod data;
-pub mod error;
+pub mod data_types;
 pub mod execution;
 pub mod factories;
 pub mod http;
+pub(crate) mod repay;
 pub mod websocket;
 
 #[cfg(feature = "python")]

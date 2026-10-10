@@ -15,20 +15,21 @@
 
 //! Example demonstrating live data testing with the Betfair adapter.
 //!
-//! Run with: `cargo run -p nautilus-betfair --example betfair-data-tester`
+//! Run with: `cargo run -p nautilus-betfair --example betfair-data-tester --features examples`
 //!
-//! Environment variables:
+//! Required environment variables:
 //! - `BETFAIR_USERNAME`: Your Betfair username
 //! - `BETFAIR_PASSWORD`: Your Betfair password
 //! - `BETFAIR_APP_KEY`: Your Betfair application key
-//! - `BETFAIR_MARKET_ID`: Optional market ID override. Defaults to `1.254209667`
+//! - `BETFAIR_MARKET_ID`: An active Betfair market ID
 //!
 //! Market IDs can be found from `https://www.betfair.com.au/exchange/plus/`
 
 use std::sync::Arc;
 
 use nautilus_betfair::{
-    config::BetfairDataConfig,
+    common::consts::BETFAIR_CLIENT_ID,
+    config::BetfairDataClientConfig,
     factories::BetfairDataClientFactory,
     http::client::BetfairHttpClient,
     provider::{BetfairInstrumentProvider, NavigationFilter},
@@ -36,29 +37,33 @@ use nautilus_betfair::{
 use nautilus_common::{enums::Environment, providers::InstrumentProvider};
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     instruments::{Instrument, InstrumentAny},
     types::Currency,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
 
+const TRADER_ID: &str = "TESTER-001";
+const NODE_NAME: &str = "BETFAIR-DATA-TESTER-001";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    let market_id =
-        std::env::var("BETFAIR_MARKET_ID").unwrap_or_else(|_| "1.254209667".to_string());
+    let market_id = std::env::var("BETFAIR_MARKET_ID").map_err(|_| {
+        anyhow::anyhow!("BETFAIR_MARKET_ID must be set to an active Betfair market")
+    })?;
     let (account_currency, instruments) = load_market_context(&market_id).await?;
     let instrument_ids = instrument_ids(&instruments);
 
     println!("Found instruments for market {market_id}: {instrument_ids:?}");
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let node_name = "BETFAIR-DATA-TESTER-001".to_string();
-    let client_id = ClientId::new("BETFAIR");
+    let trader_id = TraderId::from(TRADER_ID);
+    let node_name = NODE_NAME.to_string();
+    let client_id = *BETFAIR_CLIENT_ID;
 
-    let data_config = BetfairDataConfig {
+    let data_config = BetfairDataClientConfig {
         account_currency,
         market_ids: Some(vec![market_id]),
         stream_conflate_ms: Some(0),
@@ -73,12 +78,15 @@ async fn main() -> anyhow::Result<()> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let tester_config = DataTesterConfig::new(client_id, instrument_ids)
-        .with_subscribe_book_deltas(true)
-        .with_subscribe_trades(true)
-        .with_subscribe_instrument_status(true)
-        .with_can_unsubscribe(false)
-        .with_log_data(true);
+    let tester_config = DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .subscribe_book_deltas(true)
+        .subscribe_trades(true)
+        .subscribe_instrument_status(true)
+        .can_unsubscribe(false)
+        .manage_book(true)
+        .build()?;
 
     let tester = DataTester::new(tester_config);
 
@@ -89,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn load_market_context(market_id: &str) -> anyhow::Result<(String, Vec<InstrumentAny>)> {
-    let credential = BetfairDataConfig::default().credential()?;
+    let credential = BetfairDataClientConfig::default().credential()?;
     let http_client = Arc::new(BetfairHttpClient::new(
         credential,
         None,
@@ -133,7 +141,7 @@ async fn load_market_context(market_id: &str) -> anyhow::Result<(String, Vec<Ins
         );
     }
 
-    Ok((account_currency.code.as_str().to_string(), instruments))
+    Ok((account_currency.code.to_string(), instruments))
 }
 
 fn instrument_ids(instruments: &[InstrumentAny]) -> Vec<InstrumentId> {

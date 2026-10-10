@@ -1,29 +1,23 @@
 name: common-test-data
-description: Common test data caching
+description: Prepare, verify, and cache common test data
 
 runs:
   using: "composite"
   steps:
-    - name: Restore test data from cache
+    - name: Cache test data
       # Skip on macOS: hashFiles() broken in composite actions after Nov 20 runner update
       # See: https://github.com/actions/runner/issues/3765
       if: runner.os != 'macOS'
-      id: cached-testdata-large
-      # https://github.com/actions/cache/tree/main/restore
-      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      # The post step saves fixtures fetched by the preparation step
+      # https://github.com/actions/cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: tests/test_data/large
-        key: large-files-${{ hashFiles('tests/test_data/large/checksums.json') }}
+        # Keep the tracked checksum manifest from the checked-out commit.
+        path: test_data/large/*.parquet
+        key: large-files-${{ hashFiles('test_data/large/checksums.json') }}
         restore-keys: large-files-
         enableCrossOsArchive: true
 
-    - name: Save test data to cache
-      # Skip on macOS: hashFiles() broken in composite actions after Nov 20 runner update
-      # See: https://github.com/actions/runner/issues/3765
-      if: ${{ runner.os != 'macOS' && always() && steps.cached-testdata-large.outputs.cache-hit != 'true' }}
-      # https://github.com/actions/cache/tree/main/save
-      uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-      with:
-        path: tests/test_data/large
-        key: large-files-${{ hashFiles('tests/test_data/large/checksums.json') }}
-        enableCrossOsArchive: true
+    - name: Prepare test data
+      shell: bash
+      run: cargo run --locked -p nautilus-testkit --bin prepare-test-data

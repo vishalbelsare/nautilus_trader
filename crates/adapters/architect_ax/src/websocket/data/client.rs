@@ -16,7 +16,8 @@
 //! Market data WebSocket client for Ax.
 
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display},
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
@@ -24,27 +25,34 @@ use std::{
     time::Duration,
 };
 
+use ahash::AHashSet;
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use nautilus_common::live::get_runtime;
-use nautilus_core::consts::NAUTILUS_USER_AGENT;
+use nautilus_core::{AtomicMap, string::secret::SecretString};
+use nautilus_live::{
+    SocketControl,
+    book::snapshot::SnapshotGate,
+    task::{SharedTaskSlot, TaskJoinOutcome},
+};
 use nautilus_network::{
-    backoff::ExponentialBackoff,
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
-        PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig, channel_message_handler,
+        InitialConnectRetryPolicy, PingHandler, ReconnectHeaders, SubscriptionState,
+        TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
+use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
-use super::handler::{AxMdWsFeedHandler, HandlerCommand};
+use super::{
+    AxMdSubscriptionSpec,
+    handler::{AxMdWsFeedHandler, HandlerCommand},
+};
 use crate::{
     common::enums::{AxCandleWidth, AxMarketDataLevel},
     websocket::messages::AxDataWsMessage,
 };
-
-/// Default heartbeat interval in seconds.
-const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 
 /// Subscription topic delimiter for Ax.
 const AX_TOPIC_DELIMITER: char = ':';
@@ -59,13 +67,24 @@ pub enum AxWsClientError {
     Transport(String),
     /// Channel send error.
     ChannelError(String),
+    /// Client request error, such as a book that is no longer subscribed.
+    ClientError(String),
+    /// Operation timeout, such as a book snapshot that did not arrive.
+    OperationTimeout { timeout_ms: u64 },
+    /// Book frame that could not be converted to a snapshot.
+    InvalidSnapshot(String),
 }
 
-impl core::fmt::Display for AxWsClientError {
+impl Display for AxWsClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Transport(msg) => write!(f, "Transport error: {msg}"),
             Self::ChannelError(msg) => write!(f, "Channel error: {msg}"),
+            Self::ClientError(msg) => write!(f, "Client error: {msg}"),
+            Self::OperationTimeout { timeout_ms } => {
+                write!(f, "Operation timed out after {timeout_ms}ms")
+            }
+            Self::InvalidSnapshot(msg) => write!(f, "Invalid book snapshot: {msg}"),
         }
     }
 }
@@ -76,23 +95,50 @@ impl std::error::Error for AxWsClientError {}
 pub struct SymbolDataTypes {
     pub quotes: bool,
     pub trades: bool,
+    pub mark_prices: bool,
+    pub instrument_status: bool,
     pub book_level: Option<AxMarketDataLevel>,
 }
 
 impl SymbolDataTypes {
-    pub fn effective_level(&self) -> Option<AxMarketDataLevel> {
-        if let Some(level) = self.book_level {
-            return Some(level);
+    fn effective_subscription(&self) -> Option<AxMdSubscriptionSpec> {
+        let book_level = self.book_level.or({
+            if self.quotes || self.ticker() {
+                Some(AxMarketDataLevel::Level1)
+            } else {
+                None
+            }
+        });
+
+        if let Some(level) = book_level {
+            return Some(self.book_subscription(level));
         }
 
-        if self.quotes || self.trades {
-            return Some(AxMarketDataLevel::Level1);
+        if self.trades {
+            return Some(AxMdSubscriptionSpec::new(
+                AxMarketDataLevel::Trades,
+                None,
+                None,
+            ));
         }
+
         None
     }
 
+    fn book_subscription(&self, level: AxMarketDataLevel) -> AxMdSubscriptionSpec {
+        AxMdSubscriptionSpec::new(level, Some(self.trades), Some(self.ticker()))
+    }
+
+    fn ticker(&self) -> bool {
+        self.mark_prices || self.instrument_status
+    }
+
     fn is_empty(&self) -> bool {
-        !self.quotes && !self.trades && self.book_level.is_none()
+        !self.quotes
+            && !self.trades
+            && !self.mark_prices
+            && !self.instrument_status
+            && self.book_level.is_none()
     }
 }
 
@@ -103,16 +149,23 @@ impl SymbolDataTypes {
 pub struct AxMdWebSocketClient {
     url: String,
     heartbeat: Option<u64>,
-    auth_token: Option<String>,
+    auth_token: Arc<Mutex<Option<SecretString>>>,
+    reconnect_headers: Arc<Mutex<Option<ReconnectHeaders>>>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<AxDataWsMessage>>>,
     signal: Arc<AtomicBool>,
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    cancellation_token: Arc<ArcSwap<CancellationToken>>,
+    task_handle: Arc<SharedTaskSlot<()>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     subscriptions: SubscriptionState,
     request_id_counter: Arc<AtomicI64>,
     subscribe_lock: Arc<tokio::sync::Mutex<()>>,
-    symbol_data_types: Arc<DashMap<String, SymbolDataTypes>>,
+    symbol_data_types: Arc<AtomicMap<String, SymbolDataTypes>>,
+    status_invalidations: Arc<Mutex<AHashSet<Ustr>>>,
+    transport_backend: TransportBackend,
+    proxy_url: Option<SecretString>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for AxMdWebSocketClient {
@@ -130,26 +183,49 @@ impl Clone for AxMdWebSocketClient {
         Self {
             url: self.url.clone(),
             heartbeat: self.heartbeat,
-            auth_token: self.auth_token.clone(),
+            auth_token: Arc::clone(&self.auth_token),
+            reconnect_headers: Arc::clone(&self.reconnect_headers),
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: None,
             signal: Arc::clone(&self.signal),
-            task_handle: None,
+            cancellation_token: Arc::clone(&self.cancellation_token),
+            task_handle: Arc::clone(&self.task_handle),
+            connect_lock: Arc::clone(&self.connect_lock),
             subscriptions: self.subscriptions.clone(),
             subscribe_lock: Arc::clone(&self.subscribe_lock),
             request_id_counter: Arc::clone(&self.request_id_counter),
             symbol_data_types: Arc::clone(&self.symbol_data_types),
+            status_invalidations: Arc::clone(&self.status_invalidations),
+            transport_backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
 
 impl AxMdWebSocketClient {
+    fn initial_connect_retry_policy() -> InitialConnectRetryPolicy {
+        InitialConnectRetryPolicy {
+            max_attempts: NonZeroU32::new(5).expect("initial connect attempts must be non-zero"),
+            delay_initial: Duration::from_millis(500),
+            delay_max: Duration::from_secs(5),
+            backoff_factor: 2.0,
+            jitter_ms: 250,
+        }
+    }
+
     /// Creates a new Ax market data WebSocket client.
     ///
     /// The `auth_token` is a Bearer token obtained from the HTTP `/api/authenticate` endpoint.
     #[must_use]
-    pub fn new(url: String, auth_token: String, heartbeat: Option<u64>) -> Self {
+    pub fn new(
+        url: String,
+        auth_token: impl Into<SecretString>,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+    ) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
         let initial_mode = AtomicU8::new(ConnectionMode::Closed.as_u8());
@@ -157,17 +233,24 @@ impl AxMdWebSocketClient {
 
         Self {
             url,
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
-            auth_token: Some(auth_token),
+            heartbeat: Some(heartbeat),
+            auth_token: Arc::new(Mutex::new(Some(auth_token.into()))),
+            reconnect_headers: Arc::new(Mutex::new(None)),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
-            task_handle: None,
+            cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
+            task_handle: Arc::new(SharedTaskSlot::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions: SubscriptionState::new(AX_TOPIC_DELIMITER),
             request_id_counter: Arc::new(AtomicI64::new(1)),
             subscribe_lock: Arc::new(tokio::sync::Mutex::new(())),
-            symbol_data_types: Arc::new(DashMap::new()),
+            symbol_data_types: Arc::new(AtomicMap::new()),
+            status_invalidations: Arc::new(Mutex::new(AHashSet::new())),
+            transport_backend,
+            proxy_url: proxy_url.map(SecretString::from),
+            socket_control: None,
         }
     }
 
@@ -175,7 +258,12 @@ impl AxMdWebSocketClient {
     ///
     /// Use [`set_auth_token`](Self::set_auth_token) to set the token before connecting.
     #[must_use]
-    pub fn without_auth(url: String, heartbeat: Option<u64>) -> Self {
+    pub fn without_auth(
+        url: String,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
+    ) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
         let initial_mode = AtomicU8::new(ConnectionMode::Closed.as_u8());
@@ -183,18 +271,32 @@ impl AxMdWebSocketClient {
 
         Self {
             url,
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
-            auth_token: None,
+            heartbeat: Some(heartbeat),
+            auth_token: Arc::new(Mutex::new(None)),
+            reconnect_headers: Arc::new(Mutex::new(None)),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
-            task_handle: None,
+            cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
+            task_handle: Arc::new(SharedTaskSlot::new()),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             subscriptions: SubscriptionState::new(AX_TOPIC_DELIMITER),
             request_id_counter: Arc::new(AtomicI64::new(1)),
             subscribe_lock: Arc::new(tokio::sync::Mutex::new(())),
-            symbol_data_types: Arc::new(DashMap::new()),
+            symbol_data_types: Arc::new(AtomicMap::new()),
+            status_invalidations: Arc::new(Mutex::new(AHashSet::new())),
+            transport_backend,
+            proxy_url: proxy_url.map(SecretString::from),
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Returns the WebSocket URL.
@@ -206,8 +308,27 @@ impl AxMdWebSocketClient {
     /// Sets the authentication token for subsequent connections.
     ///
     /// This should be called before `connect()` if authentication is required.
-    pub fn set_auth_token(&mut self, token: String) {
-        self.auth_token = Some(token);
+    pub fn set_auth_token(&self, token: impl Into<SecretString>) {
+        *self.auth_token.lock() = Some(token.into());
+    }
+
+    /// Updates the token used by future automatic reconnect attempts.
+    ///
+    /// Updating the token does not interrupt the active WebSocket connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reconnect header cannot be updated.
+    pub fn update_auth_token(&self, token: SecretString) -> AxWsResult<()> {
+        let value = format!("Bearer {}", token.expose_secret());
+
+        if let Some(headers) = self.reconnect_headers.lock().as_ref() {
+            headers
+                .update("Authorization", &value)
+                .map_err(|e| AxWsClientError::Transport(e.to_string()))?;
+        }
+        self.set_auth_token(token);
+        Ok(())
     }
 
     /// Returns whether the client is currently connected and active.
@@ -234,8 +355,13 @@ impl AxMdWebSocketClient {
 
     /// Returns the symbol data types map (shared with handler).
     #[must_use]
-    pub fn symbol_data_types(&self) -> Arc<DashMap<String, SymbolDataTypes>> {
+    pub fn symbol_data_types(&self) -> Arc<AtomicMap<String, SymbolDataTypes>> {
         Arc::clone(&self.symbol_data_types)
+    }
+
+    /// Returns the shared set of symbols whose instrument status cache has been invalidated.
+    pub fn status_invalidations(&self) -> Arc<Mutex<AHashSet<Ustr>>> {
+        Arc::clone(&self.status_invalidations)
     }
 
     fn next_request_id(&self) -> i64 {
@@ -256,110 +382,99 @@ impl AxMdWebSocketClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection cannot be established.
+    /// Returns an error if the connection cannot be established or the initial handler command
+    /// cannot be sent.
     pub async fn connect(&mut self) -> AxWsResult<()> {
-        const MAX_RETRIES: u32 = 5;
-        const CONNECTION_TIMEOUT_SECS: u64 = 10;
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
+
+        if !self.task_handle.is_empty() && !self.task_handle.is_finished() {
+            return Err(AxWsClientError::Transport(
+                "WebSocket handler is already running".to_string(),
+            ));
+        }
+
+        if let Some(outcome) = self
+            .task_handle
+            .finish(Duration::from_secs(2), Duration::from_secs(2))
+            .await
+        {
+            match outcome {
+                TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted => {}
+                TaskJoinOutcome::Failed(error) => {
+                    return Err(AxWsClientError::Transport(format!(
+                        "Previous WebSocket handler failed: {error}"
+                    )));
+                }
+                TaskJoinOutcome::Incomplete => {
+                    return Err(AxWsClientError::Transport(
+                        "Previous WebSocket handler did not stop within shutdown bounds"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         self.signal.store(false, Ordering::Release);
+        let cancellation_token = CancellationToken::new();
+        self.cancellation_token
+            .store(Arc::new(cancellation_token.clone()));
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
         // No-op: ping responses are handled internally by the WebSocketClient
         let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {});
 
-        let mut headers = vec![("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string())];
+        let mut headers = create_standard_nautilus_headers();
 
-        if let Some(ref token) = self.auth_token {
-            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        let auth_token = self.auth_token.lock().clone();
+
+        if let Some(token) = auth_token {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", token.expose_secret()),
+            ));
         }
 
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None, // Ax server sends heartbeats
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None, // Ax server sends heartbeats
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
+            writer_capacity: None,
+            backend: self.transport_backend,
+            proxy_url: self
+                .proxy_url
+                .as_ref()
+                .map(|url| url.expose_secret().to_owned()),
+            max_message_size_bytes: None,
+            max_frame_size_bytes: None,
         };
 
-        // Retry initial connection with exponential backoff
-        let mut backoff = ExponentialBackoff::new(
-            Duration::from_millis(500),
-            Duration::from_millis(5000),
-            2.0,
-            250,
-            false,
-        )
-        .map_err(|e| AxWsClientError::Transport(e.to_string()))?;
-
-        let mut last_error: String;
-        let mut attempt = 0;
-
-        let client = loop {
-            attempt += 1;
-
-            match tokio::time::timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-                WebSocketClient::connect(
-                    config.clone(),
-                    Some(raw_handler.clone()),
-                    Some(ping_handler.clone()),
-                    None,
-                    vec![],
-                    None,
-                ),
-            )
+        let client = WebSocketClient::builder()
+            .config(config.clone())
+            .message_handler(raw_handler.clone())
+            .ping_handler(ping_handler.clone())
+            .initial_connect_retry_policy(Self::initial_connect_retry_policy())
+            .cancellation_token(cancellation_token)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
             .await
-            {
-                Ok(Ok(client)) => {
-                    if attempt > 1 {
-                        log::info!("WebSocket connection established after {attempt} attempts");
-                    }
-                    break client;
-                }
-                Ok(Err(e)) => {
-                    last_error = e.to_string();
-                    log::warn!(
-                        "WebSocket connection attempt failed: attempt={attempt}/{MAX_RETRIES}, url={}, error={last_error}",
-                        self.url
-                    );
-                }
-                Err(_) => {
-                    last_error = format!("Connection timeout after {CONNECTION_TIMEOUT_SECS}s");
-                    log::warn!(
-                        "WebSocket connection attempt timed out: attempt={attempt}/{MAX_RETRIES}, url={}",
-                        self.url
-                    );
-                }
-            }
-
-            if attempt >= MAX_RETRIES {
-                return Err(AxWsClientError::Transport(format!(
-                    "Failed to connect to {} after {MAX_RETRIES} attempts: {}",
-                    self.url,
-                    if last_error.is_empty() {
-                        "unknown error"
-                    } else {
-                        &last_error
-                    }
-                )));
-            }
-
-            let delay = backoff.next_duration();
-            log::debug!(
-                "Retrying in {delay:?} (attempt {}/{MAX_RETRIES})",
-                attempt + 1
-            );
-            tokio::time::sleep(delay).await;
-        };
+            .map_err(|e| {
+                AxWsClientError::Transport(format!("Failed to connect to {}: {e}", self.url))
+            })?;
 
         self.connection_mode.store(client.connection_mode_atomic());
+        let reconnect_handle = client.reconnect_handle();
+        *self.reconnect_headers.lock() = Some(client.reconnect_headers());
 
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<AxDataWsMessage>();
         self.out_rx = Some(Arc::new(out_rx));
@@ -369,10 +484,14 @@ impl AxMdWebSocketClient {
 
         self.send_cmd(HandlerCommand::SetClient(client)).await?;
 
+        if !self.subscriptions.all_topics().is_empty() {
+            self.send_cmd(HandlerCommand::ReplaySubscriptions).await?;
+        }
+
         let signal = Arc::clone(&self.signal);
         let subscriptions = self.subscriptions.clone();
 
-        let stream_handle = get_runtime().spawn(async move {
+        if let Err(e) = self.task_handle.spawn(async move {
             let mut handler =
                 AxMdWsFeedHandler::new(signal.clone(), cmd_rx, raw_rx, subscriptions.clone());
 
@@ -388,9 +507,16 @@ impl AxMdWebSocketClient {
             }
 
             log::debug!("Handler loop exited");
-        });
+        }) {
+            self.out_rx = None;
+            return Err(AxWsClientError::Transport(format!(
+                "Failed to start WebSocket handler task: {e}"
+            )));
+        }
 
-        self.task_handle = Some(stream_handle);
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         Ok(())
     }
@@ -410,32 +536,157 @@ impl AxMdWebSocketClient {
     ) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let entry = self
+        let current = self
             .symbol_data_types
-            .entry(symbol.to_string())
-            .or_default();
+            .load()
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default();
 
-        // AX allows only one subscription per symbol, skip if book already subscribed
-        if entry.book_level.is_some() {
-            log::debug!("Book deltas already subscribed for {symbol}, skipping");
+        if current.book_level == Some(level) {
+            log::debug!("Book deltas already subscribed for {symbol} at {level:?}, skipping");
             return Ok(());
         }
 
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.book_level = Some(level);
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        self.symbol_data_types
-            .entry(symbol.to_string())
-            .or_default()
-            .book_level = Some(level);
+        self.symbol_data_types.rcu(|m| {
+            let entry = m.entry(symbol.to_string()).or_default();
+            entry.book_level = Some(level);
+        });
 
         Ok(())
+    }
+
+    /// Subscribes to order book deltas for a symbol, opening `gate` once the subscription is
+    /// written.
+    ///
+    /// A stream already open with the same options is replaced so the book starts from a fresh
+    /// snapshot. Returns without subscribing when `cancel` has already fired, and stops waiting
+    /// once it fires; a queued write still completes so the venue matches the subscription state.
+    pub(crate) async fn subscribe_book_deltas_gated(
+        &self,
+        symbol: Ustr,
+        level: AxMarketDataLevel,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> AxWsResult<()> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+
+        {
+            let _guard = self.subscribe_lock.lock().await;
+
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
+            let current = self
+                .symbol_data_types
+                .load()
+                .get(symbol.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let old_spec = current.effective_subscription();
+            let spec = current.book_subscription(level);
+            let replace = old_spec == Some(spec);
+
+            if let Some(old) = old_spec.filter(|_| !replace) {
+                log::debug!("Resubscribing {symbol}: {old:?} -> {spec:?}");
+                self.send_unsubscribe(symbol.as_str(), old).await?;
+            }
+
+            let topic = spec.topic(symbol.as_str());
+
+            if !replace {
+                self.subscriptions.mark_subscribe(&topic);
+            }
+
+            let command = HandlerCommand::WriteBook {
+                request_id: self.next_request_id(),
+                unsubscribe_request_id: replace.then(|| self.next_request_id()),
+                symbol,
+                spec,
+                cancel: cancel.clone(),
+                gate,
+                completion,
+            };
+
+            if let Err(e) = self.send_cmd(command).await {
+                if !replace {
+                    self.subscriptions.mark_unsubscribe(&topic);
+                }
+
+                return Err(e);
+            }
+
+            self.symbol_data_types.rcu(|m| {
+                m.entry(symbol.to_string()).or_default().book_level = Some(level);
+            });
+        }
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            // The handler stopped after taking the command, so the subscription stays desired
+            result = receiver => result.map_err(|e| AxWsClientError::Transport(e.to_string()))?,
+        }
+    }
+
+    /// Replaces the symbol's market data subscription to request a fresh book snapshot, opening
+    /// `gate` once the subscription is written.
+    ///
+    /// Echoes the symbol's current subscription options and keeps the subscription desired for
+    /// reconnect replay.
+    pub(crate) async fn resubscribe_book_gated(
+        &self,
+        symbol: Ustr,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> AxWsResult<()> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+
+        {
+            // Serializes the subscription lookup with subscribe and unsubscribe changes
+            let _guard = self.subscribe_lock.lock().await;
+
+            if cancel.is_cancelled() {
+                return Err(AxWsClientError::ClientError(
+                    "Book recovery canceled".to_string(),
+                ));
+            }
+
+            let Some(spec) = self
+                .symbol_data_types
+                .load()
+                .get(symbol.as_str())
+                .and_then(|types| types.book_level.map(|level| types.book_subscription(level)))
+            else {
+                return Err(AxWsClientError::ClientError(format!(
+                    "Book deltas for {symbol} are no longer subscribed"
+                )));
+            };
+
+            self.send_cmd(HandlerCommand::WriteBook {
+                request_id: self.next_request_id(),
+                unsubscribe_request_id: Some(self.next_request_id()),
+                symbol,
+                spec,
+                cancel,
+                gate,
+                completion,
+            })
+            .await?;
+        }
+
+        receiver
+            .await
+            .map_err(|e| AxWsClientError::Transport(e.to_string()))?
     }
 
     /// Subscribes to quote data for a symbol.
@@ -449,23 +700,23 @@ impl AxMdWebSocketClient {
     pub async fn subscribe_quotes(&self, symbol: &str) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let entry = self
+        let current = self
             .symbol_data_types
-            .entry(symbol.to_string())
-            .or_default();
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+            .load()
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.quotes = true;
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        self.symbol_data_types
-            .entry(symbol.to_string())
-            .or_default()
-            .quotes = true;
+        self.symbol_data_types.rcu(|m| {
+            m.entry(symbol.to_string()).or_default().quotes = true;
+        });
 
         Ok(())
     }
@@ -481,23 +732,23 @@ impl AxMdWebSocketClient {
     pub async fn subscribe_trades(&self, symbol: &str) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let entry = self
+        let current = self
             .symbol_data_types
-            .entry(symbol.to_string())
-            .or_default();
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+            .load()
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.trades = true;
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        self.symbol_data_types
-            .entry(symbol.to_string())
-            .or_default()
-            .trades = true;
+        self.symbol_data_types.rcu(|m| {
+            m.entry(symbol.to_string()).or_default().trades = true;
+        });
 
         Ok(())
     }
@@ -513,26 +764,26 @@ impl AxMdWebSocketClient {
     pub async fn unsubscribe_book_deltas(&self, symbol: &str) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let Some(entry) = self.symbol_data_types.get(symbol) else {
+        let Some(current) = self.symbol_data_types.load().get(symbol).cloned() else {
             log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe book deltas");
             return Ok(());
         };
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.book_level = None;
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        if let Some(mut entry) = self.symbol_data_types.get_mut(symbol) {
-            entry.book_level = None;
-            if entry.is_empty() {
-                drop(entry);
-                self.symbol_data_types.remove(symbol);
+        self.symbol_data_types.rcu(|m| {
+            if let Some(entry) = m.get_mut(symbol) {
+                entry.book_level = None;
+                if entry.is_empty() {
+                    m.remove(symbol);
+                }
             }
-        }
+        });
 
         Ok(())
     }
@@ -548,26 +799,26 @@ impl AxMdWebSocketClient {
     pub async fn unsubscribe_quotes(&self, symbol: &str) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let Some(entry) = self.symbol_data_types.get(symbol) else {
+        let Some(current) = self.symbol_data_types.load().get(symbol).cloned() else {
             log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe quotes");
             return Ok(());
         };
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.quotes = false;
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        if let Some(mut entry) = self.symbol_data_types.get_mut(symbol) {
-            entry.quotes = false;
-            if entry.is_empty() {
-                drop(entry);
-                self.symbol_data_types.remove(symbol);
+        self.symbol_data_types.rcu(|m| {
+            if let Some(entry) = m.get_mut(symbol) {
+                entry.quotes = false;
+                if entry.is_empty() {
+                    m.remove(symbol);
+                }
             }
-        }
+        });
 
         Ok(())
     }
@@ -583,26 +834,162 @@ impl AxMdWebSocketClient {
     pub async fn unsubscribe_trades(&self, symbol: &str) -> AxWsResult<()> {
         let _guard = self.subscribe_lock.lock().await;
 
-        let Some(entry) = self.symbol_data_types.get(symbol) else {
+        let Some(current) = self.symbol_data_types.load().get(symbol).cloned() else {
             log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe trades");
             return Ok(());
         };
-        let old_level = entry.effective_level();
-        let mut next = entry.clone();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
         next.trades = false;
-        let new_level = next.effective_level();
-        drop(entry);
+        let new_spec = next.effective_subscription();
 
-        self.update_data_subscription(symbol, old_level, new_level)
+        self.update_data_subscription(symbol, old_spec, new_spec)
             .await?;
 
-        if let Some(mut entry) = self.symbol_data_types.get_mut(symbol) {
-            entry.trades = false;
-            if entry.is_empty() {
-                drop(entry);
-                self.symbol_data_types.remove(symbol);
+        self.symbol_data_types.rcu(|m| {
+            if let Some(entry) = m.get_mut(symbol) {
+                entry.trades = false;
+                if entry.is_empty() {
+                    m.remove(symbol);
+                }
             }
-        }
+        });
+
+        Ok(())
+    }
+
+    /// Subscribes to mark prices for a symbol.
+    ///
+    /// Ensures at least an L1 subscription so that ticker messages
+    /// (which carry the mark price field) are received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription command cannot be sent.
+    pub async fn subscribe_mark_prices(&self, symbol: &str) -> AxWsResult<()> {
+        let _guard = self.subscribe_lock.lock().await;
+
+        let current = self
+            .symbol_data_types
+            .load()
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
+        next.mark_prices = true;
+        let new_spec = next.effective_subscription();
+
+        self.update_data_subscription(symbol, old_spec, new_spec)
+            .await?;
+
+        self.symbol_data_types.rcu(|m| {
+            m.entry(symbol.to_string()).or_default().mark_prices = true;
+        });
+
+        Ok(())
+    }
+
+    /// Unsubscribes from mark prices for a symbol.
+    ///
+    /// The underlying AX subscription is only removed when all data types
+    /// have been unsubscribed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe command cannot be sent.
+    pub async fn unsubscribe_mark_prices(&self, symbol: &str) -> AxWsResult<()> {
+        let _guard = self.subscribe_lock.lock().await;
+
+        let Some(current) = self.symbol_data_types.load().get(symbol).cloned() else {
+            log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe mark prices");
+            return Ok(());
+        };
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
+        next.mark_prices = false;
+        let new_spec = next.effective_subscription();
+
+        self.update_data_subscription(symbol, old_spec, new_spec)
+            .await?;
+
+        self.symbol_data_types.rcu(|m| {
+            if let Some(entry) = m.get_mut(symbol) {
+                entry.mark_prices = false;
+                if entry.is_empty() {
+                    m.remove(symbol);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Subscribes to instrument status for a symbol.
+    ///
+    /// Ensures at least an L1 subscription so that ticker messages
+    /// (which carry the instrument state field) are received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription command cannot be sent.
+    pub async fn subscribe_instrument_status(&self, symbol: &str) -> AxWsResult<()> {
+        let _guard = self.subscribe_lock.lock().await;
+
+        let current = self
+            .symbol_data_types
+            .load()
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
+        next.instrument_status = true;
+        let new_spec = next.effective_subscription();
+
+        self.update_data_subscription(symbol, old_spec, new_spec)
+            .await?;
+
+        self.symbol_data_types.rcu(|m| {
+            m.entry(symbol.to_string()).or_default().instrument_status = true;
+        });
+
+        Ok(())
+    }
+
+    /// Unsubscribes from instrument status for a symbol.
+    ///
+    /// The underlying AX subscription is only removed when all data types
+    /// have been unsubscribed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscribe command cannot be sent.
+    pub async fn unsubscribe_instrument_status(&self, symbol: &str) -> AxWsResult<()> {
+        let _guard = self.subscribe_lock.lock().await;
+
+        let Some(current) = self.symbol_data_types.load().get(symbol).cloned() else {
+            log::debug!("Symbol {symbol} not subscribed, skipping unsubscribe instrument status");
+            return Ok(());
+        };
+        let old_spec = current.effective_subscription();
+        let mut next = current.clone();
+        next.instrument_status = false;
+        let new_spec = next.effective_subscription();
+
+        self.update_data_subscription(symbol, old_spec, new_spec)
+            .await?;
+
+        self.symbol_data_types.rcu(|m| {
+            if let Some(entry) = m.get_mut(symbol) {
+                entry.instrument_status = false;
+                if entry.is_empty() {
+                    m.remove(symbol);
+                }
+            }
+        });
+
+        self.status_invalidations.lock().insert(Ustr::from(symbol));
 
         Ok(())
     }
@@ -610,35 +997,33 @@ impl AxMdWebSocketClient {
     async fn update_data_subscription(
         &self,
         symbol: &str,
-        old_level: Option<AxMarketDataLevel>,
-        new_level: Option<AxMarketDataLevel>,
+        old_spec: Option<AxMdSubscriptionSpec>,
+        new_spec: Option<AxMdSubscriptionSpec>,
     ) -> AxWsResult<()> {
-        if old_level == new_level {
+        if old_spec == new_spec {
             return Ok(());
         }
 
-        match (old_level, new_level) {
-            (None, Some(level)) => {
-                log::debug!("Subscribing {symbol} at {level:?}");
-                self.send_subscribe(symbol, level).await
+        match (old_spec, new_spec) {
+            (None, Some(spec)) => {
+                log::debug!("Subscribing {symbol} at {spec:?}");
+                self.send_subscribe(symbol, spec).await
             }
-            (Some(_), None) => {
+            (Some(old), None) => {
                 log::debug!("Unsubscribing {symbol} (no remaining data types)");
-                self.send_unsubscribe(symbol).await
+                self.send_unsubscribe(symbol, old).await
             }
             (Some(old), Some(new)) => {
                 log::debug!("Resubscribing {symbol}: {old:?} -> {new:?}");
-                self.send_unsubscribe(symbol).await?;
+                self.send_unsubscribe(symbol, old).await?;
                 if let Err(e) = self.send_subscribe(symbol, new).await {
                     log::warn!("Resubscribe failed for {symbol} at {new:?}: {e}");
                     if let Err(restore_err) = self.send_subscribe(symbol, old).await {
-                        // Channel dead, mark old topic for reconnection replay
                         log::error!(
                             "Failed to restore {symbol} at {old:?}: {restore_err}, \
                              reconnection required"
                         );
-                        let old_topic = format!("{symbol}:{old:?}");
-                        self.subscriptions.mark_subscribe(&old_topic);
+                        self.subscriptions.mark_subscribe(&old.topic(symbol));
                     }
                     return Err(e);
                 }
@@ -648,8 +1033,8 @@ impl AxMdWebSocketClient {
         }
     }
 
-    async fn send_subscribe(&self, symbol: &str, level: AxMarketDataLevel) -> AxWsResult<()> {
-        let topic = format!("{symbol}:{level:?}");
+    async fn send_subscribe(&self, symbol: &str, spec: AxMdSubscriptionSpec) -> AxWsResult<()> {
+        let topic = spec.topic(symbol);
         let request_id = self.next_request_id();
 
         self.subscriptions.mark_subscribe(&topic);
@@ -658,7 +1043,7 @@ impl AxMdWebSocketClient {
             .send_cmd(HandlerCommand::Subscribe {
                 request_id,
                 symbol: Ustr::from(symbol),
-                level,
+                spec,
             })
             .await
         {
@@ -669,22 +1054,26 @@ impl AxMdWebSocketClient {
         Ok(())
     }
 
-    async fn send_unsubscribe(&self, symbol: &str) -> AxWsResult<()> {
+    async fn send_unsubscribe(&self, symbol: &str, spec: AxMdSubscriptionSpec) -> AxWsResult<()> {
         let request_id = self.next_request_id();
+        let topic = spec.topic(symbol);
+        let was_pending = self
+            .subscriptions
+            .pending_subscribe_topics()
+            .contains(&topic);
 
-        self.send_cmd(HandlerCommand::Unsubscribe {
-            request_id,
-            symbol: Ustr::from(symbol),
-        })
-        .await?;
+        self.subscriptions.mark_unsubscribe(&topic);
 
-        for level in [
-            AxMarketDataLevel::Level1,
-            AxMarketDataLevel::Level2,
-            AxMarketDataLevel::Level3,
-        ] {
-            let topic = format!("{symbol}:{level:?}");
-            self.subscriptions.mark_unsubscribe(&topic);
+        if let Err(e) = self
+            .send_cmd(HandlerCommand::Unsubscribe {
+                request_id,
+                symbol: Ustr::from(symbol),
+                topic: topic.clone(),
+            })
+            .await
+        {
+            self.restore_unsubscribe_state(&topic, was_pending);
+            return Err(e);
         }
 
         Ok(())
@@ -737,15 +1126,40 @@ impl AxMdWebSocketClient {
         let _guard = self.subscribe_lock.lock().await;
         let request_id = self.next_request_id();
         let topic = format!("candles:{symbol}:{width:?}");
+        let was_pending = self
+            .subscriptions
+            .pending_subscribe_topics()
+            .contains(&topic);
+
+        if !self.is_subscribed_topic(&topic) {
+            log::debug!("Not subscribed to {topic}, skipping unsubscribe");
+            return Ok(());
+        }
 
         self.subscriptions.mark_unsubscribe(&topic);
 
-        self.send_cmd(HandlerCommand::UnsubscribeCandles {
-            request_id,
-            symbol: Ustr::from(symbol),
-            width,
-        })
-        .await
+        if let Err(e) = self
+            .send_cmd(HandlerCommand::UnsubscribeCandles {
+                request_id,
+                symbol: Ustr::from(symbol),
+                width,
+                topic: topic.clone(),
+            })
+            .await
+        {
+            self.restore_unsubscribe_state(&topic, was_pending);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    fn restore_unsubscribe_state(&self, topic: &str, was_pending: bool) {
+        self.subscriptions.confirm_unsubscribe(topic);
+        self.subscriptions.mark_subscribe(topic);
+        if !was_pending {
+            self.subscriptions.confirm_subscribe(topic);
+        }
     }
 
     /// Returns a stream of WebSocket messages.
@@ -768,6 +1182,11 @@ impl AxMdWebSocketClient {
         }
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        self.cancellation_token.load().cancel();
+        self.signal.store(true, Ordering::Release);
+    }
+
     /// Disconnects the WebSocket connection gracefully.
     pub async fn disconnect(&self) {
         log::debug!("Disconnecting WebSocket");
@@ -775,26 +1194,40 @@ impl AxMdWebSocketClient {
     }
 
     /// Closes the WebSocket connection and cleans up resources.
-    pub async fn close(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handler task fails or does not stop after abort.
+    pub async fn close(&mut self) -> anyhow::Result<()> {
+        let connect_lock = Arc::clone(&self.connect_lock);
+        let _guard = connect_lock.lock().await;
         log::debug!("Closing WebSocket client");
 
         // Send disconnect first to allow graceful cleanup before signal
+        self.cancellation_token.load().cancel();
         let _ = self.send_cmd(HandlerCommand::Disconnect).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.signal.store(true, Ordering::Release);
 
-        if let Some(handle) = self.task_handle.take() {
-            const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-            let abort_handle = handle.abort_handle();
+        let outcome = self
+            .task_handle
+            .finish(Duration::from_secs(2), Duration::from_secs(2))
+            .await;
 
-            match tokio::time::timeout(CLOSE_TIMEOUT, handle).await {
-                Ok(Ok(())) => log::debug!("Handler task completed gracefully"),
-                Ok(Err(e)) => log::warn!("Handler task panicked: {e}"),
-                Err(_) => {
-                    log::warn!("Handler task did not complete within timeout, aborting");
-                    abort_handle.abort();
-                }
-            }
+        *self.reconnect_headers.lock() = None;
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
+
+        match outcome {
+            None | Some(TaskJoinOutcome::Completed(()) | TaskJoinOutcome::Aborted) => Ok(()),
+            Some(TaskJoinOutcome::Failed(error)) => Err(anyhow::anyhow!(
+                "Architect AX data WebSocket handler failed: {error}"
+            )),
+            Some(TaskJoinOutcome::Incomplete) => Err(anyhow::anyhow!(
+                "Architect AX data WebSocket handler did not stop after abort"
+            )),
         }
     }
 
@@ -803,5 +1236,483 @@ impl AxMdWebSocketClient {
         guard
             .send(cmd)
             .map_err(|e| AxWsClientError::ChannelError(e.to_string()))
+    }
+}
+
+impl Drop for AxMdWebSocketClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.task_handle) == 1 && !self.task_handle.is_empty() {
+            self.cancellation_token.load().cancel();
+            self.signal.store(true, Ordering::Release);
+            self.task_handle.abort();
+
+            if let Some(control) = &self.socket_control {
+                control.deregister();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_live::task::TaskGroup;
+    use nautilus_model::identifiers::InstrumentId;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        book::{recovery::spawn_subscription_task, sync::BookSyncTracker},
+        websocket::data::subscription::SubscriptionOrder,
+    };
+
+    #[rstest]
+    fn test_auth_token_uses_secret_string_owner() {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "initial-token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+
+        client.set_auth_token("replacement-token".to_string());
+
+        let token = client.auth_token.lock();
+        assert_eq!(
+            token.as_ref().map(SecretString::expose_secret),
+            Some("replacement-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_aborts_handler_task() {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "test_token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            started_tx.send(()).expect("started receiver");
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = handle.abort_handle();
+        client.task_handle.insert(handle);
+        started_rx.await.expect("handler task started");
+
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler task aborted");
+    }
+
+    #[rstest]
+    fn test_effective_subscription_empty_returns_none() {
+        let sdt = SymbolDataTypes::default();
+        assert_eq!(sdt.effective_subscription(), None);
+        assert!(sdt.is_empty());
+    }
+
+    #[rstest]
+    fn test_effective_subscription_book_level_takes_precedence() {
+        let sdt = SymbolDataTypes {
+            book_level: Some(AxMarketDataLevel::Level2),
+            quotes: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sdt.effective_subscription(),
+            Some(AxMdSubscriptionSpec::new(
+                AxMarketDataLevel::Level2,
+                Some(false),
+                Some(false),
+            ))
+        );
+        assert!(!sdt.is_empty());
+    }
+
+    #[rstest]
+    #[case(
+        true,
+        false,
+        false,
+        false,
+        AxMarketDataLevel::Level1,
+        Some(false),
+        Some(false)
+    )]
+    #[case(false, true, false, false, AxMarketDataLevel::Trades, None, None)]
+    #[case(
+        false,
+        false,
+        true,
+        false,
+        AxMarketDataLevel::Level1,
+        Some(false),
+        Some(true)
+    )]
+    #[case(
+        false,
+        false,
+        false,
+        true,
+        AxMarketDataLevel::Level1,
+        Some(false),
+        Some(true)
+    )]
+    fn test_effective_subscription_for_single_data_type(
+        #[case] quotes: bool,
+        #[case] trades: bool,
+        #[case] mark_prices: bool,
+        #[case] instrument_status: bool,
+        #[case] level: AxMarketDataLevel,
+        #[case] include_trades: Option<bool>,
+        #[case] include_ticker: Option<bool>,
+    ) {
+        let sdt = SymbolDataTypes {
+            quotes,
+            trades,
+            mark_prices,
+            instrument_status,
+            book_level: None,
+        };
+        assert_eq!(
+            sdt.effective_subscription(),
+            Some(AxMdSubscriptionSpec::new(
+                level,
+                include_trades,
+                include_ticker,
+            ))
+        );
+        assert!(!sdt.is_empty());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_unsubscribe_send_failure_restores_subscription(#[case] was_pending: bool) {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "test_token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let symbol = "EURUSD-PERP";
+        let spec = AxMdSubscriptionSpec::new(AxMarketDataLevel::Level2, Some(false), Some(false));
+        let topic = spec.topic(symbol);
+        client.subscriptions.mark_subscribe(&topic);
+        if !was_pending {
+            client.subscriptions.confirm_subscribe(&topic);
+        }
+
+        let error = client.send_unsubscribe(symbol, spec).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Channel error: channel closed");
+        assert_eq!(client.subscription_count(), usize::from(!was_pending));
+        assert_eq!(client.subscriptions.all_topics(), vec![topic]);
+        assert_eq!(
+            client.subscriptions.pending_subscribe_topics().len(),
+            usize::from(was_pending)
+        );
+        assert!(client.subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_unsubscribe_candles_send_failure_restores_subscription(
+        #[case] was_pending: bool,
+    ) {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "test_token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let symbol = "EURUSD-PERP";
+        let width = AxCandleWidth::Minutes1;
+        let topic = format!("candles:{symbol}:{width:?}");
+        client.subscriptions.mark_subscribe(&topic);
+        if !was_pending {
+            client.subscriptions.confirm_subscribe(&topic);
+        }
+
+        let error = client.unsubscribe_candles(symbol, width).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Channel error: channel closed");
+        assert_eq!(client.subscription_count(), usize::from(!was_pending));
+        assert_eq!(client.subscriptions.all_topics(), vec![topic]);
+        assert_eq!(
+            client.subscriptions.pending_subscribe_topics().len(),
+            usize::from(was_pending)
+        );
+        assert!(client.subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_unsubscribe_candles_skips_untracked_topic() {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "test_token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+
+        client
+            .unsubscribe_candles("EURUSD-PERP", AxCandleWidth::Minutes1)
+            .await
+            .unwrap();
+
+        assert_eq!(client.subscription_count(), 0);
+        assert!(client.subscriptions.all_topics().is_empty());
+        assert!(client.subscriptions.pending_subscribe_topics().is_empty());
+        assert!(client.subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    const SYMBOL: &str = "EURUSD-PERP";
+
+    // Returns a client whose handler commands the test receives, with `current` already streaming
+    async fn book_client(
+        current: SymbolDataTypes,
+    ) -> (
+        AxMdWebSocketClient,
+        tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    ) {
+        let client = AxMdWebSocketClient::new(
+            "ws://localhost:9999/md/ws".to_string(),
+            "test_token".to_string(),
+            30,
+            TransportBackend::default(),
+            None,
+        );
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        *client.cmd_tx.write().await = cmd_tx;
+
+        if let Some(spec) = current.effective_subscription() {
+            let topic = spec.topic(SYMBOL);
+            client.subscriptions.mark_subscribe(&topic);
+            client.subscriptions.confirm_subscribe(&topic);
+            client.symbol_data_types.insert(SYMBOL.to_string(), current);
+        }
+
+        (client, cmd_rx)
+    }
+
+    #[rstest]
+    #[case::no_stream(SymbolDataTypes::default(), None, false)]
+    #[case::quote_stream(
+        SymbolDataTypes { quotes: true, ..Default::default() },
+        Some("EURUSD-PERP:Level1:false:false"),
+        false
+    )]
+    #[case::book_stream(
+        SymbolDataTypes { book_level: Some(AxMarketDataLevel::Level2), ..Default::default() },
+        None,
+        true
+    )]
+    #[tokio::test]
+    async fn test_subscribe_book_deltas_gated_writes_book_stream(
+        #[case] current: SymbolDataTypes,
+        #[case] unsubscribed: Option<&str>,
+        #[case] replaced: bool,
+    ) {
+        let quotes = current.quotes;
+        let (client, mut cmd_rx) = book_client(current).await;
+        let gate = SnapshotGate::default();
+        gate.lock().close();
+
+        let subscribe = client.subscribe_book_deltas_gated(
+            Ustr::from(SYMBOL),
+            AxMarketDataLevel::Level2,
+            CancellationToken::new(),
+            gate,
+        );
+
+        let handler = async {
+            let mut topics = Vec::new();
+
+            loop {
+                match cmd_rx.recv().await.expect("command queued") {
+                    HandlerCommand::Unsubscribe { topic, .. } => topics.push(topic),
+                    HandlerCommand::WriteBook {
+                        spec,
+                        unsubscribe_request_id,
+                        completion,
+                        ..
+                    } => {
+                        completion.send(Ok(())).unwrap();
+                        return (topics, spec, unsubscribe_request_id.is_some());
+                    }
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+        };
+
+        let (result, (topics, spec, replaces)) = tokio::join!(subscribe, handler);
+        let types = client
+            .symbol_data_types
+            .load()
+            .get(SYMBOL)
+            .cloned()
+            .unwrap();
+
+        assert!(result.is_ok());
+        assert_eq!(
+            topics,
+            unsubscribed
+                .map(ToString::to_string)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spec,
+            AxMdSubscriptionSpec::new(AxMarketDataLevel::Level2, Some(false), Some(false))
+        );
+        assert_eq!(replaces, replaced);
+        assert_eq!(types.book_level, Some(AxMarketDataLevel::Level2));
+        assert_eq!(types.quotes, quotes);
+        assert_eq!(client.subscriptions.all_topics(), vec![spec.topic(SYMBOL)]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_book_subscription_write_failure_starts_recovery() {
+        let (client, mut cmd_rx) = book_client(SymbolDataTypes::default()).await;
+        let book_sync = BookSyncTracker::default();
+        let tasks = TaskGroup::new();
+        let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+
+        spawn_subscription_task(
+            instrument_id,
+            AxMarketDataLevel::Level2,
+            SubscriptionOrder::default().next(),
+            book_sync.clone(),
+            client.clone(),
+            Duration::from_secs(10),
+            &tasks.spawner().unwrap(),
+        );
+
+        let mut replaces = Vec::new();
+
+        for _ in 0..2 {
+            let command = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+                .await
+                .expect("book write queued")
+                .expect("command channel open");
+
+            let HandlerCommand::WriteBook {
+                unsubscribe_request_id,
+                completion,
+                ..
+            } = command
+            else {
+                panic!("expected a book write, was {command:?}");
+            };
+
+            replaces.push(unsubscribe_request_id.is_some());
+
+            // The initial write fails in transport, which recovery retries
+            let _ = completion.send(Err(AxWsClientError::Transport("write failed".to_string())));
+        }
+
+        let owned = book_sync.claim_recovery(instrument_id).is_none();
+        tasks.begin_shutdown();
+
+        assert_eq!(replaces, [false, true]);
+        assert!(owned, "the running recovery owns the book");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_resubscribe_book_gated_echoes_current_subscription() {
+        let current = SymbolDataTypes {
+            mark_prices: true,
+            book_level: Some(AxMarketDataLevel::Level2),
+            ..Default::default()
+        };
+
+        let (client, mut cmd_rx) = book_client(current).await;
+
+        let resubscribe = client.resubscribe_book_gated(
+            Ustr::from(SYMBOL),
+            CancellationToken::new(),
+            SnapshotGate::default(),
+        );
+
+        let handler = async {
+            match cmd_rx.recv().await.expect("command queued") {
+                HandlerCommand::WriteBook {
+                    request_id,
+                    unsubscribe_request_id,
+                    symbol,
+                    spec,
+                    completion,
+                    ..
+                } => {
+                    completion.send(Ok(())).unwrap();
+                    (request_id, unsubscribe_request_id, symbol, spec)
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        };
+
+        let (result, (request_id, unsubscribe_request_id, symbol, spec)) =
+            tokio::join!(resubscribe, handler);
+
+        assert!(result.is_ok());
+        assert_eq!(request_id, 1);
+        assert_eq!(unsubscribe_request_id, Some(2));
+        assert_eq!(symbol, Ustr::from(SYMBOL));
+        assert_eq!(
+            spec,
+            AxMdSubscriptionSpec::new(AxMarketDataLevel::Level2, Some(false), Some(true))
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::not_subscribed(
+        SymbolDataTypes { quotes: true, ..Default::default() },
+        false,
+        "Client error: Book deltas for EURUSD-PERP are no longer subscribed"
+    )]
+    #[case::cancelled(
+        SymbolDataTypes { book_level: Some(AxMarketDataLevel::Level2), ..Default::default() },
+        true,
+        "Client error: Book recovery canceled"
+    )]
+    #[tokio::test]
+    async fn test_resubscribe_book_gated_refuses_without_write(
+        #[case] current: SymbolDataTypes,
+        #[case] cancelled: bool,
+        #[case] expected: &str,
+    ) {
+        let (client, mut cmd_rx) = book_client(current).await;
+        let cancel = CancellationToken::new();
+
+        if cancelled {
+            cancel.cancel();
+        }
+
+        let error = client
+            .resubscribe_book_gated(Ustr::from(SYMBOL), cancel, SnapshotGate::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+        assert!(cmd_rx.try_recv().is_err());
     }
 }

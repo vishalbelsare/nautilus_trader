@@ -15,11 +15,13 @@
 
 //! Python bindings for blockchain factories.
 
+use nautilus_common::factories::DataClientFactory;
 use pyo3::prelude::*;
 
 use crate::factories::{BlockchainDataClientFactory, BlockchainExecutionClientFactory};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BlockchainDataClientFactory {
     /// Factory for creating blockchain data clients.
     ///
@@ -31,13 +33,13 @@ impl BlockchainDataClientFactory {
     }
 
     /// Returns the factory name.
-    const fn name(&self) -> &'static str {
-        "BLOCKCHAIN"
+    fn name(&self) -> &str {
+        DataClientFactory::name(self)
     }
 
     /// Returns the configuration type.
-    const fn config_type(&self) -> &'static str {
-        "BlockchainDataClientConfig"
+    fn config_type(&self) -> &str {
+        DataClientFactory::config_type(self)
     }
 
     /// Returns a string representation of the factory.

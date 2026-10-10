@@ -1,5 +1,8 @@
 @0xc3d4e5f607182930;
 # Cap'n Proto schema for Nautilus trading commands
+#
+# WARNING: This schema is not yet stable and may change without notice
+# between releases. Do not depend on wire compatibility across versions.
 
 using Identifiers = import "../common/identifiers.capnp";
 using Types = import "../common/types.capnp";
@@ -16,6 +19,7 @@ struct TradingCommandHeader {
     commandId @4 :Base.UUID4;
     tsInit @5 :Base.UnixNanos;
     correlationId @6 :Base.UUID4;  # Optional
+    causationId @7 :Base.UUID4;  # Optional
 }
 
 # Order snapshot - bag of values representing current order state
@@ -171,6 +175,7 @@ struct TradingCommand {
         generateFillReports @10 :GenerateFillReports;
         generatePositionStatusReports @11 :GeneratePositionStatusReports;
         generateExecutionMassStatus @12 :GenerateExecutionMassStatus;
+        batchModifyOrders @13 :BatchModifyOrders;
     }
 }
 
@@ -196,6 +201,12 @@ struct ModifyOrder {
     price @4 :Types.Price;
     triggerPrice @5 :Types.Price;
     params @6 :Base.StringMap;
+}
+
+struct BatchModifyOrders {
+    header @0 :TradingCommandHeader;
+    modifications @1 :List(ModifyOrder);
+    params @2 :Base.StringMap;
 }
 
 struct CancelOrder {
@@ -230,6 +241,7 @@ struct QueryAccount {
     tsInit @3 :Base.UnixNanos;
     params @4 :Base.StringMap;
     correlationId @5 :Base.UUID4;  # Optional
+    causationId @6 :Base.UUID4;  # Optional
 }
 
 # Execution report commands

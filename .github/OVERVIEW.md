@@ -1,92 +1,162 @@
-<!--
-  README for the .github directory: composite actions and workflow definitions.
--->
 # GitHub Actions Overview
 
-This directory contains reusable composite actions and workflow definitions for
-CI/CD, testing, publishing, and automation within the NautilusTrader repository.
+The `.github` directory contains NautilusTrader's composite actions and workflows for continuous
+integration, scheduled checks, and publication.
 
 ## Composite actions (`.github/actions`)
 
-- **cargo-tool-install**: installs cargo tools (cargo-deny, cargo-vet) with caching.
-- **common-setup**: prepares the environment (OS packages, Rust toolchain, Python, sccache, pre-commit).
-- **common-test-data**: caches large test data under `tests/test_data/large`.
-- **common-wheel-build**: builds and installs Python wheels across Linux, macOS, and Windows for multiple Python versions.
-- **install-capnp**: installs the Cap'n Proto compiler with caching across Linux, macOS, and Windows.
-- **publish-wheels**: publishes built wheels to Cloudflare R2, manages old wheel cleanup and index generation.
-- **upload-artifact-wheel**: uploads the latest wheel artifact to GitHub Actions.
+- [`attest-build-provenance-retry`](actions/attest-build-provenance-retry/action.yml): retries
+  GitHub build provenance attestation after transient failures.
+- [`attest-sbom-retry`](actions/attest-sbom-retry/action.yml): retries Docker SBOM attestation after
+  transient failures.
+- [`cargo-tool-install`](actions/cargo-tool-install/action.yml): installs a version-pinned Cargo
+  tool with caching.
+- [`common-setup`](actions/common-setup/action.yml): configures system packages, Rust and Python
+  toolchains, caches, and optional disk or swap preparation.
+- [`common-test-data`](actions/common-test-data/action.yml): downloads, verifies, and caches the
+  large test data set.
+- [`generate-sbom-retry`](actions/generate-sbom-retry/action.yml): retries SPDX SBOM generation
+  after transient failures.
+- [`install-capnp`](actions/install-capnp/action.yml): installs the Cap'n Proto compiler across
+  supported platforms.
+- [`publish-wheels`](actions/publish-wheels/action.yml): publishes wheels and maintains the
+  Cloudflare R2 package index.
+- [`upload-artifact-wheel`](actions/upload-artifact-wheel/action.yml): uploads wheel artifacts to
+  GitHub Actions.
 
 ## Workflows (`.github/workflows`)
 
-- **build.yml**: main CI pipeline - pre-commit, cargo-deny, Rust tests, Python tests, wheel builds, and artifact uploads.
-- **build-v2.yml**: CI pipeline for the v2 Rust-native system.
-- **build-docs.yml**: dispatches documentation build on `master` and `nightly` pushes.
-- **cli-binaries.yml**: builds and publishes CLI binaries for multiple platforms.
-- **codeql-analysis.yml**: CodeQL security scans for Python and Rust on PRs and via cron.
-- **copilot-setup-steps.yml**: environment setup for GitHub Copilot coding agent.
-- **coverage.yml**: coverage report generation for the `nightly` branch.
-- **docker.yml**: builds and pushes multi-platform Docker images (`nautilus_trader`, `jupyterlab`) using Buildx and native ARM runners.
-- **nightly-docs-features-check.yml**: nightly docs.rs build checks and crate feature compatibility verification.
-- **nightly-merge.yml**: auto-merges `develop` into `nightly` when CI succeeds.
-- **nightly-tests.yml**: extended test suites (turmoil network tests) that are too slow for PR builds.
-- **performance.yml**: Rust/Python benchmarks on `nightly`, reporting to CodSpeed.
-- **security-audit.yml**: nightly supply chain security checks (cargo-audit, cargo-deny, cargo-vet, osv-scanner).
-- **trigger-reindexing.yml**: triggers documentation reindexing for search.
+- [`build.yml`](workflows/build.yml): plans CI scope, runs lint and test jobs, builds wheels, and
+  publishes Python packages, Rust crates, and stable release assets.
+- [`build-docs.yml`](workflows/build-docs.yml): dispatches documentation builds from `master` and
+  `nightly`.
+- [`cli-binaries.yml`](workflows/cli-binaries.yml): builds and publishes CLI archives for Linux,
+  macOS, and Windows.
+- [`codeql-analysis.yml`](workflows/codeql-analysis.yml): runs CodeQL analysis for Python and Rust.
+- [`docker.yml`](workflows/docker.yml): builds, publishes, signs, and attests the multi-platform
+  `nautilus_trader` and `jupyterlab` images.
+- [`nightly-merge.yml`](workflows/nightly-merge.yml): fast-forwards `nightly` to the latest
+  successful `develop` commit.
+- [`nightly-tests.yml`](workflows/nightly-tests.yml): runs Rust doctests, Python memory leak tests,
+  standard-precision Clippy, extended network tests, deterministic simulation (DST) smoke tests,
+  Cargo publication checks, docs.rs builds, crate feature combinations, example target checks, and
+  Miri.
+- [`openssf-scorecard.yml`](workflows/openssf-scorecard.yml): publishes OpenSSF Scorecard results
+  and uploads SARIF.
+- [`performance.yml`](workflows/performance.yml): runs Rust tests and registered benchmarks on
+  `nightly`, plus selected CodSpeed benchmarks on `develop`, `test-performance`, and pull requests
+  targeting `develop`.
+- [`security-audit.yml`](workflows/security-audit.yml): provides the change-aware supply-chain audit
+  used by `build.yml`, plus non-`develop` pull request, scheduled, manual, and `test-security` runs.
+- [`test.yml`](workflows/test.yml): runs pre-commit, Python tests, and Rust tests on Linux x86 with
+  Python 3.14 for pushes to the protected `test` branch.
 
 ## Security
 
-### Access controls
+The [security architecture](../docs/developer_guide/security.md) covers the release threat model,
+artifact integrity records, and verification flow. This section records CI-specific constraints.
 
-- **CODEOWNERS**: Critical infrastructure files (workflows, dependencies, build configs, scripts) require Core team review before merge.
-- **Branch protection**: The develop branch requires PR reviews with CODEOWNERS enforcement and passing CI checks. External PRs must receive Core team approval before merge.
-- **Least-privilege tokens**: Workflows default `GITHUB_TOKEN` to `contents: read, actions: read` and selectively elevate scopes only for jobs that need them.
-- **Secret management**: No secrets or credentials are stored in the repo. Credentials are provided via GitHub Secrets and injected at runtime.
+### Change and dependency controls
 
-### Dependency security
+- [`CODEOWNERS`](CODEOWNERS) requires Core team review for workflows, composite actions,
+  dependencies, build configuration, and scripts. Repository rulesets require signed commits,
+  reviews, and required checks on protected branches, and prevent release tag mutation.
+- External actions include their canonical source URL, use a full commit SHA, and record the
+  corresponding release tag. Adopt an action release only after it has been available for at least
+  two weeks.
+- Docker base images and workflow service containers use immutable digest pins.
+- Tool and dependency versions are pinned in the repository. Python dependency resolution applies
+  the seven-day publication cooldown defined in `python/pyproject.toml`, and Rust crate updates
+  observe the three-day cooldown defined in `Cargo.toml`.
+- `security-audit.yml` runs `cargo audit`, `cargo-deny`, `cargo-vet`, `pip-audit`, OSV-Scanner, and
+  Zizmor. CodeQL and OpenSSF Scorecard run in dedicated workflows.
 
-- **cargo-deny**: Rust dependency auditing for security advisories (RUSTSEC/GHSA), license compliance, banned crates, and supply chain integrity. Configuration in `deny.toml`.
-- **Dependency pinning**: Key tools (pre-commit, Python versions, Rust toolchain, cargo-nextest) are locked to fixed versions or SHAs.
-- **Code scanning**: CodeQL is enabled for continuous security analysis of Python and Rust code on all PRs and weekly via cron.
+### Execution boundaries
 
-### Build integrity
+- Dedicated script tests must pass in CI before pre-commit begins, so important repository scripts
+  are tested before pre-commit uses them.
+- Workflows default `GITHUB_TOKEN` to `contents: read` and `actions: read`. Individual jobs add only
+  the permissions required for their operation.
+- The script tests, pre-commit, Linux x86 wheel, and Linux x86 Rust jobs in `build.yml` use the
+  self-hosted build pool only for same-repository, non-Dependabot pull requests with a known author.
+  Fork, Dependabot, or incomplete pull request metadata routes these jobs to GitHub-hosted runners.
+  Untrusted pull request jobs remain read-only and do not receive Actions secrets.
+- `test.yml` accepts only pushes to `test`, which the `test` ruleset restricts to
+  trusted repository maintainers before the workflow reaches the self-hosted build pool.
+- `build.yml` cancels superseded pull request runs. Push runs use commit-specific concurrency groups,
+  so a later push cannot replace an earlier candidate's result.
+- Jobs that publish wheels to R2, merge `nightly`, or dispatch documentation builds declare a GitHub
+  Environment with a deployment branch policy: `r2-develop` (`develop`), `r2-nightly` (`nightly`),
+  `release` (`master`), `nightly-merge` (`develop`), and `build-docs` (`master` and `nightly`).
 
-- **Build attestations**: All published artifacts include cryptographic SLSA build provenance attestations, linking each artifact to a specific commit SHA. Verify via `gh attestation verify`.
-- **Immutable action pinning**: All third-party GitHub Actions are pinned to specific commit SHAs.
-- **Docker image pinning**: Base images in Dockerfiles and service containers in workflows are pinned to SHA256 digests to prevent supply-chain attacks via tag mutation.
-- **Caching**: Caches for sccache, pip/site-packages, pre-commit, and test data speed up workflows while preserving hermetic (reproducible) builds.
+### Publication integrity
 
-### Runtime hardening
+- PyPI and crates.io publication uses short-lived OpenID Connect identities through Trusted
+  Publishing. These jobs are bound to the protected `release` environment.
+- Stable releases remain drafts until package indexes have been published and verified against the
+  release assets. The workflow then attaches checksums, manifests, and provenance records before
+  publishing the GitHub release.
+- Container images receive keyless cosign signatures and SPDX SBOM attestations. The Docker
+  workflow verifies both against the published image digest.
 
-- **Hardened runners**: Most workflows employ `step-security/harden-runner` with `egress-policy: audit` to reduce attack surface and monitor outbound traffic.
+See [Releases](../docs/developer_guide/releases.md) for the stable release ordering constraints and
+[Security Policy](../SECURITY.md) for artifact verification commands.
 
-### Allowed network endpoints
+### Network egress
 
-The `step-security/harden-runner` action restricts network access to approved endpoints.
-Common endpoints are maintained in the variable `COMMON_ALLOWED_ENDPOINTS`:
+Supported jobs use `step-security/harden-runner` with `egress-policy: block` by default. Shared
+allow lists come from GitHub configuration variables, and workflows declare job-specific endpoints
+inline.
 
+- `STEP_SECURITY_EGRESS_POLICY`: selects the egress mode. Use `audit` only as a temporary fallback
+  while expanding an allow list.
+- `COMMON_ALLOWED_ENDPOINTS`: provides endpoints shared across workflows.
+- `CI_ALLOWED_ENDPOINTS`: adds endpoints used by build, documentation, container, and scheduled
+  test workflows.
+- `SECURITY_AUDIT_ALLOWED_ENDPOINTS`: adds endpoints used by security audit jobs and the nightly
+  publication gate.
+
+Store endpoint variables as single-line, space-delimited values. The pinned Harden Runner version
+does not enforce newline-delimited values correctly in `block` mode.
+
+Jobs that declare a GitHub Environment can override the repository or organization egress policy
+with an environment-scoped variable. Security audit jobs read repository and organization variables
+directly and do not use deployment environments or environment secrets.
+
+Fork pull requests and their called security audit jobs in `build.yml` use `audit` mode because they
+cannot read the endpoint variables. Other workflows retain the configured policy and default to
+`block`.
+
+### Security gate override
+
+The `SECURITY_GATE_OVERRIDE` environment-scoped configuration variable permits a reviewed security
+gate failure for one commit. Configure it on both `r2-develop` and `r2-nightly`, set it to `disabled`
+during normal operation, and remove any repository-scoped variable with the same name. Only
+repository admins can configure environment variables, while users with write access can configure
+repository variables.
+
+An active value uses `<UTC expiry>@<full commit SHA>`, for example:
+
+```text
+2026-08-08T12:00:00Z@0123456789abcdef0123456789abcdef01234567
 ```
-api.github.com:443                           # GitHub API
-github.com:443                               # GitHub main site
-artifacts.githubusercontent.com:443          # GitHub Actions artifacts
-codeload.github.com:443                      # GitHub code downloads
-raw.githubusercontent.com:443                # Raw file access
-uploads.github.com:443                       # GitHub uploads
-objects.githubusercontent.com:443            # GitHub objects storage
-pipelines.actions.githubusercontent.com:443  # Actions pipelines
-tokens.actions.githubusercontent.com:443     # Actions tokens
-github-cloud.githubusercontent.com:443       # GitHub cloud content
-github-cloud.s3.amazonaws.com:443            # GitHub S3 storage
-media.githubusercontent.com:443              # GitHub media content
-archive.ubuntu.com:443                       # Ubuntu package archives
-security.ubuntu.com:443                      # Ubuntu security updates
-azure.archive.ubuntu.com:443                 # Azure Ubuntu mirrors
-astral.sh:443                                # UV/Ruff tooling
-```
 
-Job-specific endpoints (e.g., `pypi.org:443` for publishing jobs) are added inline within each workflow.
+The expiry must use the exact `YYYY-MM-DDTHH:MM:SSZ` format and be no more than two hours in the
+future. The SHA must match the publication commit. Missing, malformed, expired, overlong, or
+mismatched values fail closed. Cancelled, skipped, and other incomplete gate results cannot be
+overridden.
 
-**Action Update Policy**: When updating GitHub Actions, only use versions that have been released for at least 2 weeks.
-This allows time for the community to identify potential issues while maintaining security through timely updates.
+Security audits run as part of `build.yml`. The Zizmor and supply-chain jobs remain path-scoped for
+ordinary pull requests and branch pushes, while `test-ci` and `test-pre-commit` force both jobs. The
+development publication and stable release tag gate depend directly on the same build's audit
+result. Nightly builds do not repeat the full audit; the nightly security gate completes its scans
+before publication. Scheduled and manual audits run independently, so the repository is still
+audited when no build runs. The override does not suppress pull request, scheduled, manual, or
+stable release audits.
 
-For updates or changes to actions or workflows, please adhere to the repository's
-CONTRIBUTING guidelines and maintain these security best practices.
+To approve a blocked development or nightly publication:
+
+1. Review the failed audit and confirm that publishing the affected commit is acceptable.
+1. Set `SECURITY_GATE_OVERRIDE` on the matching `r2-develop` or `r2-nightly` environment.
+1. Re-run the failed build jobs for the same commit.
+1. Reset the environment variable to `disabled` after the publication completes.

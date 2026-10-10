@@ -11,14 +11,18 @@ on:
 jobs:
   build-docs:
     runs-on: ubuntu-latest
+    environment: build-docs
     steps:
       # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: audit
+          egress-policy: ${{ vars.STEP_SECURITY_EGRESS_POLICY || 'block' }}
+          allowed-endpoints: >-
+            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
+            ${{ vars.CI_ALLOWED_ENDPOINTS }}
 
       - name: Fire event to nautilus_docs
-        run: |
+        run: |-
           curl -sS -L --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 5 --max-time 60 --fail-with-body \
             -X POST \
             -H "Accept: application/vnd.github+json" \

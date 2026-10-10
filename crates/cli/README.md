@@ -1,7 +1,7 @@
 # nautilus-cli
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-cli)](https://docs.rs/nautilus-cli/latest/nautilus-cli/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-cli)](https://docs.rs/nautilus-cli/latest/nautilus_cli/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-cli.svg)](https://crates.io/crates/nautilus-cli)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -17,15 +17,13 @@ system configuration, and operational utilities:
 - Configuration validation and setup utilities.
 - System administration and operational tools.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 

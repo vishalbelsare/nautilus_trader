@@ -19,33 +19,30 @@
 //! exchange for perpetual futures on traditional underlying asset classes (FX, rates, metals,
 //! energy, stock indexes). Designed for institutional and professional traders, it combines
 //! innovations from digital asset perpetual exchanges with the safety and risk management of
-//! traditional futures exchanges. Licensed under the [Bermuda Monetary Authority (BMA)](https://www.bma.bm/).
+//! traditional futures exchanges. Licensed under the [Bermuda Monetary Authority (BMA)](https://www.bma.bm).
 //!
-//! The `nautilus-architect-ax` crate provides client bindings (HTTP & WebSocket), data models, and
-//! helper utilities that wrap the official AX Exchange API.
+//! The `nautilus-architect-ax` crate provides client bindings (HTTP & WebSocket) and data models
+//! for the official AX Exchange API.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software
-//! correctness and safety at the highest level, with the aim of supporting mission-critical
-//! trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
-//! # Feature flags
+//! # Feature Flags
 //!
 //! This crate provides feature flags to control source code inclusion during compilation:
 //!
-//! - `python`: Enables Python bindings via [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds as a Python extension module (used together with `python`).
+//! - `examples`: Enables the crate's example binaries.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //!
 //! # Documentation
 //!
-//! - API reference: <https://docs.architect.exchange/api-reference/>
-//! - Crate docs: <https://docs.rs/nautilus-architect-ax>
+//! - API reference: <https://docs.architect.exchange/api-reference>
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -54,6 +51,9 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod common;
 pub mod config;
@@ -62,6 +62,8 @@ pub mod execution;
 pub mod factories;
 pub mod http;
 pub mod websocket;
+
+mod book;
 
 #[cfg(feature = "python")]
 pub mod python;

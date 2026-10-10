@@ -32,7 +32,7 @@ use crate::{
 impl OrderModifyRejected {
     /// Represents an event where a `ModifyOrder` command has been rejected by the
     /// trading venue.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, reason, event_id, ts_event, ts_init, reconciliation, venue_order_id=None, account_id=None))]
     fn py_new(
@@ -80,6 +80,12 @@ impl OrderModifyRejected {
         self.to_string()
     }
 
+    #[getter]
+    #[pyo3(name = "causation_id")]
+    fn py_causation_id(&self) -> Option<UUID4> {
+        self.causation_id
+    }
+
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
@@ -125,7 +131,7 @@ impl OrderModifyRejected {
     #[getter]
     #[pyo3(name = "reason")]
     fn py_reason(&self) -> String {
-        self.reason.as_str().to_string()
+        self.reason.to_string()
     }
 
     #[getter]
@@ -149,7 +155,7 @@ impl OrderModifyRejected {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[pyo3(name = "to_dict")]
@@ -177,6 +183,10 @@ impl OrderModifyRejected {
         dict.set_item("reconciliation", self.reconciliation)?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

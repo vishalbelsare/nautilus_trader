@@ -19,7 +19,10 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos, correctness::FAILED};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    correctness::{CorrectnessError, FAILED},
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -41,7 +44,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -65,7 +68,8 @@ impl MarketIfTouchedOrder {
     /// Returns an error if:
     /// - The `quantity` is not positive.
     /// - The `time_in_force` is GTD and the `expire_time` is `None` or zero.
-    #[allow(clippy::too_many_arguments)]
+    /// - The order metadata violates an [`OrderInitialized::new_checked`] invariant.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -91,11 +95,11 @@ impl MarketIfTouchedOrder {
         tags: Option<Vec<Ustr>>,
         init_id: UUID4,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, OrderError> {
         check_positive_quantity(quantity, stringify!(quantity))?;
         check_time_in_force(time_in_force, expire_time)?;
 
-        let init_order = OrderInitialized::new(
+        let init_order = OrderInitialized::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -111,6 +115,7 @@ impl MarketIfTouchedOrder {
             init_id,
             ts_init,
             ts_init,
+            None,
             None,
             Some(trigger_price),
             Some(trigger_type),
@@ -129,7 +134,7 @@ impl MarketIfTouchedOrder {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-        );
+        )?;
 
         Ok(Self {
             core: OrderCore::new(init_order),
@@ -147,7 +152,8 @@ impl MarketIfTouchedOrder {
     /// # Panics
     ///
     /// Panics if any order validation fails (see [`MarketIfTouchedOrder::new_checked`]).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -200,7 +206,13 @@ impl MarketIfTouchedOrder {
             init_id,
             ts_init,
         )
-        .expect(FAILED)
+        .unwrap_or_else(|e| panic!("{FAILED}: {e}"))
+    }
+}
+
+impl PartialEq for MarketIfTouchedOrder {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_order_id == other.client_order_id
     }
 }
 
@@ -379,6 +391,14 @@ impl Order for MarketIfTouchedOrder {
         self.filled_qty
     }
 
+    fn voided_qty(&self) -> Quantity {
+        self.voided_qty
+    }
+
+    fn non_reopened_voided_qty(&self) -> Quantity {
+        self.non_reopened_voided_qty
+    }
+
     fn leaves_qty(&self) -> Quantity {
         self.leaves_qty
     }
@@ -387,11 +407,11 @@ impl Order for MarketIfTouchedOrder {
         self.overfill_qty
     }
 
-    fn avg_px(&self) -> Option<f64> {
+    fn avg_px(&self) -> Option<Decimal> {
         self.avg_px
     }
 
-    fn slippage(&self) -> Option<f64> {
+    fn slippage(&self) -> Option<Decimal> {
         self.slippage
     }
 
@@ -436,7 +456,10 @@ impl Order for MarketIfTouchedOrder {
     }
 
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
-        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
+        let updates_slippage = matches!(
+            event,
+            OrderEventAny::Filled(_) | OrderEventAny::FillVoided(_),
+        );
         let is_order_triggered = matches!(event, OrderEventAny::Triggered(_));
         let ts_event = if is_order_triggered {
             Some(event.ts_event())
@@ -455,7 +478,7 @@ impl Order for MarketIfTouchedOrder {
             self.ts_triggered = ts_event;
         }
 
-        if is_order_filled {
+        if updates_slippage {
             self.core.set_slippage(self.trigger_price);
         }
 
@@ -469,8 +492,7 @@ impl Order for MarketIfTouchedOrder {
             self.trigger_price = trigger_price;
         }
 
-        self.quantity = event.quantity;
-        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
+        self.core.apply_updated_quantity(event.quantity);
     }
 
     fn is_triggered(&self) -> Option<bool> {
@@ -510,23 +532,34 @@ impl Order for MarketIfTouchedOrder {
     }
 }
 
-impl From<OrderInitialized> for MarketIfTouchedOrder {
-    fn from(event: OrderInitialized) -> Self {
-        Self::new(
+impl TryFrom<OrderInitialized> for MarketIfTouchedOrder {
+    type Error = OrderError;
+
+    fn try_from(event: OrderInitialized) -> Result<Self, Self::Error> {
+        let trigger_price =
+            event
+                .trigger_price
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message:
+                        "`trigger_price` is required for `MarketIfTouchedOrder` initialization"
+                            .to_string(),
+                })?;
+        let trigger_type =
+            event
+                .trigger_type
+                .ok_or_else(|| CorrectnessError::PredicateViolation {
+                    message: "`trigger_type` is required for `MarketIfTouchedOrder` initialization"
+                        .to_string(),
+                })?;
+        Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
             event.client_order_id,
             event.order_side,
             event.quantity,
-            event
-            .trigger_price // TODO: Improve this error, model order domain errors
-            .expect(
-                "Error initializing order: `trigger_price` was `None` for `MarketIfTouchedOrder`",
-            ),
-            event.trigger_type.expect(
-                "Error initializing order: `trigger_type` was `None` for `MarketIfTouchedOrder`",
-            ),
+            trigger_price,
+            trigger_type,
             event.time_in_force,
             event.expire_time,
             event.reduce_only,
@@ -551,15 +584,15 @@ impl Display for MarketIfTouchedOrder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "MarketIfTouchedOrder {{ \
-                side: {}, \
-                qty: {}, \
-                instrument: {}, \
-                tif: {}, \
-                trigger_price: {}, \
-                trigger_type: {}, \
-                status: {} \
-            }}",
+            "MarketIfTouchedOrder(\
+                side={}, \
+                qty={}, \
+                instrument={}, \
+                tif={}, \
+                trigger_price={}, \
+                trigger_type={}, \
+                status={}\
+            )",
             self.side,
             self.quantity,
             self.instrument_id,
@@ -574,11 +607,12 @@ impl Display for MarketIfTouchedOrder {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
         enums::{OrderSide, OrderType, TimeInForce, TriggerType},
-        events::order::{filled::OrderFilledBuilder, initialized::OrderInitializedBuilder},
+        events::order::spec::{OrderFilledSpec, OrderInitializedSpec},
         identifiers::{InstrumentId, TradeId, VenueOrderId},
         instruments::{CurrencyPair, stubs::*},
         orders::{builder::OrderTestBuilder, stubs::TestOrderStubs},
@@ -586,9 +620,9 @@ mod tests {
     };
 
     #[rstest]
-    fn test_initialize(_audusd_sim: CurrencyPair) {
+    fn test_initialize(audusd_sim: CurrencyPair) {
         let order = OrderTestBuilder::new(OrderType::MarketIfTouched)
-            .instrument_id(_audusd_sim.id)
+            .instrument_id(audusd_sim.id)
             .side(OrderSide::Buy)
             .trigger_price(Price::from("0.68000"))
             .quantity(Quantity::from(1))
@@ -620,15 +654,15 @@ mod tests {
 
         assert_eq!(
             order.to_string(),
-            "MarketIfTouchedOrder { \
-                side: BUY, \
-                qty: 1, \
-                instrument: AUD/USD.SIM, \
-                tif: GTC, \
-                trigger_price: 30000, \
-                trigger_type: LAST_PRICE, \
-                status: INITIALIZED \
-            }"
+            "MarketIfTouchedOrder(\
+                side=BUY, \
+                qty=1, \
+                instrument=AUD/USD.SIM, \
+                tif=GTC, \
+                trigger_price=30000, \
+                trigger_type=LAST_PRICE, \
+                status=INITIALIZED\
+            )"
         );
     }
 
@@ -690,17 +724,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_market_if_touched_order_rejects_invalid_update_atomically() {
+        let order = OrderTestBuilder::new(OrderType::MarketIfTouched)
+            .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
+            .quantity(Quantity::from(10))
+            .trigger_price(Price::new(100.0, 2))
+            .build();
+        let mut accepted_order = TestOrderStubs::make_accepted_order(&order);
+        let state = (
+            accepted_order.status(),
+            accepted_order.previous_status(),
+            accepted_order.ts_last(),
+            accepted_order.events().len(),
+        );
+        let event = OrderUpdated {
+            client_order_id: accepted_order.client_order_id(),
+            strategy_id: accepted_order.strategy_id(),
+            price: Some(Price::new(95.0, 2)),
+            ..Default::default()
+        };
+
+        let result = accepted_order.apply(OrderEventAny::Updated(event));
+
+        assert!(matches!(result, Err(OrderError::InvalidOrderEvent)));
+        assert_eq!(accepted_order.status(), state.0);
+        assert_eq!(accepted_order.previous_status(), state.1);
+        assert_eq!(accepted_order.ts_last(), state.2);
+        assert_eq!(accepted_order.events().len(), state.3);
+    }
+
+    #[rstest]
     fn test_market_if_touched_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a MarketIfTouchedOrder
-        let order_initialized = OrderInitializedBuilder::default()
-            .trigger_price(Some(Price::new(100.0, 2)))
-            .trigger_type(Some(TriggerType::Default))
+        let order_initialized = OrderInitializedSpec::builder()
+            .trigger_price(Price::new(100.0, 2))
+            .trigger_type(TriggerType::Default)
             .order_type(OrderType::MarketIfTouched)
-            .build()
-            .unwrap();
+            .build();
 
         // Convert the OrderInitialized event into a MarketIfTouchedOrder
-        let order: MarketIfTouchedOrder = order_initialized.clone().into();
+        let order: MarketIfTouchedOrder = order_initialized.clone().try_into().unwrap();
 
         // Assert essential fields match the OrderInitialized fields
         assert_eq!(order.trader_id(), order_initialized.trader_id);
@@ -735,7 +798,7 @@ mod tests {
         let fill_quantity = accepted_order.quantity(); // Use the same quantity as the order
         let fill_price = Price::new(98.50, 2); // Use a price HIGHER than trigger price
 
-        let order_filled_event = OrderFilledBuilder::default()
+        let order_filled_event = OrderFilledSpec::builder()
             .client_order_id(accepted_order.client_order_id())
             .strategy_id(accepted_order.strategy_id())
             .instrument_id(accepted_order.instrument_id())
@@ -744,24 +807,14 @@ mod tests {
             .last_px(fill_price)
             .venue_order_id(VenueOrderId::from("TEST-001"))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
+            .build();
 
         // Apply the fill event
         accepted_order
             .apply(OrderEventAny::Filled(order_filled_event))
             .unwrap();
 
-        // The slippage calculation should be triggered by the filled event
-        assert!(accepted_order.slippage().is_some());
-
-        // We can also check the actual slippage value
-        let expected_slippage = 98.50 - 90.0; // For buy order: execution price - trigger price
-        let actual_slippage = accepted_order.slippage().unwrap();
-
-        assert!(
-            (actual_slippage - expected_slippage).abs() < 0.001,
-            "Expected slippage around {expected_slippage}, was {actual_slippage}"
-        );
+        // The fill triggers the slippage calculation: 98.50 - 90.0 for a buy order
+        assert_eq!(accepted_order.slippage(), Some(dec!(8.50)));
     }
 }

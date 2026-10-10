@@ -21,7 +21,7 @@
 //! and the next two upcoming periods across BTC, ETH, SOL, and XRP.
 //!
 //! Because [`MarketSlugFilter`] accepts a closure, the slug list is
-//! re-evaluated on each `load_all()` call — so a long-running process can
+//! re-evaluated on each `load_all()` call - so a long-running process can
 //! call `load_all()` periodically and always get the latest time window
 //! without rebuilding the filter.
 //!
@@ -31,8 +31,11 @@
 //! cargo run -p nautilus-polymarket --bin updown_markets
 //! ```
 
+use std::sync::Arc;
+
 use nautilus_common::providers::InstrumentProvider;
 use nautilus_model::instruments::{Instrument, InstrumentAny};
+use nautilus_network::retry::RetryConfig;
 use nautilus_polymarket::{
     filters::MarketSlugFilter, http::gamma::PolymarketGammaHttpClient,
     providers::PolymarketInstrumentProvider,
@@ -54,6 +57,7 @@ fn build_updown_slugs() -> Vec<String> {
     let period_start = (now / PERIOD_SECS) * PERIOD_SECS;
 
     let mut slugs = Vec::new();
+
     for i in 0..NUM_PERIODS {
         let timestamp = period_start + i * PERIOD_SECS;
         for asset in ASSETS {
@@ -67,9 +71,10 @@ fn build_updown_slugs() -> Vec<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     nautilus_common::logging::ensure_logging_initialized();
 
-    let http_client = PolymarketGammaHttpClient::new(None, None)?;
+    let http_client = PolymarketGammaHttpClient::new(None, 60, RetryConfig::default())?;
     let filter = MarketSlugFilter::new(build_updown_slugs);
-    let mut provider = PolymarketInstrumentProvider::with_filter(http_client, Box::new(filter));
+    let mut provider =
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
     provider.load_all(None).await?;
 
     let instruments = provider.store().list_all();
@@ -78,10 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for instrument in instruments {
         let id = Instrument::id(instrument);
         let expiration = Instrument::expiration_ns(instrument).map_or("N/A".to_string(), |ns| {
-            let secs = (ns.as_u64() / 1_000_000_000) as i64;
-            chrono::DateTime::from_timestamp(secs, 0).map_or("N/A".to_string(), |dt| {
-                dt.format("%Y-%m-%d %H:%M UTC").to_string()
-            })
+            ns.to_datetime_utc()
+                .strftime("%Y-%m-%d %H:%M UTC")
+                .to_string()
         });
 
         if let InstrumentAny::BinaryOption(opt) = instrument {

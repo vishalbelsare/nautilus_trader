@@ -1,7 +1,7 @@
 # nautilus-risk
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-risk)](https://docs.rs/nautilus-risk/latest/nautilus-risk/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-risk)](https://docs.rs/nautilus-risk/latest/nautilus_risk/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-risk.svg)](https://crates.io/crates/nautilus-risk)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -18,22 +18,20 @@ trading operations remain within defined risk parameters and regulatory constrai
 - **Trading controls**: Rate limiting, balance validation, and exposure management.
 - **Account protection**: Multi-currency balance checks and margin requirement validation.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 - `extension-module`: Builds as a Python extension module.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 
 ## Documentation
 

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Parsing helpers for Bybit WebSocket payloads.
+//! Parsers for Bybit WebSocket payloads.
 
 use std::convert::TryFrom;
 
@@ -26,33 +26,161 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AccountType, AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, RecordFlag, TimeInForce, TriggerType,
+        AccountType, AggressorSide, BookAction, GreeksConvention, LiquiditySide, OrderSide,
+        OrderStatus, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
     events::account::state::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Money, Price, Quantity},
+    types::{AccountBalance, MarginBalance, Money},
 };
 use rust_decimal::Decimal;
 
-use super::messages::{
-    BybitWsAccountExecution, BybitWsAccountOrder, BybitWsAccountPosition, BybitWsAccountWallet,
-    BybitWsKline, BybitWsOrderbookDepthMsg, BybitWsTickerLinear, BybitWsTickerLinearMsg,
-    BybitWsTickerOptionMsg, BybitWsTrade,
-};
-use crate::common::{
-    consts::BYBIT_TOPIC_KLINE,
-    enums::{
-        BybitOrderStatus, BybitOrderType, BybitStopOrderType, BybitTimeInForce,
-        BybitTriggerDirection,
-    },
-    parse::{
-        get_currency, parse_book_level, parse_millis_timestamp, parse_price_with_precision,
-        parse_quantity_with_precision,
+use super::{
+    enums::{BybitWsOperation, BybitWsPrivateChannel, BybitWsPublicChannel},
+    messages::{
+        BybitWsAccountExecution, BybitWsAccountExecutionFast, BybitWsAccountOrder,
+        BybitWsAccountPosition, BybitWsAccountWallet, BybitWsAuthResponse, BybitWsFrame,
+        BybitWsKline, BybitWsLiquidation, BybitWsOrderResponse, BybitWsOrderbookDepthMsg,
+        BybitWsResponse, BybitWsSubscriptionMsg, BybitWsTickerLinear, BybitWsTickerOptionMsg,
+        BybitWsTrade,
     },
 };
+use crate::{
+    common::{
+        consts::BYBIT_QUOTE_DEPTH,
+        enums::{BybitOrderSide, BybitOrderStatus, BybitPositionSide, BybitTimeInForce},
+        parse::{
+            bybit_rejection_due_post_only, get_currency, make_hedge_venue_position_id,
+            parse_book_level, parse_bybit_order_type, parse_millis_timestamp,
+            parse_price_with_precision, parse_quantity_with_precision,
+        },
+    },
+    data_types::BybitLiquidation,
+};
+
+/// Classifies a parsed JSON value into a typed Bybit WebSocket frame.
+///
+/// Returns `Unknown(value)` if no specific type matches.
+pub fn parse_bybit_ws_frame(value: serde_json::Value) -> BybitWsFrame {
+    if let Some(op_val) = value.get("op") {
+        if let Ok(op) = serde_json::from_value::<BybitWsOperation>(op_val.clone())
+            && op == BybitWsOperation::Auth
+            && let Ok(auth) = serde_json::from_value::<BybitWsAuthResponse>(value.clone())
+        {
+            let is_success = auth.success.unwrap_or(false) || auth.ret_code.unwrap_or(-1) == 0;
+            if is_success {
+                return BybitWsFrame::Auth(auth);
+            }
+            let resp = BybitWsResponse {
+                op: Some(auth.op.clone()),
+                topic: None,
+                success: auth.success,
+                conn_id: auth.conn_id.clone(),
+                req_id: None,
+                ret_code: auth.ret_code,
+                ret_msg: auth.ret_msg,
+            };
+            return BybitWsFrame::ErrorResponse(resp);
+        }
+
+        if let Some(op_str) = op_val.as_str()
+            && op_str.starts_with("order.")
+        {
+            return serde_json::from_value::<BybitWsOrderResponse>(value.clone()).map_or_else(
+                |_| BybitWsFrame::Unknown(value),
+                BybitWsFrame::OrderResponse,
+            );
+        }
+    }
+
+    if let Some(success) = value.get("success").and_then(serde_json::Value::as_bool) {
+        if success {
+            return serde_json::from_value::<BybitWsSubscriptionMsg>(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::Subscription);
+        }
+        return serde_json::from_value::<BybitWsResponse>(value.clone()).map_or_else(
+            |_| BybitWsFrame::Unknown(value),
+            BybitWsFrame::ErrorResponse,
+        );
+    }
+
+    if let Some(topic) = value.get("topic").and_then(serde_json::Value::as_str) {
+        if topic.starts_with(BybitWsPublicChannel::OrderBook.as_ref()) {
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::Orderbook);
+        }
+
+        if topic.contains(BybitWsPublicChannel::PublicTrade.as_ref())
+            || topic.starts_with(BybitWsPublicChannel::Trade.as_ref())
+        {
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::Trade);
+        }
+
+        if topic.starts_with(BybitWsPublicChannel::Kline.as_ref()) {
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::Kline);
+        }
+
+        if topic.starts_with(BybitWsPublicChannel::Tickers.as_ref()) {
+            // Option symbols have 3+ hyphens: BTC-6JAN23-17500-C
+            let is_option = value
+                .get("data")
+                .and_then(|d| d.get("symbol"))
+                .and_then(|s| s.as_str())
+                .is_some_and(|symbol| symbol.contains('-') && symbol.matches('-').count() >= 3);
+
+            if is_option {
+                return serde_json::from_value(value.clone())
+                    .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::TickerOption);
+            }
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::TickerLinear);
+        }
+
+        if topic.starts_with(BybitWsPublicChannel::AllLiquidation.as_ref()) {
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::Liquidation);
+        }
+
+        if topic.starts_with(BybitWsPrivateChannel::Order.as_ref()) {
+            return serde_json::from_value(value.clone())
+                .map_or_else(|_| BybitWsFrame::Unknown(value), BybitWsFrame::AccountOrder);
+        }
+
+        if topic.starts_with(BybitWsPrivateChannel::ExecutionFast.as_ref()) {
+            return serde_json::from_value(value.clone()).map_or_else(
+                |_| BybitWsFrame::Unknown(value),
+                BybitWsFrame::AccountExecutionFast,
+            );
+        }
+
+        if topic.starts_with(BybitWsPrivateChannel::Execution.as_ref()) {
+            return serde_json::from_value(value.clone()).map_or_else(
+                |_| BybitWsFrame::Unknown(value),
+                BybitWsFrame::AccountExecution,
+            );
+        }
+
+        if topic.starts_with(BybitWsPrivateChannel::Wallet.as_ref()) {
+            return serde_json::from_value(value.clone()).map_or_else(
+                |_| BybitWsFrame::Unknown(value),
+                BybitWsFrame::AccountWallet,
+            );
+        }
+
+        if topic.starts_with(BybitWsPrivateChannel::Position.as_ref()) {
+            return serde_json::from_value(value.clone()).map_or_else(
+                |_| BybitWsFrame::Unknown(value),
+                BybitWsFrame::AccountPosition,
+            );
+        }
+    }
+
+    BybitWsFrame::Unknown(value)
+}
 
 /// Parses a Bybit WebSocket topic string into its components.
 ///
@@ -75,10 +203,11 @@ pub fn parse_topic(topic: &str) -> anyhow::Result<Vec<&str>> {
 ///
 /// Returns an error if the topic format is invalid.
 pub fn parse_kline_topic(topic: &str) -> anyhow::Result<(&str, &str)> {
+    let kline = BybitWsPublicChannel::Kline.as_ref();
     let parts = parse_topic(topic)?;
-    if parts.len() != 3 || parts[0] != BYBIT_TOPIC_KLINE {
+    if parts.len() != 3 || parts[0] != kline {
         anyhow::bail!(
-            "Invalid kline topic format: expected '{BYBIT_TOPIC_KLINE}.{{interval}}.{{symbol}}', was '{topic}'"
+            "Invalid kline topic format: expected '{kline}.{{interval}}.{{symbol}}', was '{topic}'"
         );
     }
     Ok((parts[1], parts[2]))
@@ -109,6 +238,50 @@ pub fn parse_ws_trade_tick(
     .context("failed to construct TradeTick from Bybit trade message")
 }
 
+/// Parses a WebSocket liquidation entry into a [`BybitLiquidation`].
+///
+/// Bybit reports the side of the liquidated position, so `Buy` maps to
+/// [`PositionSide::Long`] and `Sell` maps to [`PositionSide::Short`].
+///
+/// # Errors
+///
+/// Returns an error if the side is neither `Buy` nor `Sell`, or if the price, size, or
+/// timestamp cannot be parsed.
+pub fn parse_ws_liquidation(
+    liquidation: &BybitWsLiquidation,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<BybitLiquidation> {
+    let position_side = match liquidation.side {
+        BybitOrderSide::Buy => PositionSide::Long,
+        BybitOrderSide::Sell => PositionSide::Short,
+        side @ BybitOrderSide::Unknown => {
+            anyhow::bail!("Invalid liquidation side: expected Buy or Sell, was {side:?}")
+        }
+    };
+
+    let bankruptcy_price = parse_price_with_precision(
+        &liquidation.p,
+        instrument.price_precision(),
+        "liquidation.p",
+    )?;
+    let quantity = parse_quantity_with_precision(
+        &liquidation.v,
+        instrument.size_precision(),
+        "liquidation.v",
+    )?;
+    let ts_event = parse_millis_i64(liquidation.t, "liquidation.T")?;
+
+    Ok(BybitLiquidation::new(
+        instrument.id(),
+        position_side,
+        bankruptcy_price,
+        quantity,
+        ts_event,
+        ts_init,
+    ))
+}
+
 /// Parses an order book depth message into [`OrderBookDeltas`].
 pub fn parse_orderbook_deltas(
     msg: &BybitWsOrderbookDepthMsg,
@@ -129,10 +302,12 @@ pub fn parse_orderbook_deltas(
         .context("received negative sequence in Bybit order book message")?;
 
     let total_levels = depth.b.len() + depth.a.len();
-    let capacity = if is_snapshot {
-        total_levels + 1
+    let capacity = total_levels + usize::from(is_snapshot);
+
+    let snapshot_flag = if is_snapshot {
+        RecordFlag::F_SNAPSHOT as u8
     } else {
-        total_levels
+        0
     };
     let mut deltas = Vec::with_capacity(capacity);
 
@@ -157,7 +332,7 @@ pub fn parse_orderbook_deltas(
         };
 
         processed += 1;
-        let mut flags = RecordFlag::F_MBP as u8;
+        let mut flags = RecordFlag::F_MBP as u8 | snapshot_flag;
 
         if processed == total_levels {
             flags |= RecordFlag::F_LAST as u8;
@@ -181,6 +356,7 @@ pub fn parse_orderbook_deltas(
     for level in &depth.b {
         push_level(level, OrderSide::Buy)?;
     }
+
     for level in &depth.a {
         push_level(level, OrderSide::Sell)?;
     }
@@ -195,49 +371,37 @@ pub fn parse_orderbook_deltas(
         .context("failed to assemble OrderBookDeltas from Bybit message")
 }
 
-/// Parses an order book snapshot or delta into a [`QuoteTick`].
+/// Parses a depth-1 order book snapshot into a [`QuoteTick`].
+///
+/// # Errors
+///
+/// Returns an error for a different depth or message type, missing sides, or invalid price or size data.
 pub fn parse_orderbook_quote(
     msg: &BybitWsOrderbookDepthMsg,
     instrument: &InstrumentAny,
-    last_quote: Option<&QuoteTick>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<QuoteTick> {
+    let (depth, _) = parse_orderbook_topic(msg.topic.as_str())?;
+    anyhow::ensure!(
+        depth == BYBIT_QUOTE_DEPTH && msg.msg_type == "snapshot",
+        "Expected depth-1 orderbook snapshot"
+    );
     let ts_event = parse_millis_i64(msg.ts, "orderbook.ts")?;
     let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-
-    let get_best =
-        |levels: &[Vec<String>], label: &str| -> anyhow::Result<Option<(Price, Quantity)>> {
-            if let Some(values) = levels.first() {
-                parse_book_level(values, price_precision, size_precision, label).map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-
-    let bids = get_best(&msg.data.b, "bid")?;
-    let asks = get_best(&msg.data.a, "ask")?;
-
-    let (bid_price, bid_size) = match (bids, last_quote) {
-        (Some(level), _) => level,
-        (None, Some(prev)) => (prev.bid_price, prev.bid_size),
-        (None, None) => {
-            anyhow::bail!(
-                "Bybit order book update missing bid levels and no previous quote provided"
-            );
-        }
-    };
-
-    let (ask_price, ask_size) = match (asks, last_quote) {
-        (Some(level), _) => level,
-        (None, Some(prev)) => (prev.ask_price, prev.ask_size),
-        (None, None) => {
-            anyhow::bail!(
-                "Bybit order book update missing ask levels and no previous quote provided"
-            );
-        }
-    };
+    let bid = msg
+        .data
+        .b
+        .first()
+        .context("orderbook snapshot missing bid")?;
+    let ask = msg
+        .data
+        .a
+        .first()
+        .context("orderbook snapshot missing ask")?;
+    let (bid_price, bid_size) = parse_book_level(bid, price_precision, size_precision, "bid")?;
+    let (ask_price, ask_size) = parse_book_level(ask, price_precision, size_precision, "ask")?;
 
     QuoteTick::new_checked(
         instrument.id(),
@@ -251,48 +415,18 @@ pub fn parse_orderbook_quote(
     .context("failed to construct QuoteTick from Bybit order book message")
 }
 
-/// Parses a linear or inverse ticker payload into a [`QuoteTick`].
-pub fn parse_ticker_linear_quote(
-    msg: &BybitWsTickerLinearMsg,
-    instrument: &InstrumentAny,
-    ts_init: UnixNanos,
-) -> anyhow::Result<QuoteTick> {
-    let ts_event = parse_millis_i64(msg.ts, "ticker.ts")?;
-    let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
-    let price_precision = instrument.price_precision();
-    let size_precision = instrument.size_precision();
-
-    let data = &msg.data;
-    let bid_price = data
-        .bid1_price
-        .as_ref()
-        .context("Bybit ticker message missing bid1Price")?
-        .as_str();
-    let ask_price = data
-        .ask1_price
-        .as_ref()
-        .context("Bybit ticker message missing ask1Price")?
-        .as_str();
-
-    let bid_price = parse_price_with_precision(bid_price, price_precision, "ticker.bid1Price")?;
-    let ask_price = parse_price_with_precision(ask_price, price_precision, "ticker.ask1Price")?;
-
-    let bid_size_str = data.bid1_size.as_deref().unwrap_or("0");
-    let ask_size_str = data.ask1_size.as_deref().unwrap_or("0");
-
-    let bid_size = parse_quantity_with_precision(bid_size_str, size_precision, "ticker.bid1Size")?;
-    let ask_size = parse_quantity_with_precision(ask_size_str, size_precision, "ticker.ask1Size")?;
-
-    QuoteTick::new_checked(
-        instrument.id(),
-        bid_price,
-        ask_price,
-        bid_size,
-        ask_size,
-        ts_event,
-        ts_init,
-    )
-    .context("failed to construct QuoteTick from Bybit linear ticker message")
+pub(crate) fn parse_orderbook_topic(topic: &str) -> anyhow::Result<(u32, &str)> {
+    let mut parts = topic.splitn(3, '.');
+    anyhow::ensure!(
+        parts.next() == Some("orderbook"),
+        "Invalid orderbook topic: {topic}"
+    );
+    let depth = parts.next().context("missing orderbook depth")?.parse()?;
+    let symbol = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("missing orderbook symbol")?;
+    Ok((depth, symbol))
 }
 
 /// Parses an option ticker payload into a [`QuoteTick`].
@@ -342,10 +476,18 @@ pub fn parse_ticker_linear_funding(
         .as_ref()
         .context("Bybit ticker missing funding_rate")?;
 
+    if funding_rate_str.is_empty() {
+        anyhow::bail!(
+            "empty funding_rate for {instrument_id} (dated futures do not have funding rates)"
+        );
+    }
+
     let funding_rate = funding_rate_str
         .as_str()
         .parse::<Decimal>()
-        .context("invalid funding_rate value")?;
+        .with_context(|| {
+            format!("invalid funding_rate value '{funding_rate_str}' for {instrument_id}")
+        })?;
 
     let funding_interval = if let Some(funding_interval_hour) = &data.funding_interval_hour {
         let funding_interval_hour = funding_interval_hour
@@ -524,6 +666,7 @@ pub fn parse_ticker_option_greeks(
 
     Ok(OptionGreeks {
         instrument_id: instrument.id(),
+        convention: GreeksConvention::BlackScholes,
         greeks: OptionGreekValues {
             delta,
             gamma,
@@ -573,23 +716,22 @@ pub fn parse_ws_kline_bar(
     let close = parse_price_with_precision(&kline.close, price_precision, "kline.close")?;
     let volume = parse_quantity_with_precision(&kline.volume, size_precision, "kline.volume")?;
 
-    let mut ts_event = parse_millis_i64(kline.start, "kline.start")?;
+    let ts_open = parse_millis_i64(kline.start, "kline.start")?;
+    let interval_ns = bar_type.spec().timedelta().as_nanos();
+    let interval_ns = u64::try_from(interval_ns)
+        .context("bar interval overflowed the u64 range for nanoseconds")?;
+    let ts_close = ts_open
+        .as_u64()
+        .checked_add(interval_ns)
+        .map(UnixNanos::from)
+        .context("bar timestamp overflowed when adjusting to close time")?;
 
-    if timestamp_on_close {
-        let interval_ns = bar_type
-            .spec()
-            .timedelta()
-            .num_nanoseconds()
-            .context("bar specification produced non-integer interval")?;
-        let interval_ns = u64::try_from(interval_ns)
-            .context("bar interval overflowed the u64 range for nanoseconds")?;
-        let updated = ts_event
-            .as_u64()
-            .checked_add(interval_ns)
-            .context("bar timestamp overflowed when adjusting to close time")?;
-        ts_event = UnixNanos::from(updated);
-    }
-    let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
+    let ts_event = if timestamp_on_close {
+        ts_close
+    } else {
+        ts_open
+    };
+    let ts_init = if ts_init.is_zero() { ts_close } else { ts_init };
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init)
         .context("failed to construct Bar from Bybit WebSocket kline")
@@ -606,98 +748,22 @@ pub fn parse_ws_order_status_report(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
-    use crate::common::enums::BybitOrderSide;
-
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(order.order_id.as_str());
-    let order_side: OrderSide = order.side.into();
+    let venue_order_id = VenueOrderId::new(order.order_id);
+    let order_side: Option<OrderSide> = order.side.into();
 
-    // Bybit represents conditional orders using orderType + stopOrderType + triggerDirection + side
-    let order_type: OrderType = match (
+    let order_type = parse_bybit_order_type(
         order.order_type,
         order.stop_order_type,
         order.trigger_direction,
         order.side,
-    ) {
-        (BybitOrderType::Market, BybitStopOrderType::None | BybitStopOrderType::Unknown, _, _) => {
-            OrderType::Market
-        }
-        (BybitOrderType::Limit, BybitStopOrderType::None | BybitStopOrderType::Unknown, _, _) => {
-            OrderType::Limit
-        }
-
-        (
-            BybitOrderType::Market,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::RisesTo,
-            BybitOrderSide::Buy,
-        ) => OrderType::StopMarket,
-        (
-            BybitOrderType::Market,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::FallsTo,
-            BybitOrderSide::Buy,
-        ) => OrderType::MarketIfTouched,
-
-        (
-            BybitOrderType::Market,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::FallsTo,
-            BybitOrderSide::Sell,
-        ) => OrderType::StopMarket,
-        (
-            BybitOrderType::Market,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::RisesTo,
-            BybitOrderSide::Sell,
-        ) => OrderType::MarketIfTouched,
-
-        (
-            BybitOrderType::Limit,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::RisesTo,
-            BybitOrderSide::Buy,
-        ) => OrderType::StopLimit,
-        (
-            BybitOrderType::Limit,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::FallsTo,
-            BybitOrderSide::Buy,
-        ) => OrderType::LimitIfTouched,
-
-        (
-            BybitOrderType::Limit,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::FallsTo,
-            BybitOrderSide::Sell,
-        ) => OrderType::StopLimit,
-        (
-            BybitOrderType::Limit,
-            BybitStopOrderType::Stop,
-            BybitTriggerDirection::RisesTo,
-            BybitOrderSide::Sell,
-        ) => OrderType::LimitIfTouched,
-
-        // triggerDirection=None means regular order with TP/SL attached, not a standalone conditional order
-        (BybitOrderType::Market, BybitStopOrderType::Stop, BybitTriggerDirection::None, _) => {
-            OrderType::Market
-        }
-        (BybitOrderType::Limit, BybitStopOrderType::Stop, BybitTriggerDirection::None, _) => {
-            OrderType::Limit
-        }
-
-        // TP/SL stopOrderTypes are attached to positions, not standalone conditional orders
-        (BybitOrderType::Market, _, _, _) => OrderType::Market,
-        (BybitOrderType::Limit, _, _, _) => OrderType::Limit,
-
-        (BybitOrderType::Unknown, _, _, _) => OrderType::Limit,
-    };
+    );
 
     let time_in_force: TimeInForce = match order.time_in_force {
         BybitTimeInForce::Gtc => TimeInForce::Gtc,
         BybitTimeInForce::Ioc => TimeInForce::Ioc,
         BybitTimeInForce::Fok => TimeInForce::Fok,
-        BybitTimeInForce::PostOnly => TimeInForce::Gtc,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi => TimeInForce::Gtc,
     };
 
     let quantity =
@@ -727,6 +793,15 @@ pub fn parse_ws_order_status_report(
         }
         BybitOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
         BybitOrderStatus::Filled => OrderStatus::Filled,
+        // A post-only order that would take liquidity is reported as Cancelled with
+        // rejectReason=EC_PostOnlyWillTakeLiquidity (not Rejected). Surface it as Rejected
+        // for consistency with the tracked-order event path.
+        BybitOrderStatus::Canceled
+            if filled_qty.is_zero()
+                && bybit_rejection_due_post_only(order.reject_reason.as_str()) =>
+        {
+            OrderStatus::Rejected
+        }
         BybitOrderStatus::Canceled | BybitOrderStatus::PartiallyFilledCanceled => {
             OrderStatus::Canceled
         }
@@ -755,7 +830,7 @@ pub fn parse_ws_order_status_report(
     );
 
     if !order.order_link_id.is_empty() {
-        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id.as_str()));
+        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id));
     }
 
     if !order.price.is_empty() && order.price != "0" {
@@ -765,11 +840,10 @@ pub fn parse_ws_order_status_report(
     }
 
     if !order.avg_price.is_empty() && order.avg_price != "0" {
-        let avg_px = order
-            .avg_price
-            .parse::<f64>()
-            .with_context(|| format!("Failed to parse avg_price='{}' as f64", order.avg_price))?;
-        report = report.with_avg_px(avg_px)?;
+        let avg_px = order.avg_price.parse::<Decimal>().with_context(|| {
+            format!("Failed to parse avg_price='{}' as Decimal", order.avg_price)
+        })?;
+        report = report.with_avg_px(avg_px);
     }
 
     if !order.trigger_price.is_empty() && order.trigger_price != "0" {
@@ -785,11 +859,19 @@ pub fn parse_ws_order_status_report(
         report = report.with_trigger_type(trigger_type);
     }
 
+    if let Some(venue_position_id) = make_hedge_venue_position_id(instrument_id, order.position_idx)
+    {
+        report = report.with_venue_position_id(venue_position_id);
+    }
+
     if order.reduce_only {
         report = report.with_reduce_only(true);
     }
 
-    if order.time_in_force == BybitTimeInForce::PostOnly {
+    if matches!(
+        order.time_in_force,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi
+    ) {
         report = report.with_post_only(true);
     }
 
@@ -812,11 +894,11 @@ pub fn parse_ws_fill_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(execution.order_id.as_str());
+    let venue_order_id = VenueOrderId::new(execution.order_id);
     let trade_id = TradeId::new_checked(execution.exec_id.as_str())
         .context("invalid execId in Bybit WebSocket execution payload")?;
 
-    let order_side: OrderSide = execution.side.into();
+    let order_side = OrderSide::try_from(execution.side)?;
     let last_qty = parse_quantity_with_precision(
         &execution.exec_qty,
         instrument.size_precision(),
@@ -839,7 +921,7 @@ pub fn parse_ws_fill_report(
         .parse()
         .with_context(|| format!("Failed to parse execFee='{}'", execution.exec_fee))?;
 
-    let commission_currency = instrument.quote_currency();
+    let commission_currency = get_currency(&execution.fee_currency);
     let commission = Money::from_decimal(fee_decimal, commission_currency).with_context(|| {
         format!(
             "Failed to create commission from execFee='{}'",
@@ -851,7 +933,7 @@ pub fn parse_ws_fill_report(
     let client_order_id = if execution.order_link_id.is_empty() {
         None
     } else {
-        Some(ClientOrderId::new(execution.order_link_id.as_str()))
+        Some(ClientOrderId::new(execution.order_link_id))
     };
 
     Ok(FillReport::new(
@@ -865,10 +947,84 @@ pub fn parse_ws_fill_report(
         commission,
         liquidity_side,
         client_order_id,
-        None, // venue_position_id
+        None, // venue_position_id: execution data lacks position_idx
         ts_event,
         ts_init,
         None, // report_id
+    ))
+}
+
+/// Parses a fast-stream WebSocket execution payload into a [`FillReport`].
+///
+/// The `execution.fast` channel omits fee and exec-type fields, so the resulting
+/// report carries zero commission. Liquidity side is derived from the payload's
+/// `isMaker` flag. Pair with the standard `execution` channel if exact fee data
+/// is required.
+///
+/// `venue_position_id` should be supplied for tracked hedge-mode orders so the
+/// emitted report carries the long/short position identity that the standard
+/// channel preserves via `OrderFilled`.
+///
+/// # Errors
+///
+/// Returns an error if price or quantity fields cannot be parsed or timestamps are invalid.
+pub fn parse_ws_fill_report_fast(
+    execution: &BybitWsAccountExecutionFast,
+    account_id: AccountId,
+    instrument: &InstrumentAny,
+    venue_position_id: Option<PositionId>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FillReport> {
+    let instrument_id = instrument.id();
+    let venue_order_id = VenueOrderId::new(execution.order_id);
+    let trade_id = TradeId::new_checked(execution.exec_id.as_str())
+        .context("invalid execId in Bybit WebSocket fast-execution payload")?;
+
+    let order_side = OrderSide::try_from(execution.side)?;
+    let last_qty = parse_quantity_with_precision(
+        &execution.exec_qty,
+        instrument.size_precision(),
+        "execution.execQty",
+    )?;
+    let last_px = parse_price_with_precision(
+        &execution.exec_price,
+        instrument.price_precision(),
+        "execution.execPrice",
+    )?;
+
+    let liquidity_side = if execution.is_maker {
+        LiquiditySide::Maker
+    } else {
+        LiquiditySide::Taker
+    };
+
+    // execution.fast carries no fee data (no rate or currency)
+    let commission_currency = instrument.quote_currency();
+    let commission = Money::from_decimal(Decimal::ZERO, commission_currency)
+        .with_context(|| format!("Failed to create zero commission for {commission_currency}"))?;
+    let ts_event = parse_millis_timestamp(&execution.exec_time, "execution.execTime")?;
+
+    let client_order_id = if execution.order_link_id.is_empty() {
+        None
+    } else {
+        Some(ClientOrderId::new(execution.order_link_id))
+    };
+
+    Ok(FillReport::new(
+        account_id,
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        order_side,
+        last_qty,
+        last_px,
+        commission,
+        liquidity_side,
+        client_order_id,
+        venue_position_id,
+        ts_event,
+        ts_init,
+        None,
     ))
 }
 
@@ -892,16 +1048,27 @@ pub fn parse_ws_position_status_report(
         "position.size",
     )?;
 
-    // Derive position side from the side field
-    let position_side = if position.side.eq_ignore_ascii_case("buy") {
-        PositionSideSpecified::Long
-    } else if position.side.eq_ignore_ascii_case("sell") {
-        PositionSideSpecified::Short
-    } else {
-        PositionSideSpecified::Flat
+    let position_side = match position.side {
+        BybitPositionSide::Buy => PositionSide::Long,
+        BybitPositionSide::Sell => PositionSide::Short,
+        BybitPositionSide::Flat => PositionSide::Flat,
     };
 
+    // Bybit ranks open positions 1-5 by ADL priority (5 = next to be deleveraged);
+    // 0 means the account has no open position or is flat. Warn when approaching the
+    // top tier so operators can react before the venue force-closes.
+    if position.adl_rank_indicator >= 4 {
+        log::warn!(
+            "Elevated ADL risk: {} position size={} adl_rank={}",
+            instrument_id,
+            position.size,
+            position.adl_rank_indicator,
+        );
+    }
+
     let ts_last = parse_millis_timestamp(&position.updated_time, "position.updatedTime")?;
+
+    let venue_position_id = make_hedge_venue_position_id(instrument_id, position.position_idx);
 
     Ok(PositionStatusReport::new(
         account_id,
@@ -910,8 +1077,8 @@ pub fn parse_ws_position_status_report(
         quantity,
         ts_last,
         ts_init,
-        None,                 // report_id
-        None,                 // venue_position_id
+        None, // report_id
+        venue_position_id,
         position.entry_price, // avg_px_open
     ))
 }
@@ -928,26 +1095,40 @@ pub fn parse_ws_account_state(
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
     let mut balances = Vec::new();
+    let mut margins = Vec::new();
 
     for coin_data in &wallet.coin {
         let currency = get_currency(coin_data.coin.as_str());
         let total_dec = coin_data.wallet_balance - coin_data.spot_borrow;
         let locked_dec = coin_data.total_order_im + coin_data.total_position_im;
 
-        let total = Money::from_decimal(total_dec, currency)?;
-        let locked = Money::from_decimal(locked_dec, currency)?;
-        let free = Money::from_raw(total.raw - locked.raw, currency);
+        balances.push(AccountBalance::from_total_and_locked(
+            total_dec, locked_dec, currency,
+        )?);
 
-        let balance = AccountBalance::new(total, locked, free);
-        balances.push(balance);
+        // Sum position IM (reserved by open positions) and order IM (reserved by
+        // pending orders) so the reported initial margin reflects either source.
+        let initial_margin_dec = coin_data.total_position_im + coin_data.total_order_im;
+        let maintenance_margin_dec = match &coin_data.total_position_mm {
+            Some(mm) if !mm.is_empty() => mm.parse::<Decimal>()?,
+            _ => Decimal::ZERO,
+        };
+
+        if !initial_margin_dec.is_zero() || !maintenance_margin_dec.is_zero() {
+            margins.push(MarginBalance::new(
+                Money::from_decimal(initial_margin_dec, currency)?,
+                Money::from_decimal(maintenance_margin_dec, currency)?,
+                None,
+            ));
+        }
     }
 
     Ok(AccountState::new(
         account_id,
         AccountType::Margin, // Bybit unified account
         balances,
-        vec![], // margins - Bybit doesn't provide per-instrument margin in wallet updates
-        true,   // is_reported
+        margins,
+        true, // is_reported
         UUID4::new(),
         ts_event,
         ts_init,
@@ -957,9 +1138,15 @@ pub fn parse_ws_account_state(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use nautilus_model::{
         data::BarSpecification,
-        enums::{AggregationSource, BarAggregation, PositionSide, PriceType},
+        enums::{
+            AggregationSource, BarAggregation, OrderType, PositionSide, PriceType, TriggerType,
+        },
+        identifiers::PositionId,
+        types::{Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
@@ -967,13 +1154,14 @@ mod tests {
     use super::*;
     use crate::{
         common::{
+            enums::{BybitExecType, BybitOrderSide, BybitProductType},
             parse::{parse_linear_instrument, parse_option_instrument},
             testing::load_test_json,
         },
         http::models::{BybitInstrumentLinearResponse, BybitInstrumentOptionResponse},
         websocket::messages::{
-            BybitWsOrderbookDepthMsg, BybitWsTickerLinearMsg, BybitWsTickerOptionMsg,
-            BybitWsTradeMsg,
+            BybitWsAccountExecutionMsg, BybitWsLiquidationMsg, BybitWsOrderbookDepthMsg,
+            BybitWsTickerLinearMsg, BybitWsTickerOptionMsg, BybitWsTradeMsg,
         },
     };
 
@@ -981,28 +1169,11 @@ mod tests {
 
     use ustr::Ustr;
 
-    use crate::http::models::BybitFeeRate;
-
-    fn sample_fee_rate(
-        symbol: &str,
-        taker: &str,
-        maker: &str,
-        base_coin: Option<&str>,
-    ) -> BybitFeeRate {
-        BybitFeeRate {
-            symbol: Ustr::from(symbol),
-            taker_fee_rate: taker.to_string(),
-            maker_fee_rate: maker.to_string(),
-            base_coin: base_coin.map(Ustr::from),
-        }
-    }
-
     fn linear_instrument() -> InstrumentAny {
         let json = load_test_json("http_get_instruments_linear.json");
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
-        let fee_rate = sample_fee_rate("BTCUSDT", "0.00055", "0.0001", Some("BTC"));
-        parse_linear_instrument(instrument, &fee_rate, TS, TS).unwrap()
+        parse_linear_instrument(instrument, TS, TS).unwrap()
     }
 
     fn option_instrument() -> InstrumentAny {
@@ -1024,12 +1195,84 @@ mod tests {
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price, instrument.make_price(27451.00));
         assert_eq!(tick.size, instrument.make_qty(0.010, None));
-        assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+        assert_eq!(tick.aggressor_side, AggressorSide::Buy);
         assert_eq!(
             tick.trade_id.to_string(),
             "9dc75fca-4bdd-4773-9f78-6f5d7ab2a110"
         );
         assert_eq!(tick.ts_event, UnixNanos::new(1_709_891_679_000_000_000));
+    }
+
+    #[rstest]
+    fn parse_bybit_ws_frame_routes_all_liquidation_topic() {
+        let value: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_all_liquidation.json")).unwrap();
+
+        let frame = parse_bybit_ws_frame(value);
+
+        match frame {
+            BybitWsFrame::Liquidation(msg) => {
+                assert_eq!(msg.topic, Ustr::from("allLiquidation.BTCUSDT"));
+                assert_eq!(msg.msg_type, Ustr::from("snapshot"));
+                assert_eq!(msg.ts, 1_739_502_303_204);
+                assert_eq!(msg.data.len(), 2);
+                assert_eq!(msg.data[0].t, 1_739_502_302_929);
+                assert_eq!(msg.data[0].s, Ustr::from("BTCUSDT"));
+                assert_eq!(msg.data[0].side, BybitOrderSide::Buy);
+                assert_eq!(msg.data[0].v, "0.015");
+                assert_eq!(msg.data[0].p, "96250.5");
+                assert_eq!(msg.data[1].t, 1_739_502_303_011);
+                assert_eq!(msg.data[1].s, Ustr::from("BTCUSDT"));
+                assert_eq!(msg.data[1].side, BybitOrderSide::Sell);
+                assert_eq!(msg.data[1].v, "1.250");
+                assert_eq!(msg.data[1].p, "97410.0");
+            }
+            other => panic!("Expected Liquidation, found {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::buy_is_long(0, PositionSide::Long, "96250.5", "0.015", 1_739_502_302_929_000_000)]
+    #[case::sell_is_short(1, PositionSide::Short, "97410.0", "1.250", 1_739_502_303_011_000_000)]
+    fn parse_ws_liquidation_into_bybit_liquidation(
+        #[case] index: usize,
+        #[case] expected_side: PositionSide,
+        #[case] expected_price: &str,
+        #[case] expected_quantity: &str,
+        #[case] expected_ts_event: u64,
+    ) {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_all_liquidation.json");
+        let msg: BybitWsLiquidationMsg = serde_json::from_str(&json).unwrap();
+
+        let liquidation = parse_ws_liquidation(&msg.data[index], &instrument, TS).unwrap();
+
+        assert_eq!(
+            liquidation.instrument_id,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT")
+        );
+        assert_eq!(liquidation.position_side, expected_side);
+        assert_eq!(liquidation.bankruptcy_price, Price::from(expected_price));
+        assert_eq!(liquidation.quantity, Quantity::from(expected_quantity));
+        assert_eq!(liquidation.ts_event, UnixNanos::new(expected_ts_event));
+        assert_eq!(liquidation.ts_init, TS);
+    }
+
+    #[rstest]
+    fn parse_ws_liquidation_rejects_unknown_side() {
+        let instrument = linear_instrument();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_all_liquidation.json")).unwrap();
+        value["data"][0]["S"] = serde_json::json!("");
+        let msg: BybitWsLiquidationMsg = serde_json::from_value(value).unwrap();
+
+        let err = parse_ws_liquidation(&msg.data[0], &instrument, TS).unwrap_err();
+
+        assert_eq!(msg.data[0].side, BybitOrderSide::Unknown);
+        assert_eq!(
+            err.to_string(),
+            "Invalid liquidation side: expected Buy or Sell, was Unknown"
+        );
     }
 
     #[rstest]
@@ -1043,6 +1286,12 @@ mod tests {
         assert_eq!(deltas.instrument_id, instrument.id());
         assert_eq!(deltas.deltas.len(), 5);
         assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert!(
+            deltas
+                .deltas
+                .iter()
+                .all(|delta| RecordFlag::F_SNAPSHOT.matches(delta.flags))
+        );
         assert_eq!(
             deltas.deltas[1].order.price,
             instrument.make_price(27450.00)
@@ -1052,7 +1301,7 @@ mod tests {
             instrument.make_qty(0.500, None)
         );
         let last = deltas.deltas.last().unwrap();
-        assert_eq!(last.order.side, OrderSide::Sell);
+        assert_eq!(last.order.side, OrderSide::Sell.into());
         assert_eq!(last.order.price, instrument.make_price(27451.50));
         assert_eq!(
             last.flags & RecordFlag::F_LAST as u8,
@@ -1071,12 +1320,18 @@ mod tests {
         assert_eq!(deltas.deltas.len(), 2);
         let bid = &deltas.deltas[0];
         assert_eq!(bid.action, BookAction::Update);
-        assert_eq!(bid.order.side, OrderSide::Buy);
+        assert_eq!(bid.order.side, OrderSide::Buy.into());
         assert_eq!(bid.order.size, instrument.make_qty(0.400, None));
 
         let ask = &deltas.deltas[1];
+        assert!(
+            deltas
+                .deltas
+                .iter()
+                .all(|delta| !RecordFlag::F_SNAPSHOT.matches(delta.flags))
+        );
         assert_eq!(ask.action, BookAction::Delete);
-        assert_eq!(ask.order.side, OrderSide::Sell);
+        assert_eq!(ask.order.side, OrderSide::Sell.into());
         assert_eq!(ask.order.size, instrument.make_qty(0.0, None));
         assert_eq!(
             ask.flags & RecordFlag::F_LAST as u8,
@@ -1090,7 +1345,7 @@ mod tests {
         let json = load_test_json("ws_orderbook_snapshot.json");
         let msg: BybitWsOrderbookDepthMsg = serde_json::from_str(&json).unwrap();
 
-        let quote = parse_orderbook_quote(&msg, &instrument, None, TS).unwrap();
+        let quote = parse_orderbook_quote(&msg, &instrument, TS).unwrap();
 
         assert_eq!(quote.instrument_id, instrument.id());
         assert_eq!(quote.bid_price, instrument.make_price(27450.00));
@@ -1100,37 +1355,60 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_orderbook_quote_with_delta_updates_sizes() {
+    #[case::delta(
+        "orderbook.1.BTCUSDT",
+        "delta",
+        false,
+        false,
+        "Expected depth-1 orderbook snapshot"
+    )]
+    #[case::depth_50(
+        "orderbook.50.BTCUSDT",
+        "snapshot",
+        false,
+        false,
+        "Expected depth-1 orderbook snapshot"
+    )]
+    #[case::missing_bid(
+        "orderbook.1.BTCUSDT",
+        "snapshot",
+        true,
+        false,
+        "orderbook snapshot missing bid"
+    )]
+    #[case::missing_ask(
+        "orderbook.1.BTCUSDT",
+        "snapshot",
+        false,
+        true,
+        "orderbook snapshot missing ask"
+    )]
+    fn parse_orderbook_quote_rejects_non_top_of_book(
+        #[case] topic: &str,
+        #[case] msg_type: &str,
+        #[case] missing_bid: bool,
+        #[case] missing_ask: bool,
+        #[case] expected_error: &str,
+    ) {
         let instrument = linear_instrument();
-        let snapshot: BybitWsOrderbookDepthMsg =
+        let mut msg: BybitWsOrderbookDepthMsg =
             serde_json::from_str(&load_test_json("ws_orderbook_snapshot.json")).unwrap();
-        let base_quote = parse_orderbook_quote(&snapshot, &instrument, None, TS).unwrap();
+        msg.topic = topic.into();
+        msg.msg_type = msg_type.into();
+        if missing_bid {
+            msg.data.b.clear();
+        }
 
-        let delta: BybitWsOrderbookDepthMsg =
-            serde_json::from_str(&load_test_json("ws_orderbook_delta.json")).unwrap();
-        let updated = parse_orderbook_quote(&delta, &instrument, Some(&base_quote), TS).unwrap();
+        if missing_ask {
+            msg.data.a.clear();
+        }
 
-        assert_eq!(updated.bid_price, instrument.make_price(27450.00));
-        assert_eq!(updated.bid_size, instrument.make_qty(0.400, None));
-        assert_eq!(updated.ask_price, instrument.make_price(27451.00));
-        assert_eq!(updated.ask_size, instrument.make_qty(0.0, None));
-    }
-
-    #[rstest]
-    fn parse_linear_ticker_quote_to_quote_tick() {
-        let instrument = linear_instrument();
-        let json = load_test_json("ws_ticker_linear.json");
-        let msg: BybitWsTickerLinearMsg = serde_json::from_str(&json).unwrap();
-
-        let quote = parse_ticker_linear_quote(&msg, &instrument, TS).unwrap();
-
-        assert_eq!(quote.instrument_id, instrument.id());
-        assert_eq!(quote.bid_price, instrument.make_price(17215.50));
-        assert_eq!(quote.ask_price, instrument.make_price(17216.00));
-        assert_eq!(quote.bid_size, instrument.make_qty(84.489, None));
-        assert_eq!(quote.ask_size, instrument.make_qty(83.020, None));
-        assert_eq!(quote.ts_event, UnixNanos::new(1_673_272_861_686_000_000));
-        assert_eq!(quote.ts_init, TS);
+        assert_eq!(
+            parse_orderbook_quote(&msg, &instrument, TS)
+                .unwrap_err()
+                .to_string(),
+            expected_error
+        );
     }
 
     #[rstest]
@@ -1181,6 +1459,36 @@ mod tests {
     }
 
     #[rstest]
+    #[case::timestamp_on_open(false)]
+    #[case::timestamp_on_close(true)]
+    fn parse_ws_kline_zero_ts_init_falls_back_to_close(#[case] timestamp_on_close: bool) {
+        use std::num::NonZero;
+
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_kline.json");
+        let msg: crate::websocket::messages::BybitWsKlineMsg = serde_json::from_str(&json).unwrap();
+        let kline = &msg.data[0];
+
+        let bar_spec = BarSpecification {
+            step: NonZero::new(5).unwrap(),
+            aggregation: BarAggregation::Minute,
+            price_type: PriceType::Last,
+        };
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::External);
+
+        let bar = parse_ws_kline_bar(
+            kline,
+            &instrument,
+            bar_type,
+            timestamp_on_close,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bar.ts_init, UnixNanos::new(1_672_325_100_000_000_000));
+    }
+
+    #[rstest]
     fn parse_ws_order_into_order_status_report() {
         let instrument = linear_instrument();
         let json = load_test_json("ws_account_order_filled.json");
@@ -1193,7 +1501,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument.id());
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Filled);
@@ -1210,6 +1518,30 @@ mod tests {
             UnixNanos::new(1_672_364_262_444_000_000)
         );
         assert_eq!(report.ts_last, UnixNanos::new(1_672_364_262_457_000_000));
+    }
+
+    #[rstest]
+    fn parse_ws_order_avg_price_keeps_every_digit_the_venue_sent() {
+        // 28 significant digits is exactly what `Decimal` holds, and more than `f64` can:
+        // routing the same string through `f64` first collapses it to 30000.500000000004.
+        let raw = "30000.50000000000372529029846";
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_filled.json");
+        let mut msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        msg.data[0].avg_price = raw.to_string();
+
+        let report = parse_ws_order_status_report(
+            &msg.data[0],
+            &instrument,
+            AccountId::new("BYBIT-001"),
+            TS,
+        )
+        .unwrap();
+
+        let via_f64: Decimal = raw.parse::<f64>().unwrap().to_string().parse().unwrap();
+        assert_eq!(report.avg_px, Some(Decimal::from_str(raw).unwrap()));
+        assert_ne!(report.avg_px, Some(via_f64));
     }
 
     #[rstest]
@@ -1231,6 +1563,28 @@ mod tests {
             "O-20251001-164609-APEX-000-49"
         );
         assert_eq!(report.cancel_reason, Some("UNKNOWN".to_string()));
+    }
+
+    #[rstest]
+    fn parse_ws_order_post_only_cancel_maps_to_rejected() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order.json");
+        let mut msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+
+        let order = msg.data.first_mut().unwrap();
+        order.reject_reason = Ustr::from("EC_PostOnlyWillTakeLiquidity");
+        order.cum_exec_qty = "0".to_string();
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report =
+            parse_ws_order_status_report(&msg.data[0], &instrument, account_id, TS).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(
+            report.cancel_reason,
+            Some("EC_PostOnlyWillTakeLiquidity".to_string())
+        );
     }
 
     #[rstest]
@@ -1258,12 +1612,244 @@ mod tests {
         assert_eq!(report.last_qty, instrument.make_qty(0.5, None));
         assert_eq!(report.last_px, instrument.make_price(95900.1));
         assert_eq!(report.commission.as_f64(), 26.3725275);
+        assert_eq!(report.commission.currency.code, "USDT");
         assert_eq!(report.liquidity_side, LiquiditySide::Taker);
         assert_eq!(
             report.client_order_id.as_ref().unwrap().to_string(),
             "test-order-link-001"
         );
         assert_eq!(report.ts_event, UnixNanos::new(1_746_270_400_353_000_000));
+    }
+
+    #[rstest]
+    fn parse_ws_adl_execution_into_fill_report() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_execution_adl.json");
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_str(&json).unwrap();
+        let execution = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-001");
+
+        assert_eq!(execution.exec_type, BybitExecType::AdlTrade);
+        assert!(execution.exec_type.is_exchange_generated());
+        assert!(execution.order_link_id.is_empty());
+
+        let report = parse_ws_fill_report(execution, account_id, &instrument, TS).unwrap();
+
+        // ADL fills carry an empty orderLinkId; client_order_id is None so the engine
+        // creates the order as external from the accompanying order status report.
+        assert_eq!(report.client_order_id, None);
+        assert_eq!(
+            report.venue_order_id.to_string(),
+            "9aac161b-8ed6-450d-9cab-c5cc67c21785"
+        );
+        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.last_qty, instrument.make_qty(0.5, None));
+        assert_eq!(report.last_px, instrument.make_price(95850.0));
+        assert_eq!(report.commission.as_f64(), 0.0);
+        assert_eq!(report.commission.currency.code, "USDT");
+    }
+
+    #[rstest]
+    #[case::forward_split_settle("ForwardSplitSettle", BybitExecType::ForwardSplitSettle)]
+    #[case::reverse_split_settle("ReverseSplitSettle", BybitExecType::ReverseSplitSettle)]
+    #[case::dividend("Dividend", BybitExecType::Dividend)]
+    fn parse_ws_exchange_generated_execution_into_fill_report(
+        #[case] exec_type: &str,
+        #[case] expected: BybitExecType,
+    ) {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_execution_adl.json");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["data"][0]["execType"] = serde_json::json!(exec_type);
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_value(value).unwrap();
+        let execution = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-001");
+
+        assert_eq!(execution.exec_type, expected);
+        assert!(execution.exec_type.is_exchange_generated());
+        assert!(execution.order_link_id.is_empty());
+
+        let report = parse_ws_fill_report(execution, account_id, &instrument, TS).unwrap();
+
+        assert_eq!(report.client_order_id, None);
+        assert_eq!(
+            report.venue_order_id.to_string(),
+            "9aac161b-8ed6-450d-9cab-c5cc67c21785"
+        );
+    }
+
+    #[rstest]
+    fn parse_ws_fill_report_venue_position_id_is_none() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_execution.json");
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_str(&json).unwrap();
+        let execution = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_fill_report(execution, account_id, &instrument, TS).unwrap();
+
+        assert_eq!(report.venue_position_id, None);
+    }
+
+    #[rstest]
+    fn parse_ws_fill_report_uses_payload_fee_currency() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_execution.json");
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_str(&json).unwrap();
+
+        let mut execution = msg.data[0].clone();
+        execution.fee_currency = Ustr::from("BTC");
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_fill_report(&execution, account_id, &instrument, TS).unwrap();
+
+        assert_eq!(report.commission.currency.code, "BTC");
+    }
+
+    fn fast_execution(is_maker: bool, order_link_id: &str) -> BybitWsAccountExecutionFast {
+        BybitWsAccountExecutionFast {
+            category: BybitProductType::Linear,
+            symbol: Ustr::from("BTCUSDT"),
+            exec_id: "abc-123".to_string(),
+            exec_price: "50000.0".to_string(),
+            exec_qty: "0.5".to_string(),
+            order_id: Ustr::from("ord-1"),
+            order_link_id: Ustr::from(order_link_id),
+            side: BybitOrderSide::Buy,
+            exec_time: "1716800399334".to_string(),
+            is_maker,
+            seq: 42,
+        }
+    }
+
+    #[rstest]
+    // Maker fast fill: docs say orderLinkId is always empty -> client_order_id is None.
+    #[case(true, "", LiquiditySide::Maker, None)]
+    // Taker fast fill: orderLinkId is populated -> client_order_id is set.
+    #[case(false, "link-1", LiquiditySide::Taker, Some("link-1"))]
+    fn parse_ws_fill_report_fast_maps_is_maker_and_link_id(
+        #[case] is_maker: bool,
+        #[case] order_link_id: &str,
+        #[case] expected_liquidity: LiquiditySide,
+        #[case] expected_cid: Option<&str>,
+    ) {
+        let instrument = linear_instrument();
+        let exec = fast_execution(is_maker, order_link_id);
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_fill_report_fast(&exec, account_id, &instrument, None, TS).unwrap();
+
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(report.venue_order_id.to_string(), "ord-1");
+        assert_eq!(report.trade_id.to_string(), "abc-123");
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.last_qty, instrument.make_qty(0.5, None));
+        assert_eq!(report.last_px, instrument.make_price(50000.0));
+        assert_eq!(report.commission.as_f64(), 0.0);
+        assert_eq!(report.liquidity_side, expected_liquidity);
+        assert_eq!(
+            report.client_order_id.map(|c| c.to_string()),
+            expected_cid.map(str::to_string),
+        );
+        assert_eq!(report.venue_position_id, None);
+        assert_eq!(report.ts_event, UnixNanos::new(1_716_800_399_334_000_000));
+    }
+
+    #[rstest]
+    fn parse_ws_fill_report_fast_preserves_venue_position_id() {
+        let instrument = linear_instrument();
+        let exec = fast_execution(false, "link-hedge");
+        let account_id = AccountId::new("BYBIT-001");
+        let venue_pid = PositionId::from("BTCUSDT-LINEAR.BYBIT-LONG");
+
+        let report =
+            parse_ws_fill_report_fast(&exec, account_id, &instrument, Some(venue_pid), TS).unwrap();
+
+        assert_eq!(report.venue_position_id, Some(venue_pid));
+    }
+
+    #[rstest]
+    fn parse_bybit_ws_frame_routes_execution_fast_topic() {
+        // The fixture topic is `execution.fast` (matches the venue-doc sample),
+        // which the prefix check at parse_bybit_ws_frame routes to the fast frame.
+        let value: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_account_execution_fast.json")).unwrap();
+        let frame = parse_bybit_ws_frame(value);
+        assert!(
+            matches!(frame, BybitWsFrame::AccountExecutionFast(_)),
+            "expected AccountExecutionFast, found {frame:?}",
+        );
+    }
+
+    #[rstest]
+    fn parse_bybit_ws_frame_routes_standard_execution_topic() {
+        // Sanity: with the fast prefix checked first, a plain `execution.<cat>` topic
+        // must still route to the standard variant (not the fast one).
+        let envelope = BybitWsAccountExecutionMsg {
+            topic: Ustr::from("execution.linear"),
+            id: "std-1".to_string(),
+            creation_time: 1_716_800_399_338,
+            data: vec![],
+        };
+        let value = serde_json::to_value(envelope).unwrap();
+        let frame = parse_bybit_ws_frame(value);
+        assert!(
+            matches!(frame, BybitWsFrame::AccountExecution(_)),
+            "expected AccountExecution, found {frame:?}",
+        );
+    }
+
+    #[rstest]
+    fn parse_bybit_ws_frame_unrecognized_exec_type_still_routes_execution() {
+        let json = load_test_json("ws_account_execution_adl.json");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["data"][0]["execType"] = serde_json::json!("StockMerger");
+
+        let frame = parse_bybit_ws_frame(value);
+
+        match frame {
+            BybitWsFrame::AccountExecution(msg) => {
+                assert_eq!(msg.data[0].exec_type, BybitExecType::Unknown);
+            }
+            other => panic!("Expected AccountExecution, found {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn parse_ws_order_status_report_venue_position_id_is_none_for_tp() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_take_profit.json");
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        let order = &msg.data[0]; // positionIdx=0
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_order_status_report(order, &instrument, account_id, TS).unwrap();
+
+        assert_eq!(report.venue_position_id, None);
+    }
+
+    #[rstest]
+    fn parse_ws_order_status_report_venue_position_id_for_hedge() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_take_profit.json");
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        let mut order = msg.data[0].clone();
+        order.position_idx = 1;
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_order_status_report(&order, &instrument, account_id, TS).unwrap();
+
+        assert_eq!(
+            report.venue_position_id,
+            Some(PositionId::from("BTCUSDT-LINEAR.BYBIT-LONG"))
+        );
     }
 
     #[rstest]
@@ -1280,7 +1866,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument.id());
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, instrument.make_qty(0.01, None));
         assert_eq!(
             report.avg_px_open,
@@ -1291,20 +1877,32 @@ mod tests {
     }
 
     #[rstest]
+    fn parse_ws_position_status_report_venue_position_id_for_hedge() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_position.json");
+        let msg: crate::websocket::messages::BybitWsAccountPositionMsg =
+            serde_json::from_str(&json).unwrap();
+        let mut position = msg.data[0].clone();
+        position.position_idx = 2;
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report =
+            parse_ws_position_status_report(&position, account_id, &instrument, TS).unwrap();
+
+        assert_eq!(
+            report.venue_position_id,
+            Some(PositionId::from("BTCUSDT-LINEAR.BYBIT-SHORT"))
+        );
+    }
+
+    #[rstest]
     fn parse_ws_position_short_into_position_status_report() {
         // Create ETHUSDT instrument
         let instruments_json = load_test_json("http_get_instruments_linear.json");
         let instruments_response: crate::http::models::BybitInstrumentLinearResponse =
             serde_json::from_str(&instruments_json).unwrap();
         let eth_def = &instruments_response.result.list[1]; // ETHUSDT is second in the list
-        let fee_rate = crate::http::models::BybitFeeRate {
-            symbol: Ustr::from("ETHUSDT"),
-            taker_fee_rate: "0.00055".to_string(),
-            maker_fee_rate: "0.0001".to_string(),
-            base_coin: Some(Ustr::from("ETH")),
-        };
-        let instrument =
-            crate::common::parse::parse_linear_instrument(eth_def, &fee_rate, TS, TS).unwrap();
+        let instrument = crate::common::parse::parse_linear_instrument(eth_def, TS, TS).unwrap();
 
         let json = load_test_json("ws_account_position_short.json");
         let msg: crate::websocket::messages::BybitWsAccountPositionMsg =
@@ -1317,7 +1915,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id.symbol.as_str(), "ETHUSDT-LINEAR");
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, instrument.make_qty(0.01, None));
         assert_eq!(
             report.avg_px_open,
@@ -1345,17 +1943,37 @@ mod tests {
 
         // Check BTC balance
         let btc_balance = &state.balances[0];
-        assert_eq!(btc_balance.currency.code.as_str(), "BTC");
+        assert_eq!(btc_balance.currency.code, "BTC");
         assert!((btc_balance.total.as_f64() - 0.00102964).abs() < 1e-8);
         assert!((btc_balance.free.as_f64() - 0.00092964).abs() < 1e-8);
         assert!((btc_balance.locked.as_f64() - 0.0001).abs() < 1e-8);
 
         // Check USDT balance
         let usdt_balance = &state.balances[1];
-        assert_eq!(usdt_balance.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_balance.currency.code, "USDT");
         assert!((usdt_balance.total.as_f64() - 9647.75537647).abs() < 1e-6);
         assert!((usdt_balance.free.as_f64() - 9519.89806037).abs() < 1e-6);
         assert!((usdt_balance.locked.as_f64() - 127.8573161).abs() < 1e-6);
+
+        // BTC has order IM only (no position), USDT has position IM+MM (no orders).
+        assert_eq!(state.margins.len(), 2);
+        assert!(state.margins.iter().all(|m| m.instrument_id.is_none()));
+
+        let btc_margin = state
+            .margins
+            .iter()
+            .find(|m| m.currency.code == "BTC")
+            .expect("BTC margin missing");
+        assert!((btc_margin.initial.as_f64() - 0.0001).abs() < 1e-8);
+        assert!(btc_margin.maintenance.as_f64().abs() < 1e-9);
+
+        let usdt_margin = state
+            .margins
+            .iter()
+            .find(|m| m.currency.code == "USDT")
+            .expect("USDT margin missing");
+        assert!((usdt_margin.initial.as_f64() - 127.8573161).abs() < 1e-6);
+        assert!((usdt_margin.maintenance.as_f64() - 12.78573161).abs() < 1e-6);
 
         assert_eq!(state.ts_event, ts_event);
         assert_eq!(state.ts_init, TS);
@@ -1380,7 +1998,7 @@ mod tests {
 
         // Check USDT balance
         let usdt_balance = &state.balances[0];
-        assert_eq!(usdt_balance.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_balance.currency.code, "USDT");
 
         // Wallet has 51,333.82 USDT total
         assert!((usdt_balance.total.as_f64() - 51333.82543837).abs() < 1e-6);
@@ -1393,6 +2011,15 @@ mod tests {
 
         // The bug would have calculated: locked = total - availableToWithdraw = 51,333.82 - 0 = 51,333.82 (all locked!)
         // This test verifies that we now correctly use totalOrderIM instead of deriving from availableToWithdraw
+
+        // The small order reserves 50.028 USDT of initial margin via `totalOrderIM`,
+        // so the account-wide USDT margin must be populated even with no open position.
+        assert_eq!(state.margins.len(), 1);
+        let usdt_margin = &state.margins[0];
+        assert!(usdt_margin.instrument_id.is_none());
+        assert_eq!(usdt_margin.currency.code, "USDT");
+        assert!((usdt_margin.initial.as_f64() - 50.028).abs() < 1e-6);
+        assert!(usdt_margin.maintenance.as_f64().abs() < 1e-9);
     }
 
     #[rstest]
@@ -1490,7 +2117,7 @@ mod tests {
 
         // Verify sell StopMarket: orderType=Market + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::StopMarket);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.trigger_price, Some(instrument.make_price(45000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1513,7 +2140,7 @@ mod tests {
 
         // Verify buy StopMarket: orderType=Market + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::StopMarket);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1536,7 +2163,7 @@ mod tests {
 
         // Verify buy MIT: orderType=Market + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1559,7 +2186,7 @@ mod tests {
 
         // Verify sell MIT: orderType=Market + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(
@@ -1582,7 +2209,7 @@ mod tests {
         // Verify StopLimit order type is correctly parsed
         // orderType=Limit + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::StopLimit);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.price, Some(instrument.make_price(44500.00)));
         assert_eq!(report.trigger_price, Some(instrument.make_price(45000.00)));
@@ -1606,7 +2233,7 @@ mod tests {
         // Verify LimitIfTouched order type is correctly parsed
         // orderType=Limit + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::LimitIfTouched);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.price, Some(instrument.make_price(55500.00)));
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
@@ -1614,5 +2241,62 @@ mod tests {
             report.client_order_id.as_ref().unwrap().to_string(),
             "test-client-lit-001"
         );
+    }
+
+    #[rstest]
+    fn parse_ws_wallet_clamps_free_to_zero_when_locked_exceeds_total() {
+        // totalOrderIM (80) + totalPositionIM (40) = 120, which exceeds
+        // walletBalance (100). Free balance should clamp to zero, not underflow.
+        let json = load_test_json("ws_account_wallet_locked_exceeds_total.json");
+        let msg: crate::websocket::messages::BybitWsAccountWalletMsg =
+            serde_json::from_str(&json).unwrap();
+        let wallet = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-UNIFIED");
+        let ts_event = UnixNanos::new(1_762_960_669_000_000_000);
+
+        let state = parse_ws_account_state(wallet, account_id, ts_event, TS).unwrap();
+
+        let usdt_balance = &state.balances[0];
+        assert_eq!(usdt_balance.currency.code, "USDT");
+        assert!((usdt_balance.total.as_f64() - 100.0).abs() < 1e-6);
+        // Locked is capped at total to prevent negative free balance
+        assert!((usdt_balance.locked.as_f64() - 100.0).abs() < 1e-6);
+        assert_eq!(usdt_balance.free.as_f64(), 0.0);
+    }
+
+    #[rstest]
+    fn parse_ws_order_take_profit_maps_to_market_if_touched() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_take_profit.json");
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        let order = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_order_status_report(order, &instrument, account_id, TS).unwrap();
+
+        assert_eq!(report.order_type, OrderType::MarketIfTouched);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
+        assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
+        assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+        assert!(report.reduce_only);
+    }
+
+    #[rstest]
+    fn parse_ws_order_stop_loss_maps_to_stop_market() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_stop_loss.json");
+        let msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        let order = &msg.data[0];
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_order_status_report(order, &instrument, account_id, TS).unwrap();
+
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
+        assert_eq!(report.trigger_price, Some(instrument.make_price(48000.00)));
+        assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+        assert!(report.reduce_only);
     }
 }

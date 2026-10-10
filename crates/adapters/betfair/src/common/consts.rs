@@ -17,7 +17,7 @@
 
 use std::sync::LazyLock;
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
 use ustr::Ustr;
 
 /// Venue identifier string.
@@ -25,6 +25,10 @@ pub const BETFAIR: &str = "BETFAIR";
 
 /// Static venue instance.
 pub static BETFAIR_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(BETFAIR)));
+
+/// Static client ID instance.
+pub static BETFAIR_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(BETFAIR)));
 
 /// Price decimal precision for Betfair markets.
 pub const BETFAIR_PRICE_PRECISION: u8 = 2;
@@ -54,6 +58,9 @@ pub const BETFAIR_RACE_STREAM_HOST: &str = "sports-data-stream-api.betfair.com";
 /// Stream TLS port.
 pub const BETFAIR_STREAM_PORT: u16 = 443;
 
+/// Requested interval between server stream heartbeat messages in milliseconds.
+pub const BETFAIR_STREAM_SERVER_HEARTBEAT_MS: u64 = 5_000;
+
 // Interactive login URL (non-cert)
 pub const BETFAIR_IDENTITY_LOGIN_URL: &str = "https://identitysso.betfair.com/api/login";
 
@@ -70,16 +77,30 @@ pub const BETFAIR_RATE_LIMIT_ORDERS: &str = "orders";
 /// of the client order ID to preserve the high-entropy suffix (UUID tail).
 pub const BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN: usize = 32;
 
-/// Betfair tiered price tiers: (min, max, increment).
-pub const BETFAIR_PRICE_TIERS: [(f64, f64, f64); 10] = [
-    (1.01, 2.0, 0.01),
-    (2.0, 3.0, 0.02),
-    (3.0, 4.0, 0.05),
-    (4.0, 6.0, 0.1),
-    (6.0, 10.0, 0.2),
-    (10.0, 20.0, 0.5),
-    (20.0, 30.0, 1.0),
-    (30.0, 50.0, 2.0),
-    (50.0, 100.0, 5.0),
-    (100.0, 1010.0, 10.0),
-];
+// Betting API JSON-RPC methods
+pub const METHOD_LIST_MARKET_CATALOGUE: &str = "SportsAPING/v1.0/listMarketCatalogue";
+pub const METHOD_LIST_EVENTS: &str = "SportsAPING/v1.0/listEvents";
+pub const METHOD_LIST_CURRENT_ORDERS: &str = "SportsAPING/v1.0/listCurrentOrders";
+pub const METHOD_PLACE_ORDERS: &str = "SportsAPING/v1.0/placeOrders";
+pub const METHOD_CANCEL_ORDERS: &str = "SportsAPING/v1.0/cancelOrders";
+pub const METHOD_REPLACE_ORDERS: &str = "SportsAPING/v1.0/replaceOrders";
+
+// Accounts API JSON-RPC methods
+pub const METHOD_GET_ACCOUNT_FUNDS: &str = "AccountAPING/v1.0/getAccountFunds";
+pub const METHOD_GET_ACCOUNT_DETAILS: &str = "AccountAPING/v1.0/getAccountDetails";
+
+// Stream operation strings
+pub const STREAM_OP_AUTHENTICATION: &str = "authentication";
+pub const STREAM_OP_MARKET_SUBSCRIPTION: &str = "marketSubscription";
+pub const STREAM_OP_ORDER_SUBSCRIPTION: &str = "orderSubscription";
+pub const STREAM_OP_RACE_SUBSCRIPTION: &str = "raceSubscription";
+pub const STREAM_OP_CRICKET_SUBSCRIPTION: &str = "cricketSubscription";
+pub const STREAM_OP_HEARTBEAT: &str = "heartbeat";
+
+// HTTP header names
+pub const HEADER_X_AUTHENTICATION: &str = "X-Authentication";
+pub const HEADER_X_APPLICATION: &str = "X-Application";
+
+// Default market attribute values
+pub const DEFAULT_BETTING_TYPE: &str = "ODDS";
+pub const DEFAULT_MARKET_TYPE: &str = "WIN";

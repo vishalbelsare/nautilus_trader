@@ -32,7 +32,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -49,14 +49,17 @@ pub struct PoolFlash {
     pub pool_identifier: PoolIdentifier,
     /// The blockchain block number at which the flash loan was executed.
     pub block: u64,
+    /// The hash of the block observed when this flash loan was ingested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
     /// The unique hash identifier of the blockchain transaction containing the flash loan.
     pub transaction_hash: String,
     /// The index position of the transaction within the block.
     pub transaction_index: u32,
     /// The index position of the flash loan event log within the transaction.
     pub log_index: u32,
-    /// The UNIX timestamp (nanoseconds) when the event occurred.
-    pub ts_event: Option<UnixNanos>,
+    /// UNIX timestamp (nanoseconds) when the flash event occurred.
+    pub ts_event: UnixNanos,
     /// The blockchain address of the user or contract that initiated the flash loan.
     pub sender: Address,
     /// The blockchain address that received the flash loan.
@@ -69,12 +72,14 @@ pub struct PoolFlash {
     pub paid0: U256,
     /// The amount of token1 paid back (including fees).
     pub paid1: U256,
+    /// UNIX timestamp (nanoseconds) when the instance was created.
+    pub ts_init: UnixNanos,
 }
 
 impl PoolFlash {
     /// Creates a new [`PoolFlash`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         chain: SharedChain,
         dex: SharedDex,
@@ -84,7 +89,8 @@ impl PoolFlash {
         transaction_hash: String,
         transaction_index: u32,
         log_index: u32,
-        ts_event: Option<UnixNanos>,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
         sender: Address,
         recipient: Address,
         amount0: U256,
@@ -98,6 +104,7 @@ impl PoolFlash {
             instrument_id,
             pool_identifier,
             block: block_number,
+            block_hash: None,
             transaction_hash,
             transaction_index,
             log_index,
@@ -108,6 +115,7 @@ impl PoolFlash {
             amount1,
             paid0,
             paid1,
+            ts_init,
         }
     }
 }

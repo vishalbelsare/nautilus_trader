@@ -1,5 +1,8 @@
 @0xb2c3d4e5f6071829;
 # Cap'n Proto schema for Nautilus enum types
+#
+# WARNING: This schema is not yet stable and may change without notice
+# between releases. Do not depend on wire compatibility across versions.
 
 enum AccountType {
     cash @0;
@@ -10,8 +13,8 @@ enum AccountType {
 
 enum AggressorSide {
     noAggressor @0;
-    buyer @1;
-    seller @2;
+    buy @1;
+    sell @2;
 }
 
 enum AssetClass {
@@ -42,6 +45,11 @@ enum InstrumentClass {
 enum OptionKind {
     call @0;
     put @1;
+}
+
+enum GreeksConvention {
+    blackScholes @0;
+    priceAdjusted @1;
 }
 
 enum OrderSide {
@@ -77,6 +85,7 @@ enum OrderStatus {
     pendingCancel @11;
     partiallyFilled @12;
     filled @13;
+    voided @14;
 }
 
 enum TimeInForce {
@@ -133,13 +142,6 @@ enum BookType {
     topOfBookBidOffer @0;  # Level 1 Top-of-book bid and offer
     marketByPrice @1;       # Level 2 Market by price
     marketByOrder @2;       # Level 3 Market by order
-}
-
-enum OrderBookDeltaType {
-    add @0;
-    update @1;
-    delete @2;
-    clear @3;
 }
 
 enum RecordFlag {
@@ -210,6 +212,12 @@ enum InstrumentCloseType {
     contractExpired @1;
 }
 
+enum OptionalBool {
+    unknown @0;
+    true @1;
+    false @2;
+}
+
 enum MarketStatusAction {
     none @0;
     preOpen @1;
@@ -253,6 +261,6 @@ enum ComponentState {
 
 enum TradingState {
     active @0;
-    halted @1;
-    reducing @2;
+    reducing @1;
+    halted @2;
 }

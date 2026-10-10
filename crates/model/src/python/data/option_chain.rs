@@ -22,24 +22,19 @@ use crate::{
     data::{
         QuoteTick,
         greeks::OptionGreekValues,
-        option_chain::{
-            OptionChainSlice, OptionGreeks, OptionStrikeData, StrikeRange as RustStrikeRange,
-        },
+        option_chain::{OptionChainSlice, OptionGreeks, OptionStrikeData, StrikeRange},
     },
+    enums::GreeksConvention,
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
 
 /// Python wrapper for `StrikeRange` (complex enum).
-#[pyclass(
-    name = "StrikeRange",
-    module = "nautilus_trader.core.nautilus_pyo3.model",
-    from_py_object
-)]
+#[pyclass(name = "StrikeRange", module = "nautilus_trader.model", from_py_object)]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")]
 #[derive(Clone, Debug)]
 pub struct PyStrikeRange {
-    pub inner: RustStrikeRange,
+    pub inner: StrikeRange,
 }
 
 #[pymethods]
@@ -50,7 +45,7 @@ impl PyStrikeRange {
     #[pyo3(name = "fixed")]
     fn py_fixed(strikes: Vec<Price>) -> Self {
         Self {
-            inner: RustStrikeRange::Fixed(strikes),
+            inner: StrikeRange::Fixed(strikes),
         }
     }
 
@@ -59,7 +54,7 @@ impl PyStrikeRange {
     #[pyo3(name = "atm_relative")]
     fn py_atm_relative(strikes_above: usize, strikes_below: usize) -> Self {
         Self {
-            inner: RustStrikeRange::AtmRelative {
+            inner: StrikeRange::AtmRelative {
                 strikes_above,
                 strikes_below,
             },
@@ -71,7 +66,28 @@ impl PyStrikeRange {
     #[pyo3(name = "atm_percent")]
     fn py_atm_percent(pct: f64) -> Self {
         Self {
-            inner: RustStrikeRange::AtmPercent { pct },
+            inner: StrikeRange::AtmPercent { pct },
+        }
+    }
+
+    /// Creates a `StrikeRange::Delta` variant.
+    #[staticmethod]
+    #[pyo3(name = "delta")]
+    fn py_delta(target: f64, tolerance: f64) -> Self {
+        Self {
+            inner: StrikeRange::Delta { target, tolerance },
+        }
+    }
+
+    /// Returns the variant name (`Fixed`, `AtmRelative`, `AtmPercent`, or `Delta`).
+    #[getter]
+    #[pyo3(name = "kind")]
+    fn py_kind(&self) -> &'static str {
+        match self.inner {
+            StrikeRange::Fixed(_) => "Fixed",
+            StrikeRange::AtmRelative { .. } => "AtmRelative",
+            StrikeRange::AtmPercent { .. } => "AtmPercent",
+            StrikeRange::Delta { .. } => "Delta",
         }
     }
 
@@ -89,8 +105,8 @@ impl PyStrikeRange {
 impl OptionGreeks {
     /// Exchange-provided option Greeks and implied volatility for a single instrument.
     #[new]
-    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=0.0, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=0.0, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0, convention=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_id: InstrumentId,
         delta: f64,
@@ -105,9 +121,11 @@ impl OptionGreeks {
         open_interest: Option<f64>,
         ts_event: u64,
         ts_init: u64,
+        convention: Option<GreeksConvention>,
     ) -> Self {
         Self {
             instrument_id,
+            convention: convention.unwrap_or_default(),
             greeks: OptionGreekValues {
                 delta,
                 gamma,
@@ -123,6 +141,12 @@ impl OptionGreeks {
             ts_event: UnixNanos::from(ts_event),
             ts_init: UnixNanos::from(ts_init),
         }
+    }
+
+    #[getter]
+    #[pyo3(name = "convention")]
+    fn py_convention(&self) -> GreeksConvention {
+        self.convention
     }
 
     #[getter]
@@ -209,47 +233,6 @@ impl OptionGreeks {
 
     fn __str__(&self) -> String {
         format!("{self}")
-    }
-}
-
-impl OptionGreeks {
-    /// Creates an `OptionGreeks` from a Python object.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the Python object is missing required attributes.
-    pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let instrument_id = obj.getattr("instrument_id")?.extract::<InstrumentId>()?;
-        let delta = obj.getattr("delta")?.extract::<f64>()?;
-        let gamma = obj.getattr("gamma")?.extract::<f64>()?;
-        let vega = obj.getattr("vega")?.extract::<f64>()?;
-        let theta = obj.getattr("theta")?.extract::<f64>()?;
-        let rho = obj.getattr("rho")?.extract::<f64>()?;
-        let mark_iv = obj.getattr("mark_iv")?.extract::<Option<f64>>()?;
-        let bid_iv = obj.getattr("bid_iv")?.extract::<Option<f64>>()?;
-        let ask_iv = obj.getattr("ask_iv")?.extract::<Option<f64>>()?;
-        let underlying_price = obj.getattr("underlying_price")?.extract::<Option<f64>>()?;
-        let open_interest = obj.getattr("open_interest")?.extract::<Option<f64>>()?;
-        let ts_event = obj.getattr("ts_event")?.extract::<u64>()?;
-        let ts_init = obj.getattr("ts_init")?.extract::<u64>()?;
-
-        Ok(Self {
-            instrument_id,
-            greeks: OptionGreekValues {
-                delta,
-                gamma,
-                vega,
-                theta,
-                rho,
-            },
-            mark_iv,
-            bid_iv,
-            ask_iv,
-            underlying_price,
-            open_interest,
-            ts_event: UnixNanos::from(ts_event),
-            ts_init: UnixNanos::from(ts_init),
-        })
     }
 }
 

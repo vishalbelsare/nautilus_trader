@@ -18,11 +18,14 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache, clients::ExecutionClient, clock::Clock, live::clock::LiveClock,
+    cache::Cache,
+    clients::ExecutionClient,
+    clock::Clock,
+    factories::{ClientConfig, SimulatedExecutionClientFactory},
+    live::clock::LiveClock,
 };
 use nautilus_execution::client::core::ExecutionClientCore;
-use nautilus_model::identifiers::ClientId;
-use nautilus_system::factories::{ClientConfig, ExecutionClientFactory};
+use nautilus_model::identifiers::{ClientId, TraderId};
 
 use crate::{config::SandboxExecutionClientConfig, execution::SandboxExecutionClient};
 
@@ -33,7 +36,19 @@ impl ClientConfig for SandboxExecutionClientConfig {
 }
 
 /// Factory for creating sandbox execution clients.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.sandbox",
+        unsendable,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.sandbox")
+)]
 pub struct SandboxExecutionClientFactory;
 
 impl SandboxExecutionClientFactory {
@@ -44,9 +59,10 @@ impl SandboxExecutionClientFactory {
     }
 }
 
-impl ExecutionClientFactory for SandboxExecutionClientFactory {
+impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: Rc<RefCell<Cache>>,
@@ -65,7 +81,7 @@ impl ExecutionClientFactory for SandboxExecutionClientFactory {
         let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
 
         let core = ExecutionClientCore::new(
-            sandbox_config.trader_id,
+            trader_id,
             client_id,
             sandbox_config.venue,
             sandbox_config.oms_type,
@@ -75,7 +91,7 @@ impl ExecutionClientFactory for SandboxExecutionClientFactory {
             cache.clone(),
         );
 
-        let client = SandboxExecutionClient::new(core, sandbox_config, clock, cache);
+        let client = SandboxExecutionClient::new(core, sandbox_config, clock, cache)?;
         Ok(Box::new(client))
     }
 

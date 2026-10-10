@@ -1,7 +1,7 @@
 # nautilus-blockchain
 
 [![build](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/nautechsystems/nautilus_trader/actions/workflows/build.yml)
-[![Documentation](https://img.shields.io/docsrs/nautilus-blockchain)](https://docs.rs/nautilus-blockchain/latest/nautilus-blockchain/)
+[![Documentation](https://img.shields.io/docsrs/nautilus-blockchain)](https://docs.rs/nautilus-blockchain/latest/nautilus_blockchain/)
 [![crates.io version](https://img.shields.io/crates/v/nautilus-blockchain.svg)](https://crates.io/crates/nautilus-blockchain)
 ![license](https://img.shields.io/github/license/nautechsystems/nautilus_trader?color=blue)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/NautilusTrader)
@@ -12,24 +12,22 @@ The `nautilus-blockchain` crate provides a high-performance, universal, extensib
 DeFi data from decentralized exchanges (DEXs), liquidity pools, and on-chain events. It enables you to
 power analytics pipelines and trading strategies with real-time and historical on-chain data.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
 This crate provides feature flags to control source code inclusion during compilation:
 
-- `hypersync`: Enables the [HyperSync](https://envio.dev/#hypersync) client integration.
-- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 - `extension-module`: Builds as a Python extension module.
-- `turmoil`: Enables deterministic network simulation testing with [turmoil](https://github.com/tokio-rs/turmoil).
+- `hypersync`: Enables the [`hypersync-client`](https://crates.io/crates/hypersync-client) integration.
+- `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `turmoil`: Enables deterministic network simulation testing with [turmoil](https://crates.io/crates/turmoil).
 
 ## Scripts
 
@@ -76,7 +74,7 @@ Running `target/debug/live_blocks_rpc`
 
 ```
 
-### Sync dex, tokens and pool for Uniswap V3 on Ethereum
+### Sync dex, tokens, and pool for Uniswap V3 on Ethereum
 
 This script demonstrates how to use the blockchain data client to discover and cache Uniswap V3 pools and their associated tokens. It queries the Ethereum blockchain for pool creation events emitted by the Uniswap V3 factory contract, retrieves token metadata (name, symbol, decimals) for each token in the pools via smart contract calls, and stores everything in a local Postgres database.
 

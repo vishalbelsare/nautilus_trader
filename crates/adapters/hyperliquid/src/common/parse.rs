@@ -17,8 +17,7 @@
 //!
 //! # Conditional Order Support
 //!
-//! This module implements conditional order support for Hyperliquid,
-//! following patterns established in the OKX, Bybit, and BitMEX adapters.
+//! This module implements conditional order support for Hyperliquid.
 //!
 //! ## Supported Order Types
 //!
@@ -67,24 +66,33 @@ pub use nautilus_core::serialization::{
 };
 use nautilus_model::{
     data::{bar::BarType, quote::QuoteTick},
-    enums::{AggregationSource, BarAggregation, OrderSide, OrderStatus, OrderType, TimeInForce},
-    identifiers::{ClientOrderId, InstrumentId, Symbol, TradeId, Venue},
+    enums::{
+        AggregationSource, BarAggregation, ContingencyType, OrderSide, OrderStatus, OrderType,
+        TimeInForce,
+    },
+    identifiers::{ClientOrderId, TradeId},
     orders::{Order, any::OrderAny},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
 use rust_decimal::Decimal;
 
 use crate::{
-    common::enums::{
-        HyperliquidBarInterval::{self, *},
-        HyperliquidOrderStatus, HyperliquidTpSl,
+    common::{
+        enums::{
+            HyperliquidAccountAbstraction,
+            HyperliquidBarInterval::{self, *},
+            HyperliquidOrderStatus, HyperliquidTpSl,
+        },
+        types::HyperliquidAssetId,
     },
     http::models::{
-        Cloid, CrossMarginSummary, HyperliquidExchangeResponse,
-        HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelStatus,
-        HyperliquidExecLimitParams, HyperliquidExecModifyStatus, HyperliquidExecOrderKind,
-        HyperliquidExecOrderStatus, HyperliquidExecPlaceOrderRequest, HyperliquidExecResponseData,
-        HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams, RESPONSE_STATUS_OK,
+        ClearinghouseState, Cloid, HyperliquidExchangeCancelByCloidRequest,
+        HyperliquidExchangeCancelStatus, HyperliquidExchangeGrouping,
+        HyperliquidExchangeLimitParams, HyperliquidExchangeModifyStatus,
+        HyperliquidExchangeOrderKind, HyperliquidExchangeOrderStatus,
+        HyperliquidExchangePlaceOrderRequest, HyperliquidExchangeResponse,
+        HyperliquidExchangeResponseData, HyperliquidExchangeTif, HyperliquidExchangeTpSl,
+        HyperliquidExchangeTriggerParams, RESPONSE_STATUS_OK, SpotClearinghouseState,
     },
     websocket::messages::TrailingOffsetType,
 };
@@ -99,10 +107,10 @@ use crate::{
 pub fn make_fill_trade_id(
     hash: &str,
     oid: u64,
-    px: &str,
-    sz: &str,
+    px: Decimal,
+    sz: Decimal,
     time: u64,
-    start_position: &str,
+    start_position: Decimal,
 ) -> TradeId {
     // FNV-1a with fixed seed for deterministic output
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -110,23 +118,28 @@ pub fn make_fill_trade_id(
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
+
     for b in oid.to_le_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    for &b in px.as_bytes() {
+
+    for &b in px.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    for &b in sz.as_bytes() {
+
+    for &b in sz.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
+
     for b in time.to_le_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    for &b in start_position.as_bytes() {
+
+    for &b in start_position.to_string().as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
@@ -175,12 +188,10 @@ pub fn round_to_sig_figs(value: Decimal, sig_figs: u32) -> Decimal {
         return Decimal::ZERO;
     }
 
-    // Find order of magnitude using log10
-    let abs_val = value.abs();
-    let float_val: f64 = abs_val.to_string().parse().unwrap_or(0.0);
-    let magnitude = float_val.log10().floor() as i32;
+    // log10(|value|) = log10(|mantissa|) - scale; `ilog10` skips the float path
+    let mantissa = value.mantissa().unsigned_abs();
+    let magnitude = mantissa.ilog10() as i32 - value.scale() as i32;
 
-    // Calculate shift to round to sig_figs
     let shift = sig_figs as i32 - 1 - magnitude;
     let factor = Decimal::from(10_i64.pow(shift.unsigned_abs()));
 
@@ -204,6 +215,47 @@ pub fn normalize_price(price: Decimal, decimals: u8) -> Decimal {
 pub fn normalize_quantity(qty: Decimal, decimals: u8) -> Decimal {
     let scale = Decimal::from(10_u64.pow(decimals as u32));
     (qty * scale).floor() / scale
+}
+
+/// Validates venue canonical wire form for a price submitted with price
+/// normalization disabled: at most `price_decimals` fractional digits. The
+/// venue parses prices into its canonical form before verifying the action
+/// signature, so a price with excess decimals fails signature verification
+/// and surfaces as a misleading "wallet does not exist" error instead of an
+/// order validation error.
+fn ensure_canonical_wire_price(
+    label: &str,
+    price: Decimal,
+    price_decimals: u8,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        price.scale() <= u32::from(price_decimals),
+        "{label} {price} exceeds the instrument maximum of {price_decimals} decimal places; \
+         enable normalize_prices or adjust the price"
+    );
+    Ok(())
+}
+
+/// Normalizes a price to the venue wire form, or validates the canonical
+/// form when normalization is disabled. Validation is skipped when the
+/// instrument decimal cap is unknown (`None`): the prior raw passthrough is
+/// preserved rather than validating against a placeholder. See
+/// [`ensure_canonical_wire_price`].
+pub(crate) fn normalize_or_validate_wire_price(
+    raw: Decimal,
+    label: &str,
+    price_decimals: Option<u8>,
+    should_normalize_prices: bool,
+) -> anyhow::Result<Decimal> {
+    if should_normalize_prices {
+        Ok(normalize_price(raw, price_decimals.unwrap_or(2)).normalize())
+    } else {
+        let value = raw.normalize();
+        if let Some(decimals) = price_decimals {
+            ensure_canonical_wire_price(label, value, decimals)?;
+        }
+        Ok(value)
+    }
 }
 
 /// Complete normalization for an order including price, quantity, and notional validation
@@ -237,6 +289,125 @@ pub fn millis_to_nanos(millis: u64) -> anyhow::Result<UnixNanos> {
     Ok(UnixNanos::from(value))
 }
 
+/// Parses an outcome (HIP-4) spot coin or token symbol into an asset ID.
+///
+/// Hyperliquid represents outcome spot coins as `#<encoding>` and outcome
+/// token names as `+<encoding>`, where `encoding = 10 * outcome + side`.
+///
+/// # Errors
+///
+/// Returns an error if the symbol is not an outcome symbol, the encoding is
+/// not numeric, overflows the asset id range, or carries an invalid side digit.
+pub fn parse_outcome_symbol(symbol: &str) -> anyhow::Result<HyperliquidAssetId> {
+    let encoding = parse_outcome_symbol_encoding(symbol)?;
+    HyperliquidAssetId::from_outcome_encoding(encoding).with_context(|| {
+        format!(
+            "Invalid Hyperliquid outcome symbol '{symbol}': encoding must fit u32 and end with side digit 0 or 1"
+        )
+    })
+}
+
+fn parse_outcome_symbol_encoding(symbol: &str) -> anyhow::Result<u32> {
+    let encoding = symbol
+        .strip_prefix('#')
+        .or_else(|| symbol.strip_prefix('+'))
+        .with_context(|| {
+            format!(
+                "Invalid Hyperliquid outcome symbol '{symbol}': expected #<encoding> or +<encoding>"
+            )
+        })?;
+
+    if encoding.is_empty() {
+        anyhow::bail!("Invalid Hyperliquid outcome symbol '{symbol}': encoding must not be empty");
+    }
+
+    if !encoding.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("Invalid Hyperliquid outcome symbol '{symbol}': encoding must be numeric");
+    }
+
+    encoding
+        .parse::<u32>()
+        .with_context(|| format!("Invalid Hyperliquid outcome symbol '{symbol}'"))
+}
+
+/// Suffix shared by every Nautilus outcome symbol, mirroring `-PERP` / `-SPOT`.
+pub const OUTCOME_SYMBOL_SUFFIX: &str = "-OUTCOME";
+/// Yes-side label on Nautilus outcome symbols.
+pub const OUTCOME_SIDE_YES: &str = "YES";
+/// No-side label on Nautilus outcome symbols.
+pub const OUTCOME_SIDE_NO: &str = "NO";
+
+/// Parses a Nautilus outcome instrument symbol of the form
+/// `{outcome_index}-{YES|NO}-OUTCOME` into `(outcome_index, side)` where side
+/// is `0` for Yes and `1` for No.
+///
+/// Returns `None` if the symbol does not match the expected shape or if the
+/// `(outcome_index, side)` pair would not encode into a valid HIP-4
+/// `HyperliquidAssetId` (i.e. `100_000_000 + 10 * outcome_index + side`
+/// would overflow `u32`). The legacy `#E` / `+E` wire parser already rejects
+/// out-of-range encodings; this keeps the two paths in parity so downstream
+/// arithmetic on the returned pair cannot overflow.
+#[must_use]
+pub fn parse_outcome_nautilus_symbol(symbol: &str) -> Option<(u32, u8)> {
+    let rest = symbol.strip_suffix(OUTCOME_SYMBOL_SUFFIX)?;
+    let (index_str, side_str) = rest.rsplit_once('-')?;
+    let outcome_index = index_str.parse::<u32>().ok()?;
+    let side = match side_str {
+        OUTCOME_SIDE_YES => 0,
+        OUTCOME_SIDE_NO => 1,
+        _ => return None,
+    };
+    let encoding = outcome_index
+        .checked_mul(10)?
+        .checked_add(u32::from(side))?;
+    HyperliquidAssetId::from_outcome_encoding(encoding)?;
+    Some((outcome_index, side))
+}
+
+/// Formats an `(outcome_index, side)` pair into the Nautilus outcome symbol
+/// form `{outcome_index}-{YES|NO}-OUTCOME`.
+#[must_use]
+pub fn format_outcome_nautilus_symbol(outcome_index: u32, side: u8) -> String {
+    let side_label = match side {
+        0 => OUTCOME_SIDE_YES,
+        _ => OUTCOME_SIDE_NO,
+    };
+    format!("{outcome_index}-{side_label}{OUTCOME_SYMBOL_SUFFIX}")
+}
+
+/// Returns the `+<encoding>` token form for the side token referenced by a
+/// Nautilus outcome symbol, or `None` if the symbol is not an outcome.
+#[must_use]
+pub fn outcome_token_from_nautilus_symbol(symbol: &str) -> Option<String> {
+    let (outcome_index, side) = parse_outcome_nautilus_symbol(symbol)?;
+    let encoding = 10 * outcome_index + u32::from(side);
+    Some(format!("+{encoding}"))
+}
+
+/// Returns the secondary cache-alias key for a Nautilus instrument symbol.
+///
+/// For outcome symbols, this is the `+<encoding>` token form (matching the
+/// `coin` field on `spotClearinghouseState` balances). For perp / spot
+/// symbols it is the leading segment before the first `-` (the base asset
+/// or sanitized base for HIP-3 perps). Returns `None` for an empty symbol.
+///
+/// Used by `cache_instrument`, order-response report builders, and the bar
+/// lookup so all three derive the same alias and stay in sync as the symbol
+/// shape evolves.
+#[must_use]
+pub fn cache_alias_for_symbol(symbol: &str) -> Option<String> {
+    if let Some(token) = outcome_token_from_nautilus_symbol(symbol) {
+        return Some(token);
+    }
+
+    let leading = symbol.split('-').next()?;
+    if leading.is_empty() {
+        None
+    } else {
+        Some(leading.to_string())
+    }
+}
+
 /// Converts a Nautilus `TimeInForce` to Hyperliquid TIF.
 ///
 /// # Errors
@@ -245,11 +416,11 @@ pub fn millis_to_nanos(millis: u64) -> anyhow::Result<UnixNanos> {
 pub fn time_in_force_to_hyperliquid_tif(
     tif: TimeInForce,
     is_post_only: bool,
-) -> anyhow::Result<HyperliquidExecTif> {
+) -> anyhow::Result<HyperliquidExchangeTif> {
     match (tif, is_post_only) {
-        (_, true) => Ok(HyperliquidExecTif::Alo), // Always use ALO for post-only orders
-        (TimeInForce::Gtc, false) => Ok(HyperliquidExecTif::Gtc),
-        (TimeInForce::Ioc, false) => Ok(HyperliquidExecTif::Ioc),
+        (_, true) => Ok(HyperliquidExchangeTif::Alo), // Always use ALO for post-only orders
+        (TimeInForce::Gtc, false) => Ok(HyperliquidExchangeTif::Gtc),
+        (TimeInForce::Ioc, false) => Ok(HyperliquidExchangeTif::Ioc),
         (TimeInForce::Fok, false) => {
             anyhow::bail!("FOK time in force is not supported by Hyperliquid")
         }
@@ -262,13 +433,13 @@ fn determine_tpsl_type(
     order_side: OrderSide,
     trigger_price: Decimal,
     current_price: Option<Decimal>,
-) -> HyperliquidExecTpSl {
+) -> HyperliquidExchangeTpSl {
     match order_type {
         // Stop orders are protective - always SL
-        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
+        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExchangeTpSl::Sl,
 
         // If Touched orders are profit-taking or entry orders - always TP
-        OrderType::MarketIfTouched | OrderType::LimitIfTouched => HyperliquidExecTpSl::Tp,
+        OrderType::MarketIfTouched | OrderType::LimitIfTouched => HyperliquidExchangeTpSl::Tp,
 
         // For other trigger types, try to infer from price relationship if available
         _ => {
@@ -277,24 +448,23 @@ fn determine_tpsl_type(
                     OrderSide::Buy => {
                         // Buy order: trigger above market = stop loss, below = take profit
                         if trigger_price > current {
-                            HyperliquidExecTpSl::Sl
+                            HyperliquidExchangeTpSl::Sl
                         } else {
-                            HyperliquidExecTpSl::Tp
+                            HyperliquidExchangeTpSl::Tp
                         }
                     }
                     OrderSide::Sell => {
                         // Sell order: trigger below market = stop loss, above = take profit
                         if trigger_price < current {
-                            HyperliquidExecTpSl::Sl
+                            HyperliquidExchangeTpSl::Sl
                         } else {
-                            HyperliquidExecTpSl::Tp
+                            HyperliquidExchangeTpSl::Tp
                         }
                     }
-                    _ => HyperliquidExecTpSl::Sl, // Default to SL for safety
                 }
             } else {
                 // No market price available, default to SL for safety
-                HyperliquidExecTpSl::Sl
+                HyperliquidExchangeTpSl::Sl
             }
         }
     }
@@ -348,28 +518,68 @@ pub fn bar_type_to_interval(bar_type: &BarType) -> anyhow::Result<HyperliquidBar
 ///
 /// This variant is used when the caller has already resolved the asset index
 /// from the instrument cache (e.g., for SPOT instruments where the index
-/// cannot be derived from the symbol alone).
+/// cannot be derived from the symbol alone). `slippage_bps` controls the
+/// buffer applied when deriving a limit from a stop trigger price.
 pub fn order_to_hyperliquid_request_with_asset(
     order: &OrderAny,
     asset: u32,
     price_decimals: u8,
     should_normalize_prices: bool,
-) -> anyhow::Result<HyperliquidExecPlaceOrderRequest> {
+    slippage_bps: u32,
+) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
+    order_to_hyperliquid_request_with_asset_and_cloid(
+        order,
+        asset,
+        price_decimals,
+        should_normalize_prices,
+        slippage_bps,
+        Some(Cloid::from_client_order_id(order.client_order_id())),
+    )
+}
+
+/// Converts a Nautilus order to Hyperliquid request with an explicit CLOID.
+pub fn order_to_hyperliquid_request_with_asset_and_cloid(
+    order: &OrderAny,
+    asset: u32,
+    price_decimals: u8,
+    should_normalize_prices: bool,
+    slippage_bps: u32,
+    cloid: Option<Cloid>,
+) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
+    order_to_hyperliquid_request_with_optional_decimals(
+        order,
+        asset,
+        Some(price_decimals),
+        should_normalize_prices,
+        slippage_bps,
+        cloid,
+    )
+}
+
+/// Converts a Nautilus order to Hyperliquid request when the instrument
+/// decimal cap may be unknown. A `None` cap disables local wire-price
+/// validation and falls back to the default two-decimal normalization.
+pub(crate) fn order_to_hyperliquid_request_with_optional_decimals(
+    order: &OrderAny,
+    asset: u32,
+    price_decimals: Option<u8>,
+    should_normalize_prices: bool,
+    slippage_bps: u32,
+    cloid: Option<Cloid>,
+) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
     let is_buy = matches!(order.order_side(), OrderSide::Buy);
     let reduce_only = order.is_reduce_only();
     let order_side = order.order_side();
     let order_type = order.order_type();
 
+    let normalize_or_validate = |raw: Decimal, label: &str| {
+        normalize_or_validate_wire_price(raw, label, price_decimals, should_normalize_prices)
+    };
+
     // Normalize decimals to strip trailing zeros, matching the server's
     // canonical form used for EIP-712 signing hash verification.
     let price_decimal = if let Some(price) = order.price() {
-        let raw = price.as_decimal();
-
-        if should_normalize_prices {
-            normalize_price(raw, price_decimals).normalize()
-        } else {
-            raw.normalize()
-        }
+        normalize_or_validate(price.as_decimal(), "Price")?
     } else if matches!(order_type, OrderType::Market) {
         Decimal::ZERO
     } else if matches!(
@@ -379,9 +589,10 @@ pub fn order_to_hyperliquid_request_with_asset(
         match order.trigger_price() {
             Some(tp) => {
                 let base = tp.as_decimal().normalize();
-                let derived = derive_limit_from_trigger(base, is_buy);
+                let derived = derive_limit_from_trigger(base, is_buy, slippage_bps);
                 let sig_rounded = round_to_sig_figs(derived, 5);
-                clamp_price_to_precision(sig_rounded, price_decimals, is_buy).normalize()
+                clamp_price_to_precision(sig_rounded, price_decimals.unwrap_or(2), is_buy)
+                    .normalize()
             }
             None => Decimal::ZERO,
         }
@@ -393,29 +604,25 @@ pub fn order_to_hyperliquid_request_with_asset(
 
     // Determine order kind based on order type
     let kind = match order_type {
-        OrderType::Market => HyperliquidExecOrderKind::Limit {
-            limit: HyperliquidExecLimitParams {
-                tif: HyperliquidExecTif::Ioc,
+        OrderType::Market => HyperliquidExchangeOrderKind::Limit {
+            limit: HyperliquidExchangeLimitParams {
+                tif: HyperliquidExchangeTif::Ioc,
             },
         },
         OrderType::Limit => {
             let tif =
                 time_in_force_to_hyperliquid_tif(order.time_in_force(), order.is_post_only())?;
-            HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams { tif },
+            HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams { tif },
             }
         }
         OrderType::StopMarket => {
             if let Some(trigger_price) = order.trigger_price() {
-                let raw = trigger_price.as_decimal();
-                let trigger_price_decimal = if should_normalize_prices {
-                    normalize_price(raw, price_decimals).normalize()
-                } else {
-                    raw.normalize()
-                };
+                let trigger_price_decimal =
+                    normalize_or_validate(trigger_price.as_decimal(), "Trigger price")?;
                 let tpsl = determine_tpsl_type(order_type, order_side, trigger_price_decimal, None);
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: true,
                         trigger_px: trigger_price_decimal,
                         tpsl,
@@ -427,15 +634,11 @@ pub fn order_to_hyperliquid_request_with_asset(
         }
         OrderType::StopLimit => {
             if let Some(trigger_price) = order.trigger_price() {
-                let raw = trigger_price.as_decimal();
-                let trigger_price_decimal = if should_normalize_prices {
-                    normalize_price(raw, price_decimals).normalize()
-                } else {
-                    raw.normalize()
-                };
+                let trigger_price_decimal =
+                    normalize_or_validate(trigger_price.as_decimal(), "Trigger price")?;
                 let tpsl = determine_tpsl_type(order_type, order_side, trigger_price_decimal, None);
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: false,
                         trigger_px: trigger_price_decimal,
                         tpsl,
@@ -447,17 +650,13 @@ pub fn order_to_hyperliquid_request_with_asset(
         }
         OrderType::MarketIfTouched => {
             if let Some(trigger_price) = order.trigger_price() {
-                let raw = trigger_price.as_decimal();
-                let trigger_price_decimal = if should_normalize_prices {
-                    normalize_price(raw, price_decimals).normalize()
-                } else {
-                    raw.normalize()
-                };
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                let trigger_price_decimal =
+                    normalize_or_validate(trigger_price.as_decimal(), "Trigger price")?;
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: true,
                         trigger_px: trigger_price_decimal,
-                        tpsl: HyperliquidExecTpSl::Tp,
+                        tpsl: HyperliquidExchangeTpSl::Tp,
                     },
                 }
             } else {
@@ -466,17 +665,13 @@ pub fn order_to_hyperliquid_request_with_asset(
         }
         OrderType::LimitIfTouched => {
             if let Some(trigger_price) = order.trigger_price() {
-                let raw = trigger_price.as_decimal();
-                let trigger_price_decimal = if should_normalize_prices {
-                    normalize_price(raw, price_decimals).normalize()
-                } else {
-                    raw.normalize()
-                };
-                HyperliquidExecOrderKind::Trigger {
-                    trigger: HyperliquidExecTriggerParams {
+                let trigger_price_decimal =
+                    normalize_or_validate(trigger_price.as_decimal(), "Trigger price")?;
+                HyperliquidExchangeOrderKind::Trigger {
+                    trigger: HyperliquidExchangeTriggerParams {
                         is_market: false,
                         trigger_px: trigger_price_decimal,
-                        tpsl: HyperliquidExecTpSl::Tp,
+                        tpsl: HyperliquidExchangeTpSl::Tp,
                     },
                 }
             } else {
@@ -486,9 +681,7 @@ pub fn order_to_hyperliquid_request_with_asset(
         _ => anyhow::bail!("Unsupported order type for Hyperliquid: {order_type:?}"),
     };
 
-    let cloid = Some(Cloid::from_client_order_id(order.client_order_id()));
-
-    Ok(HyperliquidExecPlaceOrderRequest {
+    Ok(HyperliquidExchangePlaceOrderRequest {
         asset,
         is_buy,
         price: price_decimal,
@@ -499,31 +692,38 @@ pub fn order_to_hyperliquid_request_with_asset(
     })
 }
 
-/// Derives a market order limit price from a quote with 0.5% slippage.
-///
-/// Uses the ask price for buys and the bid price for sells, applies
-/// slippage, rounds to 5 significant figures, and clamps to the
-/// instrument's price precision.
-pub fn derive_market_order_price(quote: &QuoteTick, is_buy: bool, price_decimals: u8) -> Decimal {
+/// Default slippage buffer in basis points for MARKET orders.
+pub const DEFAULT_MARKET_SLIPPAGE_BPS: u32 = 50;
+
+/// Derives a market order limit price from a quote with a configurable
+/// slippage buffer in basis points, rounded to 5 significant figures and
+/// clamped to the instrument's price precision.
+pub fn derive_market_order_price(
+    quote: &QuoteTick,
+    is_buy: bool,
+    price_decimals: u8,
+    slippage_bps: u32,
+) -> Decimal {
     let base = if is_buy {
         quote.ask_price.as_decimal()
     } else {
         quote.bid_price.as_decimal()
     };
-    let derived = derive_limit_from_trigger(base, is_buy);
+    let derived = derive_limit_from_trigger(base, is_buy, slippage_bps);
     let sig_rounded = round_to_sig_figs(derived, 5);
     clamp_price_to_precision(sig_rounded, price_decimals, is_buy).normalize()
 }
 
-/// Derives a limit price from a trigger price with slippage.
-///
-/// Hyperliquid requires that the limit price satisfies:
-/// - SELL stops: `limit_px <= trigger_px`
-/// - BUY stops: `limit_px >= trigger_px`
-///
-/// Applies 0.5% slippage in the appropriate direction.
-pub fn derive_limit_from_trigger(trigger_price: Decimal, is_buy: bool) -> Decimal {
-    let slippage = Decimal::new(5, 3); // 0.5%
+/// Derives a limit price from a trigger price with a configurable
+/// slippage buffer in basis points, widening the limit so BUY satisfies
+/// `limit_px >= trigger_px` and SELL satisfies `limit_px <= trigger_px`.
+pub fn derive_limit_from_trigger(
+    trigger_price: Decimal,
+    is_buy: bool,
+    slippage_bps: u32,
+) -> Decimal {
+    // bps -> Decimal: e.g. 50 bps -> 0.005
+    let slippage = Decimal::new(slippage_bps as i64, 4);
     let price = if is_buy {
         trigger_price * (Decimal::ONE + slippage)
     } else {
@@ -550,9 +750,9 @@ pub fn clamp_price_to_precision(price: Decimal, decimals: u8, is_buy: bool) -> D
 pub fn client_order_id_to_cancel_request_with_asset(
     client_order_id: &str,
     asset: u32,
-) -> HyperliquidExecCancelByCloidRequest {
+) -> HyperliquidExchangeCancelByCloidRequest {
     let cloid = Cloid::from_client_order_id(ClientOrderId::from(client_order_id));
-    HyperliquidExecCancelByCloidRequest { asset, cloid }
+    HyperliquidExchangeCancelByCloidRequest { asset, cloid }
 }
 
 /// Extracts per-item error from a successful Hyperliquid exchange response.
@@ -564,27 +764,27 @@ pub fn extract_inner_error(response: &HyperliquidExchangeResponse) -> Option<Str
     let HyperliquidExchangeResponse::Status { response, .. } = response else {
         return None;
     };
-    let data: HyperliquidExecResponseData = serde_json::from_value(response.clone()).ok()?;
+    let data: HyperliquidExchangeResponseData = serde_json::from_value(response.clone()).ok()?;
     match data {
-        HyperliquidExecResponseData::Order { data } => {
+        HyperliquidExchangeResponseData::Order { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecOrderStatus::Error { error } = status {
+                if let HyperliquidExchangeOrderStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
             None
         }
-        HyperliquidExecResponseData::Cancel { data } => {
+        HyperliquidExchangeResponseData::Cancel { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecCancelStatus::Error { error } = status {
+                if let HyperliquidExchangeCancelStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
             None
         }
-        HyperliquidExecResponseData::Modify { data } => {
+        HyperliquidExchangeResponseData::Modify { data } => {
             for status in &data.statuses {
-                if let HyperliquidExecModifyStatus::Error { error } = status {
+                if let HyperliquidExchangeModifyStatus::Error { error } = status {
                     return Some(error.clone());
                 }
             }
@@ -603,16 +803,34 @@ pub fn extract_inner_errors(response: &HyperliquidExchangeResponse) -> Vec<Optio
     let HyperliquidExchangeResponse::Status { response, .. } = response else {
         return Vec::new();
     };
-    let Ok(data) = serde_json::from_value::<HyperliquidExecResponseData>(response.clone()) else {
+    let Ok(data) = serde_json::from_value::<HyperliquidExchangeResponseData>(response.clone())
+    else {
         return Vec::new();
     };
+
     match data {
-        HyperliquidExecResponseData::Order { data } => data
+        HyperliquidExchangeResponseData::Order { data } => data
             .statuses
             .into_iter()
             .map(|s| match s {
-                HyperliquidExecOrderStatus::Error { error } => Some(error),
+                HyperliquidExchangeOrderStatus::Error { error } => Some(error),
                 _ => None,
+            })
+            .collect(),
+        HyperliquidExchangeResponseData::Cancel { data } => data
+            .statuses
+            .into_iter()
+            .map(|s| match s {
+                HyperliquidExchangeCancelStatus::Error { error } => Some(error),
+                HyperliquidExchangeCancelStatus::Success(_) => None,
+            })
+            .collect(),
+        HyperliquidExchangeResponseData::Modify { data } => data
+            .statuses
+            .into_iter()
+            .map(|s| match s {
+                HyperliquidExchangeModifyStatus::Error { error } => Some(error),
+                HyperliquidExchangeModifyStatus::Success(_) => None,
             })
             .collect(),
         _ => Vec::new(),
@@ -627,7 +845,15 @@ pub fn extract_error_message(response: &HyperliquidExchangeResponse) -> String {
                 "Operation successful".to_string()
             } else {
                 // Try to extract error message from response data
-                if let Some(error_msg) = response.get("error").and_then(|v| v.as_str()) {
+                if let Some(error_msg) = response
+                    .as_str()
+                    .or_else(|| response.get("error").and_then(|v| v.as_str()))
+                    .or_else(|| {
+                        (response.get("type").and_then(|v| v.as_str()) == Some("error"))
+                            .then(|| response.get("data").and_then(|v| v.as_str()))
+                            .flatten()
+                    })
+                {
                     error_msg.to_string()
                 } else {
                     format!("Request failed with status: {status}")
@@ -643,7 +869,10 @@ pub fn extract_error_message(response: &HyperliquidExchangeResponse) -> String {
 /// # Returns
 ///
 /// `true` if the order is a conditional order, `false` otherwise.
-pub fn is_conditional_order_data(trigger_px: Option<&str>, tpsl: Option<&HyperliquidTpSl>) -> bool {
+pub fn is_conditional_order_data(
+    trigger_px: Option<Decimal>,
+    tpsl: Option<&HyperliquidTpSl>,
+) -> bool {
     trigger_px.is_some() && tpsl.is_some()
 }
 
@@ -659,6 +888,28 @@ pub fn parse_trigger_order_type(is_market: bool, tpsl: &HyperliquidTpSl) -> Orde
         (true, HyperliquidTpSl::Tp) => OrderType::MarketIfTouched,
         (false, HyperliquidTpSl::Tp) => OrderType::LimitIfTouched,
     }
+}
+
+/// Parses trigger semantics from a REST `orderType` label.
+///
+/// REST order rows (`frontendOpenOrders`, `historicalOrders`) describe conditional orders with
+/// labels such as `"Stop Market"` or `"Take Profit Limit"`, rather than the `tpsl` and
+/// `isMarket` fields carried by WebSocket order updates.
+///
+/// # Returns
+///
+/// The trigger kind and whether the order executes as market once triggered, or `None` when
+/// the label does not describe a trigger order (for example `"Limit"` or `"Market"`).
+#[must_use]
+pub fn parse_trigger_order_type_label(label: &str) -> Option<(HyperliquidTpSl, bool)> {
+    let tpsl = if label.starts_with("Take Profit") {
+        HyperliquidTpSl::Tp
+    } else if label.starts_with("Stop") {
+        HyperliquidTpSl::Sl
+    } else {
+        return None;
+    };
+    Some((tpsl, label.ends_with("Market")))
 }
 
 /// Extracts order status from WebSocket order data.
@@ -739,63 +990,239 @@ pub fn parse_trigger_price(trigger_px: &str) -> anyhow::Result<Decimal> {
 
 /// Parses Hyperliquid clearinghouse state into Nautilus account balances and margins.
 ///
+/// Uses the same field selection as the HTTP account-state path
+/// (`cross_margin_summary.total_raw_usd` for total, top-level `state.withdrawable`
+/// for free) so the execution adapter and the HTTP client emit consistent balances
+/// for the same clearinghouse snapshot.
+///
 /// # Errors
 ///
 /// Returns an error if the data cannot be parsed.
 pub fn parse_account_balances_and_margins(
-    cross_margin_summary: &CrossMarginSummary,
+    state: &ClearinghouseState,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
     let mut balances = Vec::new();
     let mut margins = Vec::new();
 
     let currency = Currency::USDC();
 
-    let mut total_value = cross_margin_summary
-        .account_value
-        .to_string()
-        .parse::<f64>()?
-        .max(0.0);
+    let cross_margin_summary = match &state.cross_margin_summary {
+        Some(summary) => summary,
+        None => return Ok((balances, margins)),
+    };
 
-    let free_value = cross_margin_summary
-        .withdrawable
-        .map(|w| w.to_string().parse::<f64>())
-        .transpose()?
-        .unwrap_or(total_value)
-        .max(0.0);
+    let mut total_value = cross_margin_summary.total_raw_usd;
+    let free_value = state.withdrawable.unwrap_or(total_value).max(Decimal::ZERO);
 
-    // Ensure total >= free to satisfy AccountBalance invariant
-    if free_value > total_value {
+    // Withdrawable may include spot balances that sit outside a positive margin
+    // account value; raise total so those funds are not silently clamped away.
+    if total_value >= Decimal::ZERO && free_value > total_value {
         total_value = free_value;
     }
 
-    let locked_value = total_value - free_value;
+    balances.push(AccountBalance::from_total_and_free(
+        total_value,
+        free_value,
+        currency,
+    )?);
 
-    let total = Money::new(total_value, currency);
-    let locked = Money::new(locked_value, currency);
-    let free = Money::new(free_value, currency);
+    let margin_used = cross_margin_summary.total_margin_used;
 
-    let balance = AccountBalance::new(total, locked, free);
-    balances.push(balance);
-
-    let margin_used = cross_margin_summary
-        .total_margin_used
-        .to_string()
-        .parse::<f64>()?;
-
-    if margin_used > 0.0 {
-        let margin_instrument_id =
-            InstrumentId::new(Symbol::new("ACCOUNT"), Venue::new("HYPERLIQUID"));
-
-        let initial_margin = Money::new(margin_used, currency);
-        let maintenance_margin = Money::new(margin_used, currency);
-
-        let margin_balance =
-            MarginBalance::new(initial_margin, maintenance_margin, margin_instrument_id);
-
-        margins.push(margin_balance);
+    if margin_used > Decimal::ZERO {
+        // Hyperliquid perps use a single-collateral (USDC) cross-margin model, so the
+        // reserved margin is emitted as an account-wide entry keyed by USDC.
+        let initial_margin = Money::from_decimal(margin_used, currency)?;
+        let maintenance_margin = Money::from_decimal(margin_used, currency)?;
+        margins.push(MarginBalance::new(initial_margin, maintenance_margin, None));
     }
 
     Ok((balances, margins))
+}
+
+/// Merges perp clearinghouse balances with spot balances into a unified set.
+///
+/// Unified and portfolio margin accounts report every balance and hold in the spot
+/// clearinghouse state, so balances come from spot alone and the spot USDC `hold` becomes the
+/// account-wide margin entry. That hold covers margin on every USDC-collateralized perp dex plus
+/// USDC reserved by resting spot orders; margin on dexes collateralized in another token shows
+/// up as that token's locked balance. The perp summary describes only the default dex in these
+/// modes: its `totalRawUsd` goes negative while longs are open and its `withdrawable` is per-dex.
+///
+/// Otherwise the perp parser already reflects combined USDC when its cross-margin summary
+/// carries collateral or margin state, so this parser appends only non-USDC spot
+/// tokens in that case. If the perp state has no margin summary, or the summary
+/// is present but zeroed, spot USDC is used verbatim.
+///
+/// Account updates keep any currency an update omits, so spot tokens the venue lists at zero are
+/// reported at zero, clearing a previous balance, and USDC is always reported, at zero when there
+/// is no USDC balance. On accounts without spot collateral this needs a perp summary; with none,
+/// no zeroed entries are reported and the previous balances are kept.
+///
+/// # Errors
+///
+/// Returns an error if any balance conversion fails.
+pub fn parse_combined_account_balances_and_margins(
+    perp_state: &ClearinghouseState,
+    spot_state: &SpotClearinghouseState,
+    abstraction: HyperliquidAccountAbstraction,
+) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
+    if abstraction.uses_spot_collateral() {
+        let mut balances = parse_spot_account_balances(spot_state)?;
+        push_zeroed_balances(&mut balances, spot_state);
+
+        let mut margins = Vec::new();
+
+        if let Some(usdc) = spot_state
+            .balances
+            .iter()
+            .find(|balance| balance.coin.as_str() == "USDC")
+            && usdc.hold > Decimal::ZERO
+        {
+            let margin_used = Money::from_decimal(usdc.hold, Currency::USDC())?;
+            margins.push(MarginBalance::new(margin_used, margin_used, None));
+        }
+
+        return Ok((balances, margins));
+    }
+
+    let (mut balances, margins) = parse_account_balances_and_margins(perp_state)?;
+
+    let perp_reflects_usdc = perp_state
+        .cross_margin_summary
+        .as_ref()
+        .is_some_and(|summary| {
+            summary.total_raw_usd != Decimal::ZERO
+                || summary.total_margin_used > Decimal::ZERO
+                || perp_state.withdrawable.unwrap_or(Decimal::ZERO) > Decimal::ZERO
+        });
+
+    if perp_state.cross_margin_summary.is_some() && !perp_reflects_usdc {
+        balances.retain(|balance| balance.currency.code != "USDC");
+    }
+
+    let spot_balances = parse_spot_account_balances(spot_state)?;
+
+    for balance in spot_balances {
+        let is_usdc = balance.currency.code == "USDC";
+        if perp_reflects_usdc && is_usdc {
+            continue;
+        }
+        balances.push(balance);
+    }
+
+    // Without a perp summary the response is not a full account reading, so report no zeroed
+    // entries and keep the previous balances and margins rather than clear them
+    if perp_state.cross_margin_summary.is_some() {
+        push_zeroed_balances(&mut balances, spot_state);
+    }
+
+    Ok((balances, margins))
+}
+
+// Account updates keep any currency an update omits, so a balance that reached zero must still be
+// reported to clear the previous one: spot tokens the venue lists at zero, and USDC whenever the
+// update would otherwise carry none. The venue keeps every token an
+// account has held as a zero row, so these entries recur on every update; a token dropped from
+// the spot state entirely still keeps its last balance
+fn push_zeroed_balances(balances: &mut Vec<AccountBalance>, spot_state: &SpotClearinghouseState) {
+    let zeroed_spot = spot_state
+        .balances
+        .iter()
+        .filter(|balance| balance.total.is_zero())
+        .map(|balance| crate::http::parse::get_currency(balance.coin.as_str()));
+
+    for currency in zeroed_spot.chain(std::iter::once(Currency::USDC())) {
+        if !balances.iter().any(|balance| balance.currency == currency) {
+            let zero = Money::zero(currency);
+            balances.push(AccountBalance::new(zero, zero, zero));
+        }
+    }
+}
+
+/// Parses Hyperliquid spot clearinghouse state into Nautilus account balances.
+///
+/// Emits one [`AccountBalance`] per non-zero spot token, deriving free from
+/// `total - hold`. Tokens unknown to the global currency registry are registered
+/// on the fly with 8-decimal precision (matches Hyperliquid's `sz_decimals` cap).
+///
+/// # Errors
+///
+/// Returns an error if any balance cannot be converted to a Nautilus `Money`.
+pub fn parse_spot_account_balances(
+    state: &SpotClearinghouseState,
+) -> anyhow::Result<Vec<AccountBalance>> {
+    let mut balances = Vec::with_capacity(state.balances.len());
+
+    for balance in &state.balances {
+        if balance.total.is_zero() {
+            continue;
+        }
+
+        let currency = crate::http::parse::get_currency(balance.coin.as_str());
+
+        // Let `from_total_and_locked` do the clamping and derivation at currency
+        // precision so the `total == locked + free` invariant holds without
+        // bespoke rounding here.
+        balances.push(AccountBalance::from_total_and_locked(
+            balance.total,
+            balance.hold,
+            currency,
+        )?);
+    }
+
+    Ok(balances)
+}
+
+/// Determine the Hyperliquid grouping strategy for an order list.
+///
+/// Contingency type, reduce-only flags, structural shape, and parent/child
+/// linkage must all agree to avoid misclassifying generic contingent lists
+/// as Hyperliquid TP/SL groups.
+///
+/// - `NormalTpsl` (OTOCO bracket): entry order is OTO and not reduce-only,
+///   all child orders are OCO or OUO, reduce-only, and reference the entry as parent.
+/// - `PositionTpsl` (linked exit pair): every order is OCO or OUO, reduce-only,
+///   and linked to the same sibling set.
+/// - `Na`: everything else (independent batch).
+pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidExchangeGrouping {
+    if orders.len() >= 2 {
+        let entry = &orders[0];
+        let children = &orders[1..];
+        let entry_id = entry.client_order_id();
+        let entry_is_oto =
+            entry.contingency_type() == Some(ContingencyType::Oto) && !entry.is_reduce_only();
+        let children_are_linked = children.iter().all(|o| {
+            matches!(
+                o.contingency_type(),
+                Some(ContingencyType::Oco | ContingencyType::Ouo)
+            ) && o.is_reduce_only()
+                && o.parent_order_id() == Some(entry_id)
+        });
+
+        if entry_is_oto && children_are_linked {
+            return HyperliquidExchangeGrouping::NormalTpsl;
+        }
+    }
+
+    let all_oco_linked = orders.len() >= 2
+        && orders.iter().all(|o| {
+            matches!(
+                o.contingency_type(),
+                Some(ContingencyType::Oco | ContingencyType::Ouo)
+            ) && o.is_reduce_only()
+        })
+        && orders.iter().all(|o| {
+            o.linked_order_ids().is_some_and(|ids| {
+                ids.iter()
+                    .all(|id| orders.iter().any(|other| other.client_order_id() == *id))
+            })
+        });
+
+    if all_oco_linked {
+        HyperliquidExchangeGrouping::PositionTpsl
+    } else {
+        HyperliquidExchangeGrouping::Na
+    }
 }
 
 #[cfg(test)]
@@ -805,7 +1232,7 @@ mod tests {
     use nautilus_model::{
         enums::{OrderSide, TimeInForce, TriggerType},
         identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
-        orders::{OrderAny, StopMarketOrder},
+        orders::{LimitOrder, OrderAny, StopMarketOrder},
         types::{Price, Quantity},
     };
     use rstest::rstest;
@@ -814,6 +1241,21 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    #[rstest]
+    fn test_make_fill_trade_id_is_stable() {
+        // Pins the deterministic FNV output so the Decimal `Display` hashing
+        // stays stable for reconciliation dedup across the String->Decimal change.
+        let id = make_fill_trade_id(
+            "0xabc123",
+            12345,
+            dec!(50000.0),
+            dec!(0.1),
+            1704470400000,
+            dec!(0.0),
+        );
+        assert_eq!(id.to_string(), "a846ae6f557868e9-0000000000003039");
+    }
 
     #[derive(Serialize, Deserialize)]
     struct TestStruct {
@@ -827,6 +1269,118 @@ mod tests {
             deserialize_with = "deserialize_optional_decimal_from_str"
         )]
         optional_value: Option<Decimal>,
+    }
+
+    #[rstest]
+    #[case("#10", 100_000_010, 1, 0)]
+    #[case("+10", 100_000_010, 1, 0)]
+    #[case("#31", 100_000_031, 3, 1)]
+    #[case("+31", 100_000_031, 3, 1)]
+    fn test_parse_outcome_symbol(
+        #[case] symbol: &str,
+        #[case] raw_asset_id: u32,
+        #[case] outcome: u32,
+        #[case] side: u8,
+    ) {
+        let asset_id = parse_outcome_symbol(symbol).unwrap();
+        assert_eq!(asset_id.to_raw(), raw_asset_id);
+        assert_eq!(asset_id.outcome_index(), Some(outcome));
+        assert_eq!(asset_id.outcome_side(), Some(side));
+    }
+
+    #[rstest]
+    #[case("25-YES-OUTCOME", 25, 0)]
+    #[case("25-NO-OUTCOME", 25, 1)]
+    #[case("0-YES-OUTCOME", 0, 0)]
+    #[case("999-NO-OUTCOME", 999, 1)]
+    fn test_parse_outcome_nautilus_symbol(
+        #[case] symbol: &str,
+        #[case] outcome_index: u32,
+        #[case] side: u8,
+    ) {
+        let parsed = parse_outcome_nautilus_symbol(symbol).unwrap();
+        assert_eq!(parsed, (outcome_index, side));
+    }
+
+    #[rstest]
+    #[case("25-OUTCOME")]
+    #[case("25-MAYBE-OUTCOME")]
+    #[case("25-yes-OUTCOME")]
+    #[case("-YES-OUTCOME")]
+    #[case("YES-25-OUTCOME")]
+    #[case("25-YES-outcome")]
+    #[case("25-YES")]
+    fn test_parse_outcome_nautilus_symbol_rejects_invalid(#[case] symbol: &str) {
+        assert!(parse_outcome_nautilus_symbol(symbol).is_none());
+    }
+
+    #[rstest]
+    // outcome_index * 10 overflows u32.
+    #[case("999999999-YES-OUTCOME")]
+    // outcome_index * 10 fits but 100_000_000 + encoding overflows u32.
+    #[case("429496729-YES-OUTCOME")]
+    // u32::MAX itself; rejected on the multiply.
+    #[case("4294967295-NO-OUTCOME")]
+    fn test_parse_outcome_nautilus_symbol_rejects_overflow(#[case] symbol: &str) {
+        assert!(parse_outcome_nautilus_symbol(symbol).is_none());
+    }
+
+    #[rstest]
+    #[case(25, 0, "25-YES-OUTCOME")]
+    #[case(25, 1, "25-NO-OUTCOME")]
+    #[case(0, 0, "0-YES-OUTCOME")]
+    fn test_format_outcome_nautilus_symbol(
+        #[case] outcome_index: u32,
+        #[case] side: u8,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            format_outcome_nautilus_symbol(outcome_index, side),
+            expected,
+        );
+    }
+
+    #[rstest]
+    #[case("25-YES-OUTCOME", Some("+250".to_string()))]
+    #[case("25-NO-OUTCOME", Some("+251".to_string()))]
+    #[case("0-YES-OUTCOME", Some("+0".to_string()))]
+    #[case("BTC-USD-PERP", None)]
+    #[case("+250", None)]
+    fn test_outcome_token_from_nautilus_symbol(
+        #[case] symbol: &str,
+        #[case] expected: Option<String>,
+    ) {
+        assert_eq!(outcome_token_from_nautilus_symbol(symbol), expected);
+    }
+
+    #[rstest]
+    #[case("25-YES-OUTCOME", Some("+250".to_string()))]
+    #[case("25-NO-OUTCOME", Some("+251".to_string()))]
+    #[case("BTC-USD-PERP", Some("BTC".to_string()))]
+    #[case("PURR-USDC-SPOT", Some("PURR".to_string()))]
+    #[case("dex:STREAMABCDxxxx-USD-PERP", Some("dex:STREAMABCDxxxx".to_string()))]
+    #[case("+250", Some("+250".to_string()))]
+    #[case("#250", Some("#250".to_string()))]
+    #[case("", None)]
+    fn test_cache_alias_for_symbol(#[case] symbol: &str, #[case] expected: Option<String>) {
+        assert_eq!(cache_alias_for_symbol(symbol), expected);
+    }
+
+    #[rstest]
+    #[case("10", "expected #<encoding> or +<encoding>")]
+    #[case("#", "encoding must not be empty")]
+    #[case("#1a", "encoding must be numeric")]
+    #[case("#12", "side digit 0 or 1")]
+    #[case("#4294967295", "fit u32")]
+    fn test_parse_outcome_symbol_rejects_invalid_values(
+        #[case] symbol: &str,
+        #[case] expected_error: &str,
+    ) {
+        let err = parse_outcome_symbol(symbol).unwrap_err();
+        assert!(
+            err.to_string().contains(expected_error),
+            "expected error to contain '{expected_error}', received '{err}'",
+        );
     }
 
     #[rstest]
@@ -949,6 +1503,11 @@ mod tests {
 
         // Zero case
         assert_eq!(round_to_sig_figs(dec!(0), 5), dec!(0));
+
+        assert_eq!(round_to_sig_figs(dec!(-104567.3), 5), dec!(-104570));
+        assert_eq!(round_to_sig_figs(dec!(-1234.5), 5), dec!(-1234.5));
+        assert_eq!(round_to_sig_figs(dec!(-0.000123456), 5), dec!(-0.00012346));
+        assert_eq!(round_to_sig_figs(dec!(-0.123456), 5), dec!(-0.12346));
     }
 
     #[rstest]
@@ -1027,12 +1586,12 @@ mod tests {
     fn test_is_conditional_order_data() {
         // Test with trigger price and tpsl (conditional)
         assert!(is_conditional_order_data(
-            Some("50000.0"),
+            Some(dec!(50000.0)),
             Some(&HyperliquidTpSl::Sl)
         ));
 
         // Test with only trigger price (not conditional - needs both)
-        assert!(!is_conditional_order_data(Some("50000.0"), None));
+        assert!(!is_conditional_order_data(Some(dec!(50000.0)), None));
 
         // Test with only tpsl (not conditional - needs both)
         assert!(!is_conditional_order_data(None, Some(&HyperliquidTpSl::Tp)));
@@ -1066,6 +1625,21 @@ mod tests {
             parse_trigger_order_type(false, &HyperliquidTpSl::Tp),
             OrderType::LimitIfTouched
         );
+    }
+
+    #[rstest]
+    #[case("Stop Market", Some((HyperliquidTpSl::Sl, true)))]
+    #[case("Stop Limit", Some((HyperliquidTpSl::Sl, false)))]
+    #[case("Take Profit Market", Some((HyperliquidTpSl::Tp, true)))]
+    #[case("Take Profit Limit", Some((HyperliquidTpSl::Tp, false)))]
+    #[case("Limit", None)]
+    #[case("Market", None)]
+    #[case("", None)]
+    fn test_parse_trigger_order_type_label(
+        #[case] label: &str,
+        #[case] expected: Option<(HyperliquidTpSl, bool)>,
+    ) {
+        assert_eq!(parse_trigger_order_type_label(label), expected);
     }
 
     #[rstest]
@@ -1145,7 +1719,7 @@ mod tests {
         #[case] is_buy: bool,
         #[case] expected: Decimal,
     ) {
-        let result = derive_limit_from_trigger(trigger_price, is_buy);
+        let result = derive_limit_from_trigger(trigger_price, is_buy, DEFAULT_MARKET_SLIPPAGE_BPS);
         assert_eq!(result, expected);
 
         // Verify invariant: BUY limit >= trigger, SELL limit <= trigger
@@ -1236,8 +1810,14 @@ mod tests {
         #[case] price_decimals: u8,
     ) {
         let order = stop_market_order(side, trigger_str);
-        let request =
-            order_to_hyperliquid_request_with_asset(&order, 0, price_decimals, true).unwrap();
+        let request = order_to_hyperliquid_request_with_asset(
+            &order,
+            0,
+            price_decimals,
+            true,
+            DEFAULT_MARKET_SLIPPAGE_BPS,
+        )
+        .unwrap();
         let trigger = Decimal::from_str(trigger_str).unwrap();
         let is_buy = matches!(side, OrderSide::Buy);
 
@@ -1258,8 +1838,8 @@ mod tests {
             assert!(!request.is_buy);
         }
 
-        // Price must equal the full pipeline: derive → sig figs → clamp → normalize
-        let derived = derive_limit_from_trigger(trigger, is_buy);
+        // Price must equal the full pipeline: derive -> sig figs -> clamp -> normalize
+        let derived = derive_limit_from_trigger(trigger, is_buy, DEFAULT_MARKET_SLIPPAGE_BPS);
         let sig_rounded = round_to_sig_figs(derived, 5);
         let expected = clamp_price_to_precision(sig_rounded, price_decimals, is_buy).normalize();
         assert_eq!(request.price, expected);
@@ -1285,11 +1865,11 @@ mod tests {
         let expected_trigger = normalize_price(trigger, price_decimals).normalize();
         assert_eq!(
             request.kind,
-            HyperliquidExecOrderKind::Trigger {
-                trigger: HyperliquidExecTriggerParams {
+            HyperliquidExchangeOrderKind::Trigger {
+                trigger: HyperliquidExchangeTriggerParams {
                     is_market: true,
                     trigger_px: expected_trigger,
-                    tpsl: HyperliquidExecTpSl::Sl,
+                    tpsl: HyperliquidExchangeTpSl::Sl,
                 },
             },
         );
@@ -1436,13 +2016,49 @@ mod tests {
     }
 
     #[rstest]
-    fn test_extract_inner_errors_non_order_response() {
+    fn test_extract_inner_errors_cancel_success() {
         let response = ok_response(serde_json::json!({
             "type": "cancel",
             "data": {"statuses": ["success"]}
         }));
         let errors = extract_inner_errors(&response);
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].is_none());
+    }
+
+    #[rstest]
+    fn test_extract_inner_errors_cancel_mixed() {
+        let response = ok_response(serde_json::json!({
+            "type": "cancel",
+            "data": {"statuses": [
+                "success",
+                {"error": "Order was never placed, already canceled, or filled."},
+                "success",
+            ]}
+        }));
+        let errors = extract_inner_errors(&response);
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0], None);
+        assert_eq!(
+            errors[1],
+            Some("Order was never placed, already canceled, or filled.".to_string())
+        );
+        assert_eq!(errors[2], None);
+    }
+
+    #[rstest]
+    fn test_extract_inner_errors_modify_mixed() {
+        let response = ok_response(serde_json::json!({
+            "type": "modify",
+            "data": {"statuses": [
+                "success",
+                {"error": "Order does not exist"},
+            ]}
+        }));
+        let errors = extract_inner_errors(&response);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0], None);
+        assert_eq!(errors[1], Some("Order does not exist".to_string()));
     }
 
     #[rstest]
@@ -1518,7 +2134,8 @@ mod tests {
         #[case] expected: &str,
     ) {
         let quote = make_quote(bid, ask);
-        let result = derive_market_order_price(&quote, is_buy, price_decimals);
+        let result =
+            derive_market_order_price(&quote, is_buy, price_decimals, DEFAULT_MARKET_SLIPPAGE_BPS);
         let expected_dec = Decimal::from_str(expected).unwrap();
         assert_eq!(result, expected_dec);
 
@@ -1528,7 +2145,7 @@ mod tests {
         } else {
             quote.bid_price.as_decimal()
         };
-        let derived = derive_limit_from_trigger(base, is_buy);
+        let derived = derive_limit_from_trigger(base, is_buy, DEFAULT_MARKET_SLIPPAGE_BPS);
         let sig_rounded = round_to_sig_figs(derived, 5);
         let pipeline = clamp_price_to_precision(sig_rounded, price_decimals, is_buy).normalize();
         assert_eq!(result, pipeline);
@@ -1549,5 +2166,657 @@ mod tests {
             actual_decimals <= price_decimals as usize,
             "Price {s} has {actual_decimals} decimals, max {price_decimals}",
         );
+    }
+
+    #[rstest]
+    #[case(50, dec!(1000), true, dec!(1005))] // default 0.5% BUY
+    #[case(50, dec!(1000), false, dec!(995))] // default 0.5% SELL
+    #[case(0, dec!(1000), true, dec!(1000))] // 0 bps: no adjustment
+    #[case(100, dec!(1000), true, dec!(1010))] // 1% BUY
+    #[case(100, dec!(1000), false, dec!(990))] // 1% SELL
+    #[case(800, dec!(1000), true, dec!(1080))] // 8% (Hyperliquid SDK default) BUY
+    #[case(800, dec!(1000), false, dec!(920))] // 8% SELL
+    fn test_derive_limit_from_trigger_respects_bps(
+        #[case] slippage_bps: u32,
+        #[case] trigger: Decimal,
+        #[case] is_buy: bool,
+        #[case] expected: Decimal,
+    ) {
+        let result = derive_limit_from_trigger(trigger, is_buy, slippage_bps);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_derive_market_order_price_respects_slippage_override() {
+        let quote = make_quote("100.00", "100.10");
+        let tight = derive_market_order_price(&quote, true, 2, 50);
+        let wide = derive_market_order_price(&quote, true, 2, 800);
+        assert_eq!(tight, dec!(100.6));
+        assert_eq!(wide, dec!(108.11));
+        assert!(wide > tight);
+    }
+
+    // Locks in the field-selection invariant; diverging from it would silently
+    // disagree with the HTTP parser whenever `account_value != total_raw_usd`
+    // or the nested and top-level `withdrawable` values differ.
+    #[rstest]
+    fn test_parse_account_balances_uses_total_raw_usd_and_top_level_withdrawable() {
+        let json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "150",
+                "totalNtlPos": "0",
+                "totalRawUsd": "100",
+                "totalMarginUsed": "20",
+                "withdrawable": "120"
+            },
+            "withdrawable": "80",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        // Total comes from total_raw_usd (100), not account_value (150); free comes
+        // from top-level state.withdrawable (80), not the nested summary.withdrawable (120).
+        assert_eq!(balance.total.as_decimal(), dec!(100));
+        assert_eq!(balance.free.as_decimal(), dec!(80));
+        assert_eq!(balance.locked.as_decimal(), dec!(20));
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(20));
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_preserves_negative_total_raw_usd() {
+        let json =
+            include_str!("../../test_data/http_clearinghouse_state_negative_total_raw_usd.json");
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(-22358.938225));
+        assert_eq!(balance.free.as_decimal(), dec!(772.232111));
+        assert_eq!(balance.locked.as_decimal(), dec!(-23131.170336));
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(963.798764));
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_bumps_positive_total_when_withdrawable_exceeds() {
+        let json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "100",
+                "totalNtlPos": "0",
+                "totalRawUsd": "100",
+                "totalMarginUsed": "0",
+                "withdrawable": "100"
+            },
+            "withdrawable": "150",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, _) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(150));
+        assert_eq!(balance.free.as_decimal(), dec!(150));
+        assert_eq!(balance.locked.as_decimal(), dec!(0));
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_returns_empty_when_no_cross_margin_summary() {
+        let json = r#"{
+            "assetPositions": [],
+            "withdrawable": "100",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+        assert!(balances.is_empty());
+        assert!(margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_spot_account_balances_emits_one_per_token() {
+        let json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "100.25", "hold": "10", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "50", "hold": "0", "entryNtl": "25"},
+                {"coin": "DUST", "token": 2, "total": "0", "hold": "0", "entryNtl": "0"}
+            ]
+        }"#;
+
+        let state: SpotClearinghouseState = serde_json::from_str(json).unwrap();
+        let balances = parse_spot_account_balances(&state).unwrap();
+
+        assert_eq!(balances.len(), 2);
+
+        let usdc = &balances[0];
+        assert_eq!(usdc.currency.code, "USDC");
+        assert_eq!(usdc.total.as_decimal(), dec!(100.25));
+        assert_eq!(usdc.free.as_decimal(), dec!(90.25));
+        assert_eq!(usdc.locked.as_decimal(), dec!(10));
+
+        let purr = &balances[1];
+        assert_eq!(purr.currency.code, "PURR");
+        assert_eq!(purr.total.as_decimal(), dec!(50));
+        assert_eq!(purr.free.as_decimal(), dec!(50));
+    }
+
+    #[rstest]
+    fn test_parse_spot_account_balances_clamps_hold_to_total() {
+        let json = r#"{
+            "balances": [
+                {"coin": "HYPE", "token": 5, "total": "5", "hold": "10", "entryNtl": "0"}
+            ]
+        }"#;
+
+        let state: SpotClearinghouseState = serde_json::from_str(json).unwrap();
+        let balances = parse_spot_account_balances(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let hype = &balances[0];
+        assert_eq!(hype.total.as_decimal(), dec!(5));
+        assert_eq!(hype.free.as_decimal(), dec!(0));
+        assert_eq!(hype.locked.as_decimal(), dec!(5));
+    }
+
+    #[rstest]
+    fn test_parse_spot_account_balances_empty() {
+        let state = SpotClearinghouseState::default();
+        let balances = parse_spot_account_balances(&state).unwrap();
+        assert!(balances.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_combined_deduplicates_usdc_when_perp_summary_present() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "500",
+                "totalNtlPos": "0",
+                "totalRawUsd": "500",
+                "totalMarginUsed": "0",
+                "withdrawable": "500"
+            },
+            "withdrawable": "500"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "123", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(500));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_surfaces_spot_usdc_when_perp_summary_zeroed_unified() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "0",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "75", "hold": "5", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(75));
+        assert_eq!(balances[0].free.as_decimal(), dec!(70));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_deduplicates_usdc_when_perp_total_raw_usd_non_zero() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "50",
+                "totalNtlPos": "0",
+                "totalRawUsd": "50",
+                "totalMarginUsed": "0",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "75", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(50));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_deduplicates_usdc_when_perp_total_raw_usd_negative() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "-50",
+                "totalNtlPos": "0",
+                "totalRawUsd": "-50",
+                "totalMarginUsed": "0",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "75", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(-50));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_deduplicates_usdc_when_perp_margin_used_non_zero() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "25",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "75", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(0));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_deduplicates_usdc_when_perp_withdrawable_non_zero() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "0",
+                "withdrawable": "50"
+            },
+            "withdrawable": "50"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "75", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(50));
+        assert_eq!(balances[0].free.as_decimal(), dec!(50));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_uses_spot_usdc_when_perp_summary_missing() {
+        let perp_json = r#"{"assetPositions": []}"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "50", "hold": "0", "entryNtl": "0"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, _) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::Disabled,
+        )
+        .unwrap();
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(50));
+    }
+
+    // Unified account holding longs on the default dex and on a HIP-3 dex: the perp summary
+    // carries a negative `totalRawUsd` (`accountValue - totalNtlPos`) and a per-dex
+    // `withdrawable`, while spot USDC holds the collateral and `hold` is the margin used across
+    // every dex (180 default + 240 on a HIP-3 dex).
+    #[rstest]
+    fn test_parse_combined_unified_account_with_open_positions_uses_spot_usdc() {
+        let perp_state: ClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_clearinghouse_state_unified_open_positions.json"
+        ))
+        .unwrap();
+
+        let spot_state: SpotClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_spot_clearinghouse_state_unified_open_positions.json"
+        ))
+        .unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::UnifiedAccount,
+        )
+        .unwrap();
+
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(512.25));
+        assert_eq!(balances[0].free.as_decimal(), dec!(92.25));
+        assert_eq!(balances[0].locked.as_decimal(), dec!(420.0));
+        assert_eq!(balances[1].currency.code, "PURR");
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(420.0));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(420.0));
+    }
+
+    #[rstest]
+    fn test_parse_combined_unified_account_flat_has_no_margin() {
+        let perp_state: ClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_clearinghouse_state_unified_flat.json"
+        ))
+        .unwrap();
+        let spot_state: SpotClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_spot_clearinghouse_state_unified_flat.json"
+        ))
+        .unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::UnifiedAccount,
+        )
+        .unwrap();
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].total.as_decimal(), dec!(100));
+        assert_eq!(balances[0].free.as_decimal(), dec!(100));
+        assert!(margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_combined_unified_account_without_usdc_ignores_perp_summary() {
+        let perp_state: ClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_clearinghouse_state_unified_without_usdc.json"
+        ))
+        .unwrap();
+        let spot_state: SpotClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_spot_clearinghouse_state_unified_without_usdc.json"
+        ))
+        .unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::UnifiedAccount,
+        )
+        .unwrap();
+
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "PURR");
+        // USDC is reported as zero from spot rather than taken from the perp summary
+        assert_eq!(balances[1].currency.code, "USDC");
+        assert!(balances[1].total.is_zero());
+        assert!(balances[1].free.is_zero());
+        assert!(margins.is_empty());
+    }
+
+    // Portfolio margin borrows against other collateral, so spot USDC can go negative.
+    #[rstest]
+    fn test_parse_combined_portfolio_margin_uses_spot_including_negative_usdc() {
+        let perp_state: ClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_clearinghouse_state_portfolio_margin_negative_usdc.json"
+        ))
+        .unwrap();
+        let spot_state: SpotClearinghouseState = serde_json::from_str(include_str!(
+            "../../test_data/http_spot_clearinghouse_state_portfolio_margin_negative_usdc.json"
+        ))
+        .unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &spot_state,
+            HyperliquidAccountAbstraction::PortfolioMargin,
+        )
+        .unwrap();
+
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code, "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(-25));
+        assert_eq!(balances[1].currency.code, "HYPE");
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(50));
+    }
+
+    fn limit_order(price: &str) -> OrderAny {
+        OrderAny::Limit(LimitOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
+            ClientOrderId::from("O-1"),
+            OrderSide::Buy,
+            Quantity::from(1),
+            Price::from(price),
+            TimeInForce::Gtc,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+            Default::default(),
+        ))
+    }
+
+    #[rstest]
+    // Venue-accepted forms pass: at the cap, integer, zero, trailing zeros
+    #[case("78764.5", 1)]
+    #[case("102393", 1)]
+    #[case("0", 0)]
+    #[case("0.11525", 5)]
+    #[case("0.10", 1)]
+    fn test_ensure_canonical_wire_price_accepts(#[case] price: &str, #[case] decimals: u8) {
+        let value = Decimal::from_str(price).unwrap().normalize();
+        ensure_canonical_wire_price("Price", value, decimals).unwrap();
+    }
+
+    #[rstest]
+    // Six significant figures with one decimal inside the cap: the venue
+    // accepts these at signing (live-probed), so no false rejection.
+    #[case("78764.5", 1)]
+    #[case("102393", 1)]
+    fn test_order_to_request_raw_price_accepts_canonical_boundary(
+        #[case] price: &str,
+        #[case] decimals: u8,
+    ) {
+        let request =
+            order_to_hyperliquid_request_with_asset(&limit_order(price), 0, decimals, false, 50)
+                .unwrap();
+        assert_eq!(request.price, Decimal::from_str(price).unwrap());
+    }
+
+    #[rstest]
+    fn test_order_to_request_raw_price_rejects_excess_decimals() {
+        let err = order_to_hyperliquid_request_with_asset(&limit_order("0.62201"), 0, 4, false, 50)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Price 0.62201"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("4 decimal places"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[rstest]
+    fn test_order_to_request_normalize_still_accepts_excess_decimals() {
+        let request =
+            order_to_hyperliquid_request_with_asset(&limit_order("0.62201"), 0, 4, true, 50)
+                .unwrap();
+        assert_eq!(request.price, dec!(0.622));
+    }
+
+    #[rstest]
+    fn test_order_to_request_raw_trigger_price_rejects_excess_decimals() {
+        let order = stop_market_order(OrderSide::Sell, "0.62201");
+        let err = order_to_hyperliquid_request_with_asset(&order, 0, 4, false, 50).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Trigger price 0.62201"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("4 decimal places"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[rstest]
+    // Unknown instrument cap: validation is skipped and the prior raw
+    // passthrough is preserved rather than validating against a placeholder.
+    #[case(false)]
+    // Unknown cap with normalization enabled: falls back to two decimals
+    #[case(true)]
+    fn test_order_to_request_optional_decimals_unknown_cap(#[case] normalize: bool) {
+        let request = order_to_hyperliquid_request_with_optional_decimals(
+            &limit_order("0.123456"),
+            0,
+            None,
+            normalize,
+            50,
+            None,
+        )
+        .unwrap();
+        let expected = if normalize {
+            dec!(0.12)
+        } else {
+            dec!(0.123456)
+        };
+        assert_eq!(request.price, expected);
     }
 }
