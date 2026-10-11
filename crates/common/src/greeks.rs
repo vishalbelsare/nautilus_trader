@@ -1096,11 +1096,18 @@ impl GreeksCalculator {
                 vol_index_instrument_id,
                 vol_beta_weights,
             )?;
-            let position_greeks = quantity * &instrument_greeks;
+            let position_portfolio_greeks = quantity * &instrument_greeks.to_portfolio_greeks();
+
+            let position_greeks = GreeksData {
+                pnl: position_portfolio_greeks.pnl,
+                price: position_portfolio_greeks.price,
+                greeks: position_portfolio_greeks.greeks,
+                ..instrument_greeks
+            };
 
             // Apply greeks filter if provided
             if greeks_filter.is_none_or(|filter| filter(&position_greeks)) {
-                portfolio_greeks = portfolio_greeks + PortfolioGreeks::from(position_greeks);
+                portfolio_greeks = portfolio_greeks + position_portfolio_greeks;
             }
         }
 
@@ -2299,6 +2306,68 @@ mod tests {
     }
 
     #[rstest]
+    #[case(OrderSide::Buy, 3, [300.0, 300.0, 150.0])]
+    #[case(OrderSide::Sell, 2, [-200.0, -200.0, -100.0])]
+    fn test_portfolio_greeks_scales_futures_multiplier(
+        #[case] side: OrderSide,
+        #[case] quantity: u64,
+        #[case] expected: [f64; 3],
+    ) {
+        let now_ns = UnixNanos::from(1_700_000_000_000_000_000);
+        let mut future =
+            future_with_expiration("ES.GLBX", "ES", UnixNanos::from(1_800_000_000_000_000_000));
+        future.multiplier = Quantity::from(50);
+        let instrument = InstrumentAny::FuturesContract(future);
+        let instrument_id = instrument.id();
+        let position = position_from_fill(
+            &instrument,
+            "P-FUTURE",
+            "O-FUTURE",
+            "T-FUTURE",
+            side,
+            quantity,
+            "100.00",
+        );
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache.borrow_mut().add_instrument(instrument).unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from("101.75"),
+                Price::from("102.25"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let result = calculate_portfolio_greeks(&calculator, None).unwrap();
+
+        assert_portfolio_greeks_eq(
+            &result,
+            &PortfolioGreeks::new(
+                now_ns,
+                now_ns,
+                expected[0],
+                expected[1],
+                expected[2],
+                0.0,
+                0.0,
+                0.0,
+            ),
+        );
+    }
+
+    #[rstest]
     fn test_portfolio_greeks_ignores_closed_position_with_missing_price() {
         let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
         let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
@@ -2396,7 +2465,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let expected = PortfolioGreeks::from(open_position.signed_qty * &expected);
+        let expected = open_position.signed_qty * &expected.to_portfolio_greeks();
 
         assert_ne!(expected.delta, 0.0);
         assert_portfolio_greeks_eq(
@@ -2511,8 +2580,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let expected_long = PortfolioGreeks::from(long_position.signed_qty * &long_greeks);
-        let expected_short = PortfolioGreeks::from(short_position.signed_qty * &short_greeks);
+        let expected_long = long_position.signed_qty * &long_greeks.to_portfolio_greeks();
+        let expected_short = short_position.signed_qty * &short_greeks.to_portfolio_greeks();
         let expected = expected_long + expected_short;
 
         assert_ne!(expected.pnl, 0.0);
@@ -2527,12 +2596,215 @@ mod tests {
         );
         assert_portfolio_greeks_eq(
             &calculate_portfolio_greeks(&calculator, Some(PositionSide::Long)).unwrap(),
-            &PortfolioGreeks::from(long_position.signed_qty * &long_greeks),
+            &(long_position.signed_qty * &long_greeks.to_portfolio_greeks()),
         );
         assert_portfolio_greeks_eq(
             &calculate_portfolio_greeks(&calculator, Some(PositionSide::Short)).unwrap(),
-            &PortfolioGreeks::from(short_position.signed_qty * &short_greeks),
+            &(short_position.signed_qty * &short_greeks.to_portfolio_greeks()),
         );
+    }
+
+    #[rstest]
+    #[case(true, [-200.0, -1700.0, -1600.0, -1500.0, -1400.0, 1300.0, -1200.0])]
+    #[case(false, [600.0, 900.0, 1200.0, 1500.0, 1800.0, -2100.0, 2400.0])]
+    fn test_portfolio_greeks_scales_before_filter(
+        #[case] include_short: bool,
+        #[case] expected: [f64; 7],
+    ) {
+        let now_ns = UnixNanos::from(1_700_000_000_000_000_000);
+        let expiry_ns = UnixNanos::from(1_800_000_000_000_000_000);
+        let long_option = option_with_expiration("AAPL250417C00145000.OPRA", expiry_ns);
+        let short_option = option_with_expiration("AAPL250417C00155000.OPRA", expiry_ns);
+        let long_id = long_option.id();
+        let short_id = short_option.id();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let observed = Rc::new(RefCell::new(Vec::new()));
+
+        for (option, side, quantity, entry, price, greeks) in [
+            (
+                long_option,
+                OrderSide::Buy,
+                3,
+                "1.00",
+                3.0,
+                OptionGreekValues {
+                    delta: 4.0,
+                    gamma: 5.0,
+                    vega: 6.0,
+                    theta: -7.0,
+                    rho: 8.0,
+                },
+            ),
+            (
+                short_option,
+                OrderSide::Sell,
+                2,
+                "9.00",
+                13.0,
+                OptionGreekValues {
+                    delta: 14.0,
+                    gamma: 15.0,
+                    vega: 16.0,
+                    theta: -17.0,
+                    rho: 18.0,
+                },
+            ),
+        ] {
+            let instrument = InstrumentAny::OptionContract(option);
+            let position = position_from_fill(
+                &instrument,
+                instrument.id().symbol.as_str(),
+                instrument.id().symbol.as_str(),
+                instrument.id().symbol.as_str(),
+                side,
+                quantity,
+                entry,
+            );
+
+            let data = GreeksData {
+                ts_init: UnixNanos::from(11),
+                ts_event: UnixNanos::from(13),
+                instrument_id: instrument.id(),
+                is_call: false,
+                strike: 19.0,
+                expiry: 20_271_015,
+                expiry_in_days: 23,
+                expiry_in_years: 0.25,
+                multiplier: 100.0,
+                quantity: 1.0,
+                underlying_price: 29.0,
+                interest_rate: 0.05,
+                cost_of_carry: 0.02,
+                vol: 0.5,
+                pnl: 31.0,
+                price,
+                greeks,
+                itm_prob: 0.75,
+            };
+
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache.add_position(&position, OmsType::Hedging).unwrap();
+            cache.add_greeks(data).unwrap();
+        }
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache.clone(), clock);
+        let captured = observed.clone();
+        let filter: GreeksFilter = Box::new(move |data| {
+            captured.borrow_mut().push(data.clone());
+            include_short || data.delta > 0.0
+        });
+
+        let result = calculator
+            .portfolio_greeks(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&filter),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.ts_init, now_ns);
+        assert_eq!(result.ts_event, now_ns);
+        assert_eq!(
+            [
+                result.pnl,
+                result.price,
+                result.delta,
+                result.gamma,
+                result.vega,
+                result.theta,
+                result.rho
+            ],
+            expected
+        );
+        let mut observed = observed.borrow_mut();
+        observed.sort_by_key(|data| data.instrument_id);
+        assert_eq!(observed.len(), 2);
+
+        for (data, id, values) in [
+            (
+                &observed[0],
+                long_id,
+                [600.0, 900.0, 1200.0, 1500.0, 1800.0, -2100.0, 2400.0],
+            ),
+            (
+                &observed[1],
+                short_id,
+                [-800.0, -2600.0, -2800.0, -3000.0, -3200.0, 3400.0, -3600.0],
+            ),
+        ] {
+            assert_eq!(
+                [
+                    data.pnl, data.price, data.delta, data.gamma, data.vega, data.theta, data.rho
+                ],
+                values
+            );
+            assert_eq!(data.ts_init, UnixNanos::from(11));
+            assert_eq!(data.ts_event, UnixNanos::from(13));
+            assert_eq!(data.instrument_id, id);
+            assert!(!data.is_call);
+            assert_eq!(data.strike, 19.0);
+            assert_eq!(data.expiry, 20_271_015);
+            assert_eq!(data.expiry_in_days, 23);
+            assert_eq!(data.expiry_in_years, 0.25);
+            assert_eq!(data.multiplier, 100.0);
+            assert_eq!(data.quantity, 1.0);
+            assert_eq!(data.underlying_price, 29.0);
+            assert_eq!(data.interest_rate, 0.05);
+            assert_eq!(data.cost_of_carry, 0.02);
+            assert_eq!(data.vol, 0.5);
+            assert_eq!(data.itm_prob, 0.75);
+        }
+
+        for (id, price, greeks) in [
+            (
+                long_id,
+                3.0,
+                OptionGreekValues {
+                    delta: 4.0,
+                    gamma: 5.0,
+                    vega: 6.0,
+                    theta: -7.0,
+                    rho: 8.0,
+                },
+            ),
+            (
+                short_id,
+                13.0,
+                OptionGreekValues {
+                    delta: 14.0,
+                    gamma: 15.0,
+                    vega: 16.0,
+                    theta: -17.0,
+                    rho: 18.0,
+                },
+            ),
+        ] {
+            let cached = cache.borrow().greeks(&id).unwrap();
+            assert_eq!(cached.pnl, 31.0);
+            assert_eq!(cached.price, price);
+            assert_eq!(cached.greeks, greeks);
+        }
     }
 
     #[rstest]

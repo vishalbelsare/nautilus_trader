@@ -26,6 +26,7 @@ Released on TBD (UTC).
 - Removed Interactive Brokers connection wrappers; use `ibapi::Client` (#5041), thanks @faysou
 - Removed Interactive Brokers `ErrorCategory` and `InteractiveBrokersErrorKind` exports (#5041), thanks @faysou
 - Replaced Interactive Brokers Rust symbology functions with `Symbology` methods (#5041), thanks @faysou
+- Changed Rust `PortfolioGreeks::from(GreeksData)` to apply the contract multiplier
 - Changed Rust `VirtualTimer` and `LiveTimer` to store `interval: TimerInterval` instead of `interval_ns`;
   match `TimerInterval::Fixed` to read fixed intervals
 - Changed Rust `DataEngineConfig` and `LiveDataEngineConfig` struct literals to require `time_bars_time_zone`;
@@ -54,6 +55,8 @@ Released on TBD (UTC).
 
 ### Fixes
 
+- Fixed portfolio Greeks omitting multipliers before filtering and aggregation, including futures
+- Fixed missing Python Greeks conversion, scalar-left multiplication, and portfolio addition
 - Fixed released emulated orders sending stale order initialization (#5169), thanks @jrile018
 - Fixed monthly time bars drifting after a clamped month-end origin offset
 - Fixed queued time-bar callbacks affecting aggregation after a stop or restart
